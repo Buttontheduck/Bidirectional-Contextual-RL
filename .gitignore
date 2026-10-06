@@ -1,0 +1,27 @@
+# Tests
+test_*.py
+*_test.py
+tests/
+
+# Result figures (the whole folder, including its plotting script)
+results_figures/
+
+# Weights & Biases
+wandb/
+
+# TensorBoard logs
+tensorboard/
+events.out.tfevents.*
+
+# Model weights and checkpoints
+checkpoints/
+*.zip
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Python / macOS clutter
+__pycache__/
+*.py[cod]
+.DS_Store
