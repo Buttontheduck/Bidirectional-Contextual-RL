@@ -6,13 +6,11 @@
 #
 # stable-baselines3 and gymnasium are the plain PyPI releases. The installed SB3 has no edited files, only added
 # packages; the gymnasium edits only register BatteryPlane, which battery_plane.py does itself.
-# The code imports contextual_ppo as stable_baselines3.contextual_ppo, so after installing, link it into SB3:
+# The code imports contextual_ppo as stable_baselines3.contextual_ppo, so after installing, link it into SB3
+# (contextual_ppo needs nothing else from the SB3 fork, recurrent_sac included):
 #
 #   SB3=$(python -c "import os, stable_baselines3; print(os.path.dirname(stable_baselines3.__file__))")
 #   ln -s "$PWD/contextual_ppo" "$SB3/contextual_ppo"
-#
-# contextual_ppo also imports stable_baselines3.recurrent_sac (the xLSTM encoder), which is not on PyPI:
-# link a copy of recurrent_sac/ the same way.
 #
 # Training runs on CPU. On a Linux machine without a GPU, the CPU build of torch is much smaller:
 #   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
@@ -22,7 +20,7 @@ torch==2.13.0             # networks
 stable_baselines3==2.9.0  # plain PyPI release: PPO base classes
 gymnasium==0.29.1         # plain PyPI release
 xlstm==2.0.5              # context encoder
-dacite==1.9.2             # xLSTM config parsing in recurrent_sac
+dacite==1.9.2             # xLSTM config parsing
 omegaconf==2.3.1          # configs
 hydra-core==1.3.6         # configs, multirun
 numpy==2.4.6

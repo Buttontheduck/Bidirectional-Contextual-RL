@@ -24,7 +24,7 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
     """
     Actor-critic policy for Contextual_PPO, with a recurrent context encoder shared by the actor and the critic.
 
-    The encoder (``XLSTMRolloutEncoder``, recurrent SAC's encoder) reads ``[o_t, a_{t-1}]``, where ``a_{t-1}``
+    The encoder (``XLSTMRolloutEncoder``, an xLSTM context encoder) reads ``[o_t, a_{t-1}]``, where ``a_{t-1}``
     is the previous executed action, and gives the context ``z_t``. The actor ``pi(a_t | o_t, z_t)`` and the
     critic ``V(o_t, z_t)`` are vanilla PPO's separate MLP branches (``mlp_extractor``) on the observation
     features concatenated with ``z_t``, followed by ``action_net`` (unsquashed diagonal Gaussian) and

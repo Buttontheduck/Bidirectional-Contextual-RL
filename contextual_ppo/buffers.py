@@ -11,8 +11,8 @@ from stable_baselines3.common.utils import get_device
 from .type_aliases import ContextualRolloutSamples
 
 
-# Same helpers as in recurrent_sac/buffers.py. Copied rather than imported: importing that module
-# runs recurrent_sac/__init__.py, which imports the SAC policies and xlstm.
+# Helpers for nested recurrent states (dicts, lists, tuples, None, tensor/array leaves), also used by the encoders
+# in torch_layers.py.
 def _flatten_recurrent_state(state: Any, path: tuple = ()) -> tuple[tuple, list[tuple[tuple, th.Tensor | np.ndarray]]]:
     """
     Split a nested recurrent state (dicts, lists, tuples, None, tensor/array leaves)

@@ -1,21 +1,28 @@
 """
-Recurrent network builders for Contextual_PPO. The xLSTM builders and the context encoder are the ones of
-recurrent SAC (``stable_baselines3.recurrent_sac.torch_layers``), imported rather than copied, so both
-algorithms always run the same encoder code. Contextual_PPO only adds resets inside a sequence, an
-optional output activation of the context head, a Gaussian context head (mean and variance) and an optional
-auxiliary head trained with supervised targets.
+Recurrent network builders for Contextual_PPO, built on the official xlstm package (https://github.com/NX-AI/xlstm):
+the xLSTM block stack (``create_xlstm``), the context encoder (``XLSTMContextEncoder``) and its version for rollout
+streams (``XLSTMRolloutEncoder``), with resets inside a sequence, an optional output activation of the context head,
+a Gaussian context head (mean and variance) and an optional auxiliary head trained with supervised targets.
+The encoder started as a copy of recurrent SAC's; this package does not import ``recurrent_sac``.
 """
 
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 
+import numpy as np
 import torch as th
+from dacite import Config as DaciteConfig
+from dacite import from_dict
+from omegaconf import OmegaConf
 from torch import nn
 from torch.nn import functional as F
-from xlstm import xLSTMBlockStackConfig
+from xlstm import xLSTMBlockStack, xLSTMBlockStackConfig
+from xlstm.blocks.slstm.cell import sLSTMCell_cuda
 
 from stable_baselines3.common.torch_layers import create_mlp
-from stable_baselines3.recurrent_sac.torch_layers import DEFAULT_XLSTM_CONFIG, XLSTMContextEncoder, create_xlstm
+
+from .buffers import _flatten_recurrent_state, _unflatten_recurrent_state
 
 __all__ = [
     "CONTEXT_ACTIVATIONS",
@@ -26,6 +33,246 @@ __all__ = [
     "XLSTMRolloutEncoder",
     "create_xlstm",
 ]
+
+# One sLSTM block without causal convolution or feedforward network, so the complete recurrent
+# state is the cell state (h, c, n, m). The vanilla backend is plain PyTorch and runs on CPU, MPS and CUDA.
+DEFAULT_XLSTM_CONFIG: dict[str, Any] = {
+    "embedding_dim": 64,
+    "num_blocks": 1,
+    "slstm_at": "all",
+    "slstm_block": {
+        "slstm": {"backend": "vanilla", "num_heads": 4, "conv1d_kernel_size": 0},
+        "feedforward": None,
+    },
+}
+
+
+def create_xlstm(xlstm_config: xLSTMBlockStackConfig | Mapping[str, Any] | None = None) -> xLSTMBlockStack:
+    """
+    Create an xLSTM block stack, made of sLSTM and/or mLSTM blocks.
+
+    The config follows the schema of ``xlstm.xLSTMBlockStackConfig`` (as in the xlstm README),
+    so it can come directly from a Hydra/OmegaConf node, for instance::
+
+        embedding_dim: 64
+        num_blocks: 1
+        slstm_at: all        # or block indices, e.g. [1]; the other blocks are mLSTM blocks
+        slstm_block:
+          slstm: {backend: vanilla, num_heads: 4, conv1d_kernel_size: 0}
+          feedforward: null
+        # mlstm_block:       # required when some blocks are not in slstm_at
+        #   mlstm: {num_heads: 4, conv1d_kernel_size: 4}
+        # context_length: 256  # required by mLSTM blocks
+
+    Keys are checked strictly, so a misspelled option raises an error. A given config replaces
+    ``DEFAULT_XLSTM_CONFIG`` entirely, and the fields it leaves out take the xlstm defaults,
+    notably ``backend: cuda``, ``conv1d_kernel_size: 4`` and a feedforward network per sLSTM block.
+
+    The sLSTM ``backend: vanilla`` is plain PyTorch and runs on every device (CPU, MPS, CUDA).
+    ``backend: cuda`` compiles xlstm's CUDA kernels (CUDA toolkit required) and runs on CUDA devices
+    only. The two backends store the sLSTM weights in different layouts, so a checkpoint only loads
+    into a model with the backend it was trained with.
+
+    :param xlstm_config: ``xLSTMBlockStackConfig``, dict or OmegaConf ``DictConfig``.
+        Defaults to ``DEFAULT_XLSTM_CONFIG``: one sLSTM block of width 64.
+    :return: The block stack, whose input and output width is ``embedding_dim``
+    """
+    if xlstm_config is None:
+        xlstm_config = DEFAULT_XLSTM_CONFIG
+    if isinstance(xlstm_config, xLSTMBlockStackConfig):
+        config = deepcopy(xlstm_config)
+    else:
+        if OmegaConf.is_config(xlstm_config):
+            xlstm_config = OmegaConf.to_container(xlstm_config, resolve=True)
+        config = from_dict(xLSTMBlockStackConfig, dict(xlstm_config), config=DaciteConfig(strict=True))
+
+    if config.slstm_block is not None and config.slstm_block.slstm.backend == "cuda" and not th.cuda.is_available():
+        raise ValueError("The sLSTM 'cuda' backend requires a CUDA device, set slstm_block.slstm.backend: vanilla")
+    return xLSTMBlockStack(config)
+
+
+class XLSTMContextEncoder(nn.Module):
+    """
+    Recurrent context encoder: ``z_t = P(xLSTM(W [obs_t, action_{t-1}], state))``, where ``W`` maps the input to
+    the xLSTM width and ``P`` is the context projection.
+
+    The recurrent state is the nested dict of ``xLSTMBlockStack.step``, with one entry ``"block_<i>"``
+    per block: ``{"conv_state", "slstm_state"}`` for an sLSTM block, where ``slstm_state`` [4, B, H]
+    stacks (h, c, n, m), and ``{"mlstm_state", "conv_state"}`` for an mLSTM block. ``conv_state`` is
+    None without causal convolution. The initial state is all zeros, as in xlstm. ``step`` and
+    ``unroll`` never modify the state passed in, so it can be stored as ``state_before[t]``.
+    ``STATE_BATCH_AXIS`` gives the batch axis of every state leaf, in the format of
+    ``ContextualRolloutBuffer(recurrent_state_batch_axis=...)``.
+
+    The vanilla sLSTM starts the stabilizer ``m`` from the input gate only when the whole batch is
+    at the zero state (``torch.all(n == 0)``). Rows that start from zero next to rows that do not
+    get the same ``h``, but ``c``, ``n`` and ``m`` rescaled: compare ``h`` in reconstruction checks.
+
+    :param observation_dim: Dimension of the flattened observation
+    :param action_dim: Dimension of the action
+    :param context_dim: Dimension of the context ``z_t``
+    :param xlstm_config: Config of the block stack, see ``create_xlstm``
+    :param projection_net_arch: Hidden layers of the context projection, linear by default
+    :param activation_fn: Activation function of the hidden layers of the context projection
+    """
+
+    # Batch axis of each state leaf, in the format of ``ContextualRolloutBuffer(recurrent_state_batch_axis=...)``
+    STATE_BATCH_AXIS: dict[str, int] = {"slstm_state": 1, "mlstm_state": 0, "conv_state": 0}
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        context_dim: int = 8,
+        xlstm_config: xLSTMBlockStackConfig | Mapping[str, Any] | None = None,
+        projection_net_arch: list[int] | None = None,
+        activation_fn: type[nn.Module] = nn.ReLU,
+    ) -> None:
+        super().__init__()
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
+        self.context_dim = context_dim
+        self.xlstm = create_xlstm(xlstm_config)
+        self.uses_cuda_backend = any(isinstance(module, sLSTMCell_cuda) for module in self.xlstm.modules())
+        self.embedding_dim = self.xlstm.config.embedding_dim
+        self.input_projection = nn.Linear(observation_dim + action_dim, self.embedding_dim)
+        self.context_projection = nn.Sequential(
+            *create_mlp(self.embedding_dim, context_dim, projection_net_arch or [], activation_fn)
+        )
+
+    def initial_state(self, batch_size: int) -> dict[str, Any]:
+        """
+        State at episode start, for ``batch_size`` rows.
+
+        :param batch_size: Number of rows, e.g. ``n_envs``
+        :return: The zero state, with the structure that ``step`` returns
+        """
+        param = next(self.parameters())
+        # The structure depends on the block types, so take it from one step
+        with th.no_grad():
+            _, state = self.xlstm.step(th.zeros(batch_size, 1, self.embedding_dim, device=param.device, dtype=param.dtype))
+        return self._zeros_like_state(state)
+
+    def reset_state(self, state: dict[str, Any], reset_mask: th.Tensor | np.ndarray) -> dict[str, Any]:
+        """
+        Reset some rows to the initial state, e.g. the envs whose episode ended.
+
+        :param state: Current state
+        :param reset_mask: [B] bool, True for the rows to reset
+        :return: The new state
+        """
+        return self._select_state(reset_mask, self._zeros_like_state(state), state)
+
+    def embed_step(
+        self, state: dict[str, Any], observations: th.Tensor, prev_actions: th.Tensor
+    ) -> tuple[th.Tensor, dict[str, Any]]:
+        """
+        ``step`` without the context head: the xLSTM embedding of one input ``[obs_t, action_{t-1}]`` per row,
+        which every head reads. ``context_projection(embed_step(...)[0])`` is ``step(...)[0]``.
+
+        :param state: ``state_before[t]``
+        :param observations: ``obs_t`` [B, *obs_shape]
+        :param prev_actions: ``action_{t-1}`` [B, action_dim], zero at episode start
+        :return: The embedding [B, embedding_dim] and ``state_after[t]``
+        """
+        x = th.cat([observations.flatten(start_dim=1), prev_actions.flatten(start_dim=1)], dim=-1)
+        if self.uses_cuda_backend and x.device.type != "cuda":
+            raise RuntimeError(f"The sLSTM 'cuda' backend only runs on CUDA devices, not {x.device}: use backend: vanilla")
+        x = self.input_projection(x).unsqueeze(1)
+        # xlstm writes into the state dict and overwrites conv_state in place, so it gets a copy
+        output, new_state = self.xlstm.step(x, self._clone_state(state))
+        return output.squeeze(1), new_state
+
+    def step(
+        self, state: dict[str, Any], observations: th.Tensor, prev_actions: th.Tensor
+    ) -> tuple[th.Tensor, dict[str, Any]]:
+        """
+        Process one input ``[obs_t, action_{t-1}]`` per row.
+
+        :param state: ``state_before[t]``
+        :param observations: ``obs_t`` [B, *obs_shape]
+        :param prev_actions: ``action_{t-1}`` [B, action_dim], zero at episode start
+        :return: The context ``z_t`` [B, context_dim] and ``state_after[t]``
+        """
+        embedding, new_state = self.embed_step(state, observations, prev_actions)
+        return self.context_projection(embedding), new_state
+
+    def unroll(
+        self,
+        state: dict[str, Any],
+        observations: th.Tensor,
+        prev_actions: th.Tensor,
+        mask: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, dict[str, Any]]:
+        """
+        Process a sequence step by step, e.g. complete episodes of the episode buffer.
+        Where ``mask`` is False, a row keeps its state and gets a zero context,
+        so padding never advances the memory.
+
+        :param state: State before the first input
+        :param observations: [B, L, *obs_shape]
+        :param prev_actions: [B, L, action_dim]
+        :param mask: [B, L] bool, True for valid inputs. All inputs are valid by default.
+        :return: The contexts [B, L, context_dim] and the state after each row's last valid input
+        """
+        batch_size, seq_len = observations.shape[:2]
+        if seq_len == 0:
+            return observations.new_zeros(batch_size, 0, self.context_dim), state
+
+        contexts = []
+        for i in range(seq_len):
+            context, new_state = self.step(state, observations[:, i], prev_actions[:, i])
+            if mask is None:
+                state = new_state
+            else:
+                valid = mask[:, i].bool()
+                state = self._select_state(valid, new_state, state)
+                context = th.where(valid.unsqueeze(-1), context, th.zeros_like(context))
+            contexts.append(context)
+        return th.stack(contexts, dim=1), state
+
+    def forward(
+        self,
+        state: dict[str, Any],
+        observations: th.Tensor,
+        prev_actions: th.Tensor,
+        mask: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, dict[str, Any]]:
+        return self.unroll(state, observations, prev_actions, mask)
+
+    @classmethod
+    def _batch_axis(cls, path: tuple) -> int:
+        # The innermost key of the path with a known axis wins, e.g. ("block_0", "conv_state", 0)
+        for key in reversed(path):
+            if isinstance(key, str) and key in cls.STATE_BATCH_AXIS:
+                return cls.STATE_BATCH_AXIS[key]
+        raise ValueError(f"No batch axis known for recurrent-state leaf {path}")
+
+    @classmethod
+    def _select_state(cls, condition: th.Tensor | np.ndarray, state_if_true: Any, state_if_false: Any) -> Any:
+        """
+        Per row, ``state_if_true`` where ``condition`` [B] is True, else ``state_if_false``.
+        """
+        treedef, leaves_if_true = _flatten_recurrent_state(state_if_true)
+        _, leaves_if_false = _flatten_recurrent_state(state_if_false)
+        selected = []
+        for (path, leaf_if_true), (_, leaf_if_false) in zip(leaves_if_true, leaves_if_false, strict=True):
+            shape = [1] * leaf_if_true.ndim
+            shape[cls._batch_axis(path)] = -1
+            row_condition = th.as_tensor(condition, dtype=th.bool, device=leaf_if_true.device).view(shape)
+            selected.append(th.where(row_condition, leaf_if_true, leaf_if_false))
+        return _unflatten_recurrent_state(treedef, iter(selected))
+
+    @staticmethod
+    def _clone_state(state: Any) -> Any:
+        treedef, leaves = _flatten_recurrent_state(state)
+        return _unflatten_recurrent_state(treedef, (leaf.clone() for _, leaf in leaves))
+
+    @staticmethod
+    def _zeros_like_state(state: Any) -> Any:
+        treedef, leaves = _flatten_recurrent_state(state)
+        return _unflatten_recurrent_state(treedef, (th.zeros_like(leaf) for _, leaf in leaves))
+
 
 # Output activations of the context head, by config name
 CONTEXT_ACTIVATIONS: dict[str, type[nn.Module]] = {"sigmoid": nn.Sigmoid}
@@ -130,26 +377,6 @@ class XLSTMRolloutEncoder(XLSTMContextEncoder):
             if auxiliary_dim is None
             else nn.Sequential(*create_mlp(self.embedding_dim, auxiliary_dim, auxiliary_net_arch or [], activation_fn))
         )
-
-    def embed_step(
-        self, state: dict[str, Any], observations: th.Tensor, prev_actions: th.Tensor
-    ) -> tuple[th.Tensor, dict[str, Any]]:
-        """
-        ``XLSTMContextEncoder.step`` without the context head: the xLSTM embedding of one input ``[obs_t, action_{t-1}]``
-        per row, which both heads read. ``context_projection(embed_step(...)[0])`` is ``step(...)[0]``.
-
-        :param state: ``state_before[t]``
-        :param observations: ``obs_t`` [B, *obs_shape]
-        :param prev_actions: ``action_{t-1}`` [B, action_dim], zero at episode start
-        :return: The embedding [B, embedding_dim] and ``state_after[t]``
-        """
-        x = th.cat([observations.flatten(start_dim=1), prev_actions.flatten(start_dim=1)], dim=-1)
-        if self.uses_cuda_backend and x.device.type != "cuda":
-            raise RuntimeError(f"The sLSTM 'cuda' backend only runs on CUDA devices, not {x.device}: use backend: vanilla")
-        x = self.input_projection(x).unsqueeze(1)
-        # xlstm writes into the state dict and overwrites conv_state in place, so it gets a copy
-        output, new_state = self.xlstm.step(x, self._clone_state(state))
-        return output.squeeze(1), new_state
 
     def unroll_with_auxiliary(
         self,
