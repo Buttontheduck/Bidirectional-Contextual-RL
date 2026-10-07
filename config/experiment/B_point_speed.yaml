@@ -1,0 +1,11 @@
+# @package _global_
+# B: test the speed loss. A + speed head (vx_t / v_ref), encoder loss L_context + 0.1 * L_speed.
+cppo:
+  velocity_head:
+    enabled: true
+    weight: 0.1
+
+wandb:
+  run_name: B_point_speed_s${training.seed}
+  group: B_point_speed
+  tags: [cppo, point_context, speed_head]

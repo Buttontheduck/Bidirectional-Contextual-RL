@@ -16,8 +16,8 @@ from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from .torch_layers import CONTEXT_HEADS, XLSTMRolloutEncoder
 from .type_aliases import ContextualPolicyState
 
-# How the actor and critic read the Gaussian head's variance: as it is, or its logarithm
-CONTEXT_VARIANCE_INPUTS = ("variance", "log_variance")
+# How the actor and critic read the Gaussian head's variance: as it is, its logarithm, or not at all (the mean only)
+CONTEXT_VARIANCE_INPUTS = ("variance", "log_variance", "none")
 
 
 class ContextualActorCriticPolicy(ActorCriticPolicy):
@@ -33,9 +33,11 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
 
     With ``context_head="gaussian"``, the encoder estimates the context as a Gaussian: ``z_t = [mu_t, sigma2_t]``,
     its mean and variance, each ``context_dim`` wide. The actor and critic read ``[o_t, mu_t, log sigma2_t]``
-    (``context_variance_input="log_variance"``, the default) or ``[o_t, mu_t, sigma2_t]`` (``"variance"``), see
-    ``context_inputs``; the variance itself is often tiny next to the observations, its logarithm is not.
+    (``context_variance_input="log_variance"``, the default), ``[o_t, mu_t, sigma2_t]`` (``"variance"``) or
+    ``[o_t, mu_t]`` (``"none"``: the variance is still trained, but never an input), see ``context_inputs``; the
+    variance itself is often tiny next to the observations, its logarithm is not.
     ``latent_dim`` is the width of ``z_t``: ``context_dim``, or ``2 * context_dim`` with the Gaussian head.
+    ``context_input_dim`` is the width the actor and critic read of it: ``latent_dim``, or ``context_dim`` with ``"none"``.
 
     ``auxiliary_dim`` gives the encoder an auxiliary head for supervised targets (BatteryPlane: the true speed),
     see ``XLSTMRolloutEncoder``. The actor and critic never read it: it only shapes the encoder's embedding.
@@ -87,7 +89,8 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
     :param context_head: ``"point"``: the encoder outputs the context ``z_t``; ``"gaussian"``: its mean and
         variance ``[mu_t, sigma2_t]``, which the actor and critic both read
     :param context_variance_input: With the Gaussian head, what the actor and critic read of the variance:
-        ``"log_variance"`` (``log sigma2_t``) or ``"variance"`` (``sigma2_t``); unused with the point head
+        ``"log_variance"`` (``log sigma2_t``), ``"variance"`` (``sigma2_t``) or ``"none"`` (nothing: they read the
+        mean only); unused with the point head
     :param auxiliary_dim: Size of the encoder's auxiliary head, None for no auxiliary head
     :param auxiliary_net_arch: Hidden layers of the auxiliary head, linear by default
     """
@@ -145,6 +148,8 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
         self.auxiliary_net_arch = auxiliary_net_arch
         # Width of z_t, which the actor and critic read
         self.latent_dim = 2 * context_dim if context_head == "gaussian" else context_dim
+        # Width of what they read of it
+        self.context_input_dim = context_dim if context_head == "gaussian" and context_variance_input == "none" else self.latent_dim
 
         super().__init__(
             observation_space,
@@ -192,7 +197,7 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
     def _build_mlp_extractor(self) -> None:
         # Both branches receive [observation features, z_t]
         self.mlp_extractor = MlpExtractor(
-            self.features_dim + self.latent_dim,
+            self.features_dim + self.context_input_dim,
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
             device=self.device,
@@ -310,13 +315,16 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
     def context_inputs(self, latents: th.Tensor) -> th.Tensor:
         """
         What the actor and critic read of ``z_t``: ``z_t`` itself, except with the Gaussian head and
-        ``context_variance_input="log_variance"``, where the variance is replaced by its logarithm.
+        ``context_variance_input="log_variance"``, where the variance is replaced by its logarithm, or ``"none"``,
+        where only the mean is kept.
 
         :param latents: ``z_t`` [..., latent_dim]
-        :return: [..., latent_dim]
+        :return: [..., context_input_dim]
         """
-        if self.context_head == "gaussian" and self.context_variance_input == "log_variance":
+        if self.context_head == "gaussian" and self.context_variance_input in ("log_variance", "none"):
             mean, variance = self.encoder.split_context(latents)
+            if self.context_variance_input == "none":
+                return mean
             return th.cat([mean, th.log(variance)], dim=-1)  # type: ignore[arg-type]
         return latents
 

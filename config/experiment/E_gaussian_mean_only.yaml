@@ -1,0 +1,13 @@
+# @package _global_
+# E: test whether the uncertainty input helps. The selected Gaussian (selected_gaussian.nll_beta in the base
+# configuration), but the actor and critic read [o_t, mu_t] only; the variance is still trained. No speed head.
+cppo:
+  context_head: gaussian
+  context_variance_input: none
+  supervised:
+    nll_beta: ${selected_gaussian.nll_beta}
+
+wandb:
+  run_name: E_gaussian_mean_only_beta${selected_gaussian.nll_beta}_s${training.seed}
+  group: E_gaussian_mean_only_beta${selected_gaussian.nll_beta}
+  tags: [cppo, gaussian_context, mean_only]

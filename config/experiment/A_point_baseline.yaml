@@ -1,0 +1,6 @@
+# @package _global_
+# A: main baseline. Point estimate z_t = b_hat_t (MSE), no speed head: the base configuration itself.
+wandb:
+  run_name: A_point_baseline_s${training.seed}
+  group: A_point_baseline
+  tags: [cppo, point_context]

@@ -1,0 +1,163 @@
+# CPPO: Contextual_PPO (PPO + xLSTM context encoder) on BatteryPlane, hidden task.
+#
+# This file is the base configuration and is experiment A, the main baseline. The xLSTM encoder reads
+# [o_t, a_{t-1}] and infers the hidden battery charge b_t; the actor and critic read [o_t, z_t]. Each update,
+# PPO trains the actor and critic with the encoder frozen; then the encoder is trained alone, by supervised
+# regression on the true charge (privileged labels, training only), over complete episodes of an episode buffer.
+# A: point estimate z_t = b_hat_t (one sigmoid number, MSE loss), no speed head.
+#
+# Experiments (experiment/) change only what they test:
+#   A_point_baseline      point estimate, no speed head (this file)
+#   B_point_speed         A + speed head, weight 0.1
+#   C_gaussian_nll        Gaussian estimate, plain NLL (beta 0), actor and critic read [mu, log sigma2]
+#   D_gaussian_beta_nll   Gaussian estimate, beta-NLL (beta 0.5), actor and critic read [mu, log sigma2]
+#   E_gaussian_mean_only  selected Gaussian, actor and critic read the mean only
+#   F_gaussian_speed      selected Gaussian, [mu, log sigma2], speed head weight 0.1
+#
+# Run (Hydra needs an absolute --config-path):
+#   python main_battery_plane_contextual_ppo.py --config-path "<this repository>/config" --config-name cppo \
+#       -m +experiment=A_point_baseline training.seed=0,1,2
+
+# The Gaussian setting E and F build on: the better of C (beta 0) and D (beta 0.5). Set it once both have run,
+# here or on the command line (selected_gaussian.nll_beta=0); E and F carry it in their W&B run names.
+selected_gaussian:
+  nll_beta: 0.5
+
+env:
+  # Recorded in W&B only. The environment always comes from the project's battery_plane.py.
+  id: BatteryPlane-v0
+  observation_mode: hidden
+  # null keeps the environment's default crash penalty (300).
+  crash_penalty: null
+  # Extra BatteryPlaneVec constructor arguments. Empty = environment defaults.
+  kwargs: {}
+
+training:
+  total_timesteps: 1000000
+  n_envs: 8
+  vec_env: dummy
+  # Network init, action sampling and each env copy's stream (seed * 100 + index). Run seeds 0, 1, 2.
+  seed: 0
+  device: cpu
+
+cppo:
+  policy: MlpPolicy
+  # PPO
+  learning_rate: 0.0003
+  n_steps: 512                             # 512 x 8 envs = 4096 transitions per update
+  n_minibatches: 4                         # minibatches of complete env streams: 2 streams x 512 steps
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  normalize_advantage: true
+  ent_coef: 0.0
+  vf_coef: 0.5
+  max_grad_norm: 0.5                       # the actor and critic together
+  target_kl: null
+  net_arch: [256, 256]                     # actor and critic, each on [o_t, z_t]
+  activation_fn: tanh
+  ortho_init: true                         # the actor and critic only, never the encoder
+  log_std_init: 0.0
+  verbose: 1
+  bptt_len: null
+  reset_envs_each_rollout: false
+
+  # Encoder training: supervised on the true charge b_t (labels from the env infos b0, b; never an input).
+  # The PPO losses never reach the encoder (encoder_actor_loss_weight is used by encoder_objective: rl only).
+  encoder_objective: supervised
+  encoder_actor_loss_weight: 1.0
+  encoder_max_grad_norm: null
+  context_info_keys: [b0, b]
+  supervised:
+    capacity: 200000                       # stored timesteps of completed episodes; the oldest are evicted whole
+    episode_batch_size: 16                 # complete episodes per encoder step and per validation batch
+    gradient_steps: 8                      # encoder steps after the PPO epochs of every update
+    validation_fraction: 0.1               # share of episodes kept for validation, never trained on
+    seed: null                             # null = training.seed
+    nll_beta: 0.0                          # Gaussian head only: beta of the beta-NLL (0 = plain NLL)
+
+  # Context head: embedding -> 128 -> 128 -> 1 -> sigmoid, z_t = b_hat_t in (0, 1).
+  context_dim: 1
+  context_net_arch: [128, 128]
+  context_activation: sigmoid
+  # point: z_t = b_hat_t (MSE). gaussian: mean mu_t (sigmoid) and variance sigma2_t of b_t (beta-NLL).
+  context_head: point
+  # Gaussian head only, what the actor and critic read of the variance: log_variance, variance or none (mean only).
+  context_variance_input: log_variance
+
+  # Speed head: a second head on the encoder embedding predicts the true speed ratio vx_t / v_ref (labels from
+  # the training envs' infos). Encoder loss: L_context + weight * L_speed. The actor and critic never read it.
+  velocity_head:
+    enabled: false
+    weight: 0.1                            # lambda in [0, 1]
+    net_arch: [128, 128]
+
+  # xLSTM block stack, width 128: an mLSTM block (matrix memory), then an sLSTM block (scalar memory).
+  # Every block keeps its memory across the episode and is reset at episode starts.
+  xlstm:
+    embedding_dim: 128
+    num_blocks: 2
+    slstm_at: [1]
+    # Sizes only the causal mask of xlstm's full-sequence forward, which CPPO never calls (it always steps)
+    context_length: 700
+    mlstm_block:
+      mlstm:
+        num_heads: 4
+        conv1d_kernel_size: 4
+        qkv_proj_blocksize: 16
+    slstm_block:
+      slstm:
+        backend: vanilla
+        num_heads: 4
+        conv1d_kernel_size: 0
+      feedforward: null
+
+evaluation:
+  # In environment steps: 18 episodes x 700 steps each time, 20 points over 1M steps.
+  frequency: 50000
+  deterministic: true
+  # The fixed evaluation episodes, identical for every experiment.
+  reset_grid:
+    eval_seeds: [1000, 1001, 1002]
+    eval_initial_battery: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    eval_vx_obs_noise: [5.0]
+    eval_y0: null                          # seeded random start
+    eval_vx0: null
+  render: false
+  render_fps: 120
+
+checkpoint:
+  frequency: 500000                        # environment steps
+  name_prefix: cppo
+
+wandb:
+  project: cppo
+  entity: null
+  # null respects WANDB_MODE; offline and disabled also work
+  mode: null
+  # Run name and group: <prefix><run_name>, <prefix><group>, set by every experiment
+  run_name_prefix: cppo_
+  run_name: A_point_baseline_s${training.seed}
+  group: A_point_baseline
+  tags: [cppo, point_context]
+  sync_tensorboard: true
+  save_code: true
+  tensorboard_log_name: cppo
+  gradient_save_frequency: 0
+  callback_verbose: 2
+
+paths:
+  # Resolved from the project root of the training script, whatever directory you start from.
+  output_dir: runs_cppo
+
+hydra:
+  run:
+    dir: .
+  sweep:
+    dir: runs_cppo/_hydra_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+  output_subdir: null
+  job:
+    chdir: false

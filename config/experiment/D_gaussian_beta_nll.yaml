@@ -1,0 +1,12 @@
+# @package _global_
+# D: test beta-NLL. C with beta 0.5: each step's NLL weighted by sigma2_t ** 0.5 (no gradient through the weight).
+cppo:
+  context_head: gaussian
+  context_variance_input: log_variance
+  supervised:
+    nll_beta: 0.5
+
+wandb:
+  run_name: D_gaussian_beta_nll_s${training.seed}
+  group: D_gaussian_beta_nll
+  tags: [cppo, gaussian_context]

@@ -1,0 +1,16 @@
+# @package _global_
+# F: test the combined method. The selected Gaussian (selected_gaussian.nll_beta in the base configuration),
+# actor and critic read [o_t, mu_t, log sigma2_t], plus the speed head: L_context + 0.1 * L_speed.
+cppo:
+  context_head: gaussian
+  context_variance_input: log_variance
+  supervised:
+    nll_beta: ${selected_gaussian.nll_beta}
+  velocity_head:
+    enabled: true
+    weight: 0.1
+
+wandb:
+  run_name: F_gaussian_speed_beta${selected_gaussian.nll_beta}_s${training.seed}
+  group: F_gaussian_speed_beta${selected_gaussian.nll_beta}
+  tags: [cppo, gaussian_context, speed_head]
