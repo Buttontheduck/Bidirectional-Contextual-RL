@@ -6,6 +6,9 @@ tests/
 # Result figures (the whole folder, including its plotting script)
 results_figures/
 
+# Training runs (configs, metrics, checkpoints) and Hydra multirun folders
+runs_cppo/
+
 # Weights & Biases
 wandb/
 

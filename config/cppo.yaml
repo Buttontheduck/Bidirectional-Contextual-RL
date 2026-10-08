@@ -14,9 +14,8 @@
 #   E_gaussian_mean_only  selected Gaussian, actor and critic read the mean only
 #   F_gaussian_speed      selected Gaussian, [mu, log sigma2], speed head weight 0.1
 #
-# Run (Hydra needs an absolute --config-path):
-#   python main_battery_plane_contextual_ppo.py --config-path "<this repository>/config" --config-name cppo \
-#       -m +experiment=A_point_baseline training.seed=0,1,2
+# Run from the repository (main_battery_plane_contextual_ppo.py reads this folder):
+#   python main_battery_plane_contextual_ppo.py -m +experiment=A_point_baseline training.seed=0,1,2
 
 # The Gaussian setting E and F build on: the better of C (beta 0) and D (beta 0.5). Set it once both have run,
 # here or on the command line (selected_gaussian.nll_beta=0); E and F carry it in their W&B run names.
