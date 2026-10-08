@@ -1,4 +1,5 @@
 # @package _global_
+experiment_id: A
 # A: main baseline. Point estimate z_t = b_hat_t (MSE), no speed head: the base configuration itself.
 wandb:
   run_name: A_point_baseline_s${training.seed}

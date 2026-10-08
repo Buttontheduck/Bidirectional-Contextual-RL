@@ -6,11 +6,8 @@
 #
 # stable-baselines3 and gymnasium are the plain PyPI releases. The installed SB3 has no edited files, only added
 # packages; the gymnasium edits only register BatteryPlane, which battery_plane.py does itself.
-# The code imports contextual_ppo as stable_baselines3.contextual_ppo, so after installing, link it into SB3
-# (contextual_ppo needs nothing else from the SB3 fork, recurrent_sac included):
-#
-#   SB3=$(python -c "import os, stable_baselines3; print(os.path.dirname(stable_baselines3.__file__))")
-#   ln -s "$PWD/contextual_ppo" "$SB3/contextual_ppo"
+# The training entry point imports the repository's contextual_ppo/ directly.
+# No link inside the installed stable_baselines3 package is needed.
 #
 # Training runs on CPU. On a Linux machine without a GPU, the CPU build of torch is much smaller:
 #   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu

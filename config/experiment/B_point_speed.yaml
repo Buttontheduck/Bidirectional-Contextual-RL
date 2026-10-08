@@ -1,4 +1,5 @@
 # @package _global_
+experiment_id: B
 # B: test the speed loss. A + speed head (vx_t / v_ref), encoder loss L_context + 0.1 * L_speed.
 cppo:
   velocity_head:

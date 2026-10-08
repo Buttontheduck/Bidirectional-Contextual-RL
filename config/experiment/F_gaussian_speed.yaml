@@ -1,4 +1,5 @@
 # @package _global_
+experiment_id: F
 # F: test the combined method. The selected Gaussian (selected_gaussian.nll_beta in the base configuration),
 # actor and critic read [o_t, mu_t, log sigma2_t], plus the speed head: L_context + 0.1 * L_speed.
 cppo:

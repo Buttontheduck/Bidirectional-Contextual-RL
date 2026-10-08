@@ -2,6 +2,7 @@
 test_*.py
 *_test.py
 tests/
+!evaluate_final_test.py
 
 # Result figures (the whole folder, including its plotting script)
 results_figures/

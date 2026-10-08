@@ -18,9 +18,11 @@
 #   python main_battery_plane_contextual_ppo.py -m +experiment=A_point_baseline training.seed=0,1,2
 
 # The Gaussian setting E and F build on: the better of C (beta 0) and D (beta 0.5). Set it once both have run,
-# here or on the command line (selected_gaussian.nll_beta=0); E and F carry it in their W&B run names.
+# via run_grid.py using final-checkpoint validation return across all seeds, or explicitly on the command line.
+# Null prevents silently running E/F with an unselected default; E/F include the selected beta in their names.
+experiment_id: A
 selected_gaussian:
-  nll_beta: 0.5
+  nll_beta: null
 
 env:
   # Recorded in W&B only. The environment always comes from the project's battery_plane.py.
@@ -38,6 +40,8 @@ training:
   # Network init, action sampling and each env copy's stream (seed * 100 + index). Run seeds 0, 1, 2.
   seed: 0
   device: cpu
+  num_threads: 4                         # per training process; launcher also limits BLAS pools
+  num_interop_threads: 1
 
 cppo:
   policy: MlpPolicy
@@ -117,7 +121,7 @@ evaluation:
   # In environment steps: 18 episodes x 700 steps each time, 20 points over 1M steps.
   frequency: 50000
   deterministic: true
-  # The fixed evaluation episodes, identical for every experiment.
+  # Validation episodes, identical for every experiment; used for C/D selection, not final reporting.
   reset_grid:
     eval_seeds: [1000, 1001, 1002]
     eval_initial_battery: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
@@ -126,6 +130,15 @@ evaluation:
     eval_vx0: null
   render: false
   render_fps: 120
+
+# Reserved held-out episodes. Only evaluate_final_test.py consumes this grid, after all training/selection.
+final_test:
+  reset_grid:
+    eval_seeds: [2000, 2001, 2002]
+    eval_initial_battery: ${evaluation.reset_grid.eval_initial_battery}
+    eval_vx_obs_noise: ${evaluation.reset_grid.eval_vx_obs_noise}
+    eval_y0: ${evaluation.reset_grid.eval_y0}
+    eval_vx0: ${evaluation.reset_grid.eval_vx0}
 
 checkpoint:
   frequency: 500000                        # environment steps
@@ -150,6 +163,7 @@ wandb:
 paths:
   # Resolved from the project root of the training script, whatever directory you start from.
   output_dir: runs_cppo
+  run_dir: null                          # launcher supplies a unique attempt directory
 
 hydra:
   run:

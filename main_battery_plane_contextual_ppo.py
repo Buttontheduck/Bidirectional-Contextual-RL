@@ -5,11 +5,11 @@
     python main_battery_plane_contextual_ppo.py -m +experiment=A_point_baseline,B_point_speed training.seed=0,1,2
 
 Everything it needs is in this repository: the environment (battery_plane.py), the learner
-(contextual_ppo/, imported as stable_baselines3.contextual_ppo, see requirements.txt) and config/cppo.yaml with
+(contextual_ppo/, imported from the repository root) and config/cppo.yaml with
 its experiments. The environment, evaluation grid, rendering, checkpoints and W&B logging are those of the
 BatteryPlane PPO baseline, whose helpers are copied below.
 
-The learner is stable_baselines3.contextual_ppo.ContextualPPO (design: Contextual_PPO_project_plan.md in that
+The learner is contextual_ppo.ContextualPPO (design: Contextual_PPO_project_plan.md in that
 package). Evaluation carries the recurrent memory: SB3's evaluate_policy passes the state and the episode starts
 to predict(). For a custom inference loop, pass the returned state back at every step:
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import sys
 from collections.abc import Mapping, Sequence
 from importlib.metadata import version
@@ -32,25 +33,28 @@ from typing import Any
 import gymnasium as gym
 import hydra
 import stable_baselines3
-import stable_baselines3.contextual_ppo as contextual_ppo
+import numpy as np
+import torch
 import torch.nn as nn
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
-from stable_baselines3.contextual_ppo import ContextualPPO
-from stable_baselines3.contextual_ppo.policies import CONTEXT_VARIANCE_INPUTS
-from stable_baselines3.contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS
 from wandb.integration.sb3 import WandbCallback
 
-# The repository root holds battery_plane.py, the single source of truth for the environment.
+# The repository root holds battery_plane.py, the single source of truth for the environment, and contextual_ppo/.
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import battery_plane as bp  # noqa: E402
+import contextual_ppo  # noqa: E402
 from battery_plane import iter_eval_resets  # noqa: E402
+from contextual_ppo import ContextualPPO  # noqa: E402
+from contextual_ppo.policies import CONTEXT_VARIANCE_INPUTS  # noqa: E402
+from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 
@@ -240,8 +244,17 @@ def _positive_int(cfg: DictConfig, key: str) -> int:
 def validate_config(cfg: DictConfig) -> None:
     """Reject invalid settings before starting logging or worker processes."""
     validate_eval_reset_grid(cfg.evaluation.reset_grid)
+    validate_eval_reset_grid(cfg.final_test.reset_grid)
+    validation_seeds = set(cfg.evaluation.reset_grid.eval_seeds)
+    test_seeds = set(cfg.final_test.reset_grid.eval_seeds)
+    seed, n_envs = int(cfg.training.seed), int(cfg.training.n_envs)
+    training_seeds = {seed * 100 + i for i in range(n_envs)} | {seed + i for i in range(n_envs)}
+    if validation_seeds & test_seeds or (validation_seeds | test_seeds) & training_seeds:
+        raise ValueError("Training, validation and final-test seeds must be disjoint")
+    if cfg.experiment_id in ("E", "F") and cfg.selected_gaussian.nll_beta not in (0.0, 0.5):
+        raise ValueError("Select C or D using validation first: selected_gaussian.nll_beta=0 or 0.5")
     for key in (
-        "training.n_envs", "training.total_timesteps", "evaluation.frequency", "checkpoint.frequency",
+        "training.num_threads", "training.num_interop_threads", "training.n_envs", "training.total_timesteps", "evaluation.frequency", "checkpoint.frequency",
         "cppo.n_steps", "cppo.n_epochs", "cppo.n_minibatches", "cppo.context_dim",
         "cppo.supervised.capacity", "cppo.supervised.episode_batch_size", "cppo.supervised.gradient_steps",
     ):
@@ -376,9 +389,39 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
     )
 
 
+def configure_cpu_threads(cfg: DictConfig) -> None:
+    """Each launcher child has its own PyTorch pools; BLAS limits are set before importing it."""
+    torch.set_num_threads(int(cfg.training.num_threads))
+    interop = int(cfg.training.num_interop_threads)
+    if torch.get_num_interop_threads() != interop:
+        torch.set_num_interop_threads(interop)
+
+
+def evaluate_schedule(model, cfg: DictConfig, reset_grid: DictConfig) -> dict:
+    schedule = list(iter_eval_resets(reset_grid))
+    env, scheduler, _ = make_eval_env(cfg, schedule)
+    try:
+        scheduler.rewind()
+        rewards, lengths = evaluate_policy(
+            model, env, n_eval_episodes=len(schedule), deterministic=bool(cfg.evaluation.deterministic),
+            return_episode_rewards=True,
+        )
+    finally:
+        env.close()
+    if not np.isfinite(rewards).all():
+        raise ValueError("Non-finite evaluation return")
+    return {
+        "mean_reward": float(np.mean(rewards)), "std_reward": float(np.std(rewards)),
+        "episode_rewards": [float(x) for x in rewards], "episode_lengths": [int(x) for x in lengths],
+        "reset_schedule": schedule, "checkpoint": "final_model.zip", "timesteps": model.num_timesteps,
+    }
+
+
 @hydra.main(version_base=None, config_path="config", config_name="cppo")
 def main(cfg: DictConfig) -> None:
     validate_config(cfg)
+    configure_cpu_threads(cfg)
+    started = time.monotonic()
     schedule = list(iter_eval_resets(cfg.evaluation.reset_grid))
     prefix = cfg.wandb.run_name_prefix
     run_name = f"{prefix}{cfg.wandb.run_name or f'{cfg.env.observation_mode}_s{cfg.training.seed}'}"
@@ -403,7 +446,9 @@ def main(cfg: DictConfig) -> None:
         output_dir = Path(cfg.paths.output_dir)
         if not output_dir.is_absolute():
             output_dir = PROJECT_ROOT / output_dir
-        run_dir = output_dir / run.id
+        run_dir = Path(cfg.paths.run_dir) if cfg.paths.run_dir is not None else output_dir / run.id
+        if not run_dir.is_absolute():
+            run_dir = PROJECT_ROOT / run_dir
         run_dir.mkdir(parents=True, exist_ok=False)
         checkpoint_dir, best_model_dir, eval_log_dir = (run_dir / name for name in ("checkpoints", "best_model", "eval"))
         for directory in (checkpoint_dir, best_model_dir, eval_log_dir):
@@ -424,6 +469,9 @@ def main(cfg: DictConfig) -> None:
         versions = {pkg: version(pkg) for pkg in ("stable-baselines3", "xlstm", "torch", "gymnasium", "hydra-core")}
         metadata = {
             "algorithm": "ContextualPPO",
+            "experiment_id": cfg.experiment_id,
+            "torch_threads": torch.get_num_threads(),
+            "torch_interop_threads": torch.get_num_interop_threads(),
             "effective_env": core._kw,
             "versions": versions,
             "environment_source": str(bp.__file__),
@@ -496,6 +544,12 @@ def main(cfg: DictConfig) -> None:
             tb_log_name=cfg.wandb.tensorboard_log_name,
         )
         model.save(run_dir / "final_model")
+        # A fixed final-checkpoint validation score selects C versus D across all training seeds.
+        # The separate final_test grid is never evaluated during training or selection.
+        validation = evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)
+        (run_dir / "final_validation.json").write_text(json.dumps(validation, indent=2) + "\n")
+        run.summary["validation/final_mean_reward"] = validation["mean_reward"]
+        metadata["elapsed_seconds"] = time.monotonic() - started
         metadata["actual_timesteps"] = model.num_timesteps
         (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         run.summary["actual_timesteps"] = model.num_timesteps

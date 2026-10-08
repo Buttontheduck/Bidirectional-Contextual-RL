@@ -1,4 +1,5 @@
 # @package _global_
+experiment_id: D
 # D: test beta-NLL. C with beta 0.5: each step's NLL weighted by sigma2_t ** 0.5 (no gradient through the weight).
 cppo:
   context_head: gaussian

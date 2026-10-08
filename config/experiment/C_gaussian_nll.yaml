@@ -1,4 +1,5 @@
 # @package _global_
+experiment_id: C
 # C: test ordinary NLL. Gaussian estimate (mu_t, sigma2_t) trained by the plain NLL (beta 0);
 # the actor and critic read [o_t, mu_t, log sigma2_t]. No speed head.
 cppo:
