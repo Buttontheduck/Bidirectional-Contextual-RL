@@ -19,6 +19,74 @@ These are the results from the A–F grid (W&B `duck13/cppo`) and the vanilla PP
 
 A frozen encoder gives PPO a fixed input that no longer shifts while the policy learns, so you can test the two halves separately. But on its own it can't settle "encoder or policy." If PPO fails on top of a frozen encoder, you still won't know whether the encoder was too weak or PPO can't use any battery estimate. Adding an oracle control fixes that.
 
+### 0. First check CPPO itself: give it the true battery
+
+Before building better encoders, ask: **can CPPO learn when battery estimation is perfect?** Replace the learned context with the true current battery for both the actor and critic. Bypass the encoder and disable its training; do not give the networks an additional learned estimate alongside the true battery.
+
+Observed-mode plain PPO (p04) already provides encouraging evidence: 212 final return and about 360 at its peak. Repeat it alongside the new conditions under the same scoring rule. Those historical scores are reference points, not guaranteed reproduction targets.
+
+**CPPO and plain PPO train the networks differently.** Both collect 4,096 transitions per rollout (8 environments × 512 steps), and both use each transition 10 times. They split those transitions into minibatches differently:
+
+| | Minibatch | Optimizer steps per rollout | Optimizer steps over 2M transitions |
+|---|---|---:|---:|
+| Plain PPO (p01–p04) | 256 transitions, shuffled from all 8 environments | 160 | ≈ 78k |
+| CPPO (A–F) | 1,024 transitions: two complete 512-step stretches, each from one environment | 40 | ≈ 19.5k |
+
+The learning rate is the same, so CPPO makes a quarter as many weight updates, but not a quarter as many passes over the data. Its minibatches contain two environment streams, potentially spanning episode boundaries; plain PPO shuffles individual transitions across all eight streams.
+
+**Primary runs: three conditions × three seeds = nine fresh runs.** All use 8 environments × 512 steps, 10 epochs, 2M requested environment transitions (rounded to complete rollouts), and training seeds 0, 1, 2.
+
+| Run | Learner and battery input | Minibatch | Optimizer steps per rollout | Purpose |
+|---|---|---|---:|---|
+| 0a | Plain PPO, true battery (`observed` mode) | 256 shuffled transitions | 160 | Reproduce the original baseline |
+| 0b | Plain PPO, true battery (`observed` mode) | 1,024 shuffled transitions | 40 | Match CPPO's batch size and optimizer-step count |
+| 0c | CPPO, true battery replacing the encoder | 1,024 transitions (2 streams × 512 steps) | 40 | Test CPPO without estimation error or encoder drift |
+
+- Every actor and critic receives the same five values: the four hidden-mode observations plus the true current battery, in the same order and scale. Speed remains noisy. There is no predicted mean, variance, or other encoder feature in 0c.
+- Keep the environment, reward, actor/critic architecture, learning rate, discount, GAE settings, and other PPO settings identical. The intended differences are the learner and the minibatch settings shown above.
+- Compare 0b with 0c to investigate differences beyond batch size and optimizer-step count, including shuffled transitions versus complete streams. Compare 0a with 0b to investigate the batch-size/update-count setting within plain PPO; these two effects are not separated by this comparison.
+- The earlier 32-environment × 128-step condition is deferred. It changes trajectory collection and GAE bootstrapping as well as minibatches, so success would not establish that CPPO "only needed more updates."
+
+**The 0c oracle path (implemented 2026-10-12).** Setting only `env.observation_mode=observed` would leave the encoder active and append its predictions to the visible battery, which is a different experiment. 0c instead uses the Hydra option `cppo.context_source=oracle`, set by `config/step0/cppo_oracle.yaml`:
+- `step0_oracle.py` replaces the xLSTM with `TrueBatteryEncoder`, which has no parameters and no memory and outputs `z_t = b_t` from the observation. The actor and critic read the observation only, because observed mode already ends with `b_t`. This holds in rollout collection, PPO minibatch evaluation, value prediction and evaluation, because all of them go through the same policy methods.
+- `encoder_objective=rl` with no encoder parameters means there is no episode buffer, no supervised encoder step, and nothing for the routed PPO losses to update. The speed head stays off.
+- CPPO's collector, PPO losses and whole-stream minibatching are unchanged. The default `cppo.context_source=encoder` leaves A–F unchanged; a missing field in an older saved config also means `encoder` during validation and model construction.
+- `validate_config` requires `observed` mode for the oracle. It rejects `full` (exact speed), hidden-battery modes, a supervised objective, the speed head, the Gaussian head or `context_dim` ≠ 1.
+- The inherited W&B prefix is retained: seed 0 is named `cppo_S0c_oracle_s0`, in group `cppo_S0c_oracle`.
+
+`python -m unittest checks.step0_checks -v` covers the pre-training checks:
+- The config differs from the base only in the battery input.
+- The actor and critic inputs equal plain PPO's observed-mode features on the same observations. With the oracle's weights loaded, plain PPO gives the same values and actions, and the previous action has no effect.
+- In rollouts with resets and terminal transitions, the observation's last column equals the true `b` from the env infos, for both `o_t` and its successor.
+- The encoder group is empty, so only the actor and critic change.
+- A saved model reloads with the oracle policy.
+- The oracle rejects exact-speed `full` mode. `checks.grid_checks` also verifies that older A–F configs without `context_source` still validate and build an encoder policy.
+
+A full-size smoke run showed `encoder: 0` parameters and actor/critic parameter counts identical to plain PPO's (67,844 / 67,585). A training round took about 0.2 s, so a 2M-step run should take minutes, not the 5.5–7 h of A–F. If a 0c run takes hours, the encoder is running and something is wrong.
+
+```bash
+# 0c, from this repo
+python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2
+
+# 0a and 0b, from ../Env_BatteryPlane
+python ppo/main_battery_plane_ppo.py -m +experiment=p04_observed ppo.batch_size=256 training.total_timesteps=2000000 training.seed=0,1,2 \
+  'wandb.run_name=S0a_observed_bs256_s${training.seed}' wandb.group=S0a_observed_bs256
+python ppo/main_battery_plane_ppo.py -m +experiment=p04_observed ppo.batch_size=1024 training.total_timesteps=2000000 training.seed=0,1,2 \
+  'wandb.run_name=S0b_observed_bs1024_s${training.seed}' wandb.group=S0b_observed_bs1024
+```
+
+**Evaluation, fixed before starting.** Evaluate deterministically every 50k transitions on validation seeds 1000–1002 × starting battery 0.2–0.7, with speed noise 5 and the same seeded initial states. For each training seed, the primary score is the mean of scheduled validation returns from 1.5M through 2M transitions. Report all three seed scores and their mean/spread, together with the full learning curves, final return, completion, ground-crash, and battery-empty rates. Keep final-test seeds 2000–2002 untouched. Do not compare this late-training score directly with the historical final-only score of 212.
+
+**How to read the results.** These are diagnostic patterns, not proofs from a single run. If the seed results are mixed, add seeds before changing the pipeline.
+
+- **All three learn useful policies:** CPPO can exploit true battery. Investigate the learned encoder and its online interaction with the policy next; this does not yet prove which caused the A–F failures.
+- **0b and 0c struggle while 0a succeeds:** the larger minibatches/fewer optimizer steps become a leading suspect. Test that setting further before expanding encoder training.
+- **0c struggles while 0a and 0b succeed:** investigate remaining CPPO differences, including whole-stream minibatching and the collector. This is not automatically evidence of a code bug.
+- **All three struggle:** first check reproduction of the original p04 setup and evaluation before drawing conclusions about encoders.
+- **Other patterns:** inspect the per-seed curves and implementation checks; do not force them into an update-count or encoder explanation.
+
+Review Step 0 before launching steps 1–5. No pilot dataset or offline encoder training is needed for this screen.
+
 ### 1. Bracket the encoder with controls
 
 Run the same PPO in every condition and change only the context `z_t` the policy receives:
@@ -85,15 +153,17 @@ Three training mixes:
 - Use at least 3 seeds, preferably 5. Runs collapse unpredictably (D_s0, F_s0).
 - Score each run by the evaluation curve, or the mean over late training, not only the final checkpoint. Observed PPO peaked around 360 at 600k steps and ended at 212.
 - Keep the 2M-step budget and validation seeds 1000–1002. Leave the final-test seeds 2000–2002 untouched.
-- Write the decision rules from section 1 down before running anything.
+- Write the decision rules from sections 0 and 1 down before running anything.
 - Optional extra condition: start from the pretrained encoder, then keep training it online the way CPPO does now. That shows whether online training helps or hurts once the encoder starts out good.
 
-That comes to 8 conditions × 3 seeds = 24 PPO runs: oracle, three noisy oracles, clock-only, and three frozen encoders.
+Steps 1–5 currently list 8 conditions × 3 seeds = 24 PPO runs: oracle, three noisy oracles, clock-only, and three frozen encoders. Step 0 is a separate nine-run screen (0a, 0b and 0c, three seeds each). Review its results before committing to those later runs. Reuse 0a as the later oracle only if the wrapper and training/evaluation protocol are verified equivalent.
 
 ## Next steps
 
 The enc1 setup on the server already covers the offline training step. The new pieces are:
 
-1. **The context wrapper.** Write this first, because the oracle run on its own already answers the most important question.
-2. **The pilot generator.**
-3. **The oracle and clock-only controls.**
+1. **The CPPO oracle bypass.** Done: `cppo.context_source=oracle`, verified by `checks.step0_checks` (see Step 0).
+2. **The step 0 runs.** Run the three conditions, then use the results to choose the next diagnostic.
+3. **The context wrapper.** If Step 0 supports proceeding, implement the frozen-encoder and control inputs for plain PPO.
+4. **The pilot generator.**
+5. **The remaining controls.** Verify whether Step 0's plain-PPO oracle can be reused; add the clock-only and noisy-oracle conditions when the follow-up scope is fixed.

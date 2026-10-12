@@ -25,6 +25,10 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 python evaluate_final
 python -m unittest checks.grid_checks -v
 python -m unittest checks.grid_checks.GridChecks.test_held_out_seeds_cannot_overlap -v
 
+# Step 0 of ENCODER_PLAN.md, run 0c: CPPO with the true battery instead of the encoder (minutes per run, not hours)
+python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2
+python -m unittest checks.step0_checks -v
+
 # Learner unit tests: plain functions; each file's __main__ runs every test_* in it
 python contextual_ppo/test_contextual_ppo.py
 python -c "from stable_baselines3.contextual_ppo.test_buffer import test_no_mutable_aliasing as t; t()"
@@ -58,6 +62,7 @@ There are three layers, and the dependencies point one way only:
 
 3. **Project glue**:
    - `main_battery_plane_contextual_ppo.py` is the Hydra entry point (`config/cppo.yaml`). It provides `validate_config` (cross-field constraints, enforced before any logging or worker starts), `build_model` (maps `cfg.cppo.*` to `ContextualPPO`/`policy_kwargs`), env factories, the `TrueSpeedInfo` wrapper (adds `vx_ratio` to infos as the velocity-head target), `ScheduledEvalResets` (replays a fixed eval grid), and W&B/TensorBoard logging.
+   - `step0_oracle.py` holds `TrueBatteryEncoder` (no parameters, no state, `z_t = b_t` read from the observed-mode observation) and `TrueBatteryPolicy` (the actor and critic read the observation only). `cppo.context_source=oracle` selects them. The default is `encoder`, and `config/step0/` sits outside the A–F grid.
    - Each run writes to `runs_cppo/<wandb run id>/`, or to `paths.run_dir`: the resolved config, metadata, checkpoints, best model, `final_model.zip`, and `final_validation.json`. `wandb/` is at the repo root. All of these are gitignored.
 
 ## Experiment protocol invariants

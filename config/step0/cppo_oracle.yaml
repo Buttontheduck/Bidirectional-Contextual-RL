@@ -1,0 +1,24 @@
+# @package _global_
+# Step 0, run 0c of ENCODER_PLAN.md: can CPPO learn when its battery estimate is perfect?
+#
+# The true battery replaces the learned context (step0_oracle.py). Observed mode puts b_t last in the observation,
+# and the actor and critic read that observation alone: the five inputs of plain PPO in observed mode (0a, 0b).
+# There is no encoder to train. CPPO's collector, whole-stream minibatches and PPO losses are unchanged, and so
+# are all PPO settings of the base configuration (8 envs x 512 steps, 4 minibatches of 2 streams, 10 epochs).
+#
+#   python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2
+experiment_id: S0c
+env:
+  observation_mode: observed
+training:
+  total_timesteps: 2000000
+cppo:
+  context_source: oracle
+  # No episode buffer and no supervised encoder steps. The routed PPO losses reach no parameter either:
+  # the oracle encoder has none.
+  encoder_objective: rl
+wandb:
+  # The inherited "cppo_" prefix gives the actual name/group cppo_S0c_oracle_s0 / cppo_S0c_oracle.
+  run_name: S0c_oracle_s${training.seed}
+  group: S0c_oracle
+  tags: [cppo, step0, oracle]

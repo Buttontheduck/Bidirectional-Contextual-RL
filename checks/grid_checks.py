@@ -59,6 +59,34 @@ class GridChecks(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Select C or D"):
                 training.validate_config(config(letter, 0.2))
 
+    def test_saved_legacy_configs_default_to_encoder(self):
+        # evaluate_final_test.py loads resolved YAML directly, without composing the new defaults.
+        with tempfile.TemporaryDirectory() as folder:
+            for letter in "ABCDEF":
+                with self.subTest(letter=letter):
+                    saved = OmegaConf.to_container(config(letter, beta=0.5), resolve=True)
+                    del saved["cppo"]["context_source"]
+                    path = Path(folder) / f"{letter}.yaml"
+                    OmegaConf.save(OmegaConf.create(saved), path)
+                    legacy = OmegaConf.load(path)
+                    training.validate_config(legacy)
+                    self.assertEqual(training.context_source_from(legacy), "encoder")
+                    self.assertNotIn("context_source", legacy.cppo)
+
+    def test_model_build_accepts_a_legacy_encoder_config(self):
+        torch.set_num_threads(1)
+        saved = OmegaConf.to_container(config("A", extra=run_grid.SMOKE_OVERRIDES), resolve=True)
+        del saved["cppo"]["context_source"]
+        legacy = OmegaConf.create(saved)
+        training.validate_config(legacy)
+        env = training.make_train_env(legacy)
+        try:
+            model = training.build_model(legacy, env)
+            self.assertIsInstance(model.policy.encoder, training.contextual_ppo.torch_layers.XLSTMRolloutEncoder)
+            self.assertTrue(model.policy.parameter_groups()["encoder"])
+        finally:
+            env.close()
+
     def test_held_out_seeds_cannot_overlap(self):
         for override in ("final_test.reset_grid.eval_seeds=[1000]",
                          "evaluation.reset_grid.eval_seeds=[0]",

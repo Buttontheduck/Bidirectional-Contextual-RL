@@ -55,8 +55,16 @@ from battery_plane import iter_eval_resets  # noqa: E402
 from contextual_ppo import ContextualPPO  # noqa: E402
 from contextual_ppo.policies import CONTEXT_VARIANCE_INPUTS  # noqa: E402
 from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS  # noqa: E402
+from step0_oracle import TrueBatteryPolicy  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
+# cppo.context_source: the xLSTM encoder, or the true battery of step 0 (step0_oracle.py)
+CONTEXT_SOURCES = ("encoder", "oracle")
+
+
+def context_source_from(cfg: DictConfig) -> str:
+    """Saved A–F configs predate context_source and use the learned encoder."""
+    return cfg.cppo.get("context_source", "encoder")
 
 
 class ScheduledEvalResets(gym.Wrapper):
@@ -299,6 +307,21 @@ def validate_config(cfg: DictConfig) -> None:
         raise ValueError("cppo.supervised.seed must be null or an integer")
     if cppo.encoder_objective not in ContextualPPO.ENCODER_OBJECTIVES:
         raise ValueError(f"cppo.encoder_objective must be one of {ContextualPPO.ENCODER_OBJECTIVES}")
+    context_source = context_source_from(cfg)
+    if context_source not in CONTEXT_SOURCES:
+        raise ValueError(f"cppo.context_source must be one of {CONTEXT_SOURCES}")
+    if context_source == "oracle":
+        if cfg.env.observation_mode != "observed":
+            raise ValueError(
+                "cppo.context_source=oracle requires env.observation_mode=observed: "
+                "Step 0 keeps noisy speed; full mode supplies exact speed"
+            )
+        if (cppo.encoder_objective != "rl" or cppo.velocity_head.enabled or cppo.context_head != "point"
+                or int(cppo.context_dim) != 1):
+            raise ValueError(
+                "cppo.context_source=oracle has no encoder to train: it needs cppo.encoder_objective=rl, "
+                "cppo.velocity_head.enabled=false, cppo.context_head=point and cppo.context_dim=1"
+            )
     if cppo.encoder_objective == "supervised" and (keys is None or int(cppo.context_dim) != 1):
         raise ValueError(
             "cppo.encoder_objective=supervised fits z_t to the charge b_t: it needs cppo.context_info_keys=[b0,b] "
@@ -337,7 +360,7 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
     keys = cppo.context_info_keys
     velocity = cppo.velocity_head
     return ContextualPPO(
-        policy=cppo.policy,
+        policy=TrueBatteryPolicy if context_source_from(cfg) == "oracle" else cppo.policy,
         env=env,
         learning_rate=cppo.learning_rate,
         n_steps=int(cppo.n_steps),
@@ -397,22 +420,51 @@ def configure_cpu_threads(cfg: DictConfig) -> None:
         torch.set_num_interop_threads(interop)
 
 
+def terminal_outcome(info: Mapping[str, Any]) -> str:
+    """One outcome per flight; battery depletion takes precedence on simultaneous failures, as in the env UI."""
+    if float(info["b"]) <= 0:
+        return "battery_empty"
+    if float(info["y"]) <= 0:
+        return "ground_crash"
+    if info["mission_complete"]:
+        return "completed"
+    if info.get("TimeLimit.truncated", False):
+        return "truncated"
+    raise ValueError("Evaluation episode ended without a recognized BatteryPlane outcome")
+
+
 def evaluate_schedule(model, cfg: DictConfig, reset_grid: DictConfig) -> dict:
     schedule = list(iter_eval_resets(reset_grid))
     env, scheduler, _ = make_eval_env(cfg, schedule)
+    outcomes: list[str] = []
+
+    def record_outcome(local_vars, _global_vars):
+        # SB3's callback exposes the ending episode's info, even after VecEnv has reset the environment.
+        # These privileged diagnostics are used only for the report, never as model inputs.
+        if local_vars["done"]:
+            outcomes.append(terminal_outcome(local_vars["info"]))
+
     try:
         scheduler.rewind()
         rewards, lengths = evaluate_policy(
             model, env, n_eval_episodes=len(schedule), deterministic=bool(cfg.evaluation.deterministic),
-            return_episode_rewards=True,
+            return_episode_rewards=True, callback=record_outcome,
         )
     finally:
         env.close()
     if not np.isfinite(rewards).all():
         raise ValueError("Non-finite evaluation return")
+    if len(outcomes) != len(schedule):
+        raise ValueError("Evaluation did not record exactly one outcome per scheduled episode")
     return {
         "mean_reward": float(np.mean(rewards)), "std_reward": float(np.std(rewards)),
         "episode_rewards": [float(x) for x in rewards], "episode_lengths": [int(x) for x in lengths],
+        "episode_outcomes": outcomes,
+        "completion_rate": outcomes.count("completed") / len(outcomes),
+        "ground_crash_rate": outcomes.count("ground_crash") / len(outcomes),
+        "battery_empty_rate": outcomes.count("battery_empty") / len(outcomes),
+        "truncated_rate": outcomes.count("truncated") / len(outcomes),
+        "outcome_rule": "Exclusive categories; battery_empty takes precedence over simultaneous ground contact.",
         "reset_schedule": schedule, "checkpoint": "final_model.zip", "timesteps": model.num_timesteps,
     }
 
@@ -497,7 +549,8 @@ def main(cfg: DictConfig) -> None:
             f"  {n_envs} envs x {n_steps} steps = {n_envs * n_steps} transitions per update, "
             f"{cfg.cppo.n_minibatches} minibatches of {metadata['minibatch_transitions']} x {cfg.cppo.n_epochs} epochs"
             f" | bptt_len={cfg.cppo.bptt_len} reset_envs_each_rollout={cfg.cppo.reset_envs_each_rollout}"
-            f" | encoder_objective={cfg.cppo.encoder_objective} encoder_actor_loss_weight={cfg.cppo.encoder_actor_loss_weight}"
+            f" | context_source={context_source_from(cfg)}"
+            f" encoder_objective={cfg.cppo.encoder_objective} encoder_actor_loss_weight={cfg.cppo.encoder_actor_loss_weight}"
             f" context_head={cfg.cppo.context_head}"
             + (f" (variance input {cfg.cppo.context_variance_input}, nll_beta {cfg.cppo.supervised.nll_beta})"
                if cfg.cppo.context_head == "gaussian" else "")
@@ -549,6 +602,8 @@ def main(cfg: DictConfig) -> None:
         validation = evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)
         (run_dir / "final_validation.json").write_text(json.dumps(validation, indent=2) + "\n")
         run.summary["validation/final_mean_reward"] = validation["mean_reward"]
+        for metric in ("completion_rate", "ground_crash_rate", "battery_empty_rate", "truncated_rate"):
+            run.summary[f"validation/final_{metric}"] = validation[metric]
         metadata["elapsed_seconds"] = time.monotonic() - started
         metadata["actual_timesteps"] = model.num_timesteps
         (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

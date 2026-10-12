@@ -67,6 +67,10 @@ cppo:
   bptt_len: null
   reset_envs_each_rollout: false
 
+  # Where the actor and critic get the battery from. encoder: the xLSTM context z_t (every A-F experiment).
+  # oracle: step 0 of ENCODER_PLAN.md, the true b_t instead of the encoder (step0_oracle.py, config/step0/).
+  context_source: encoder
+
   # Encoder training: supervised on the true charge b_t (labels from the env infos b0, b; never an input).
   # The PPO losses never reach the encoder (encoder_actor_loss_weight is used by encoder_objective: rl only).
   encoder_objective: supervised
