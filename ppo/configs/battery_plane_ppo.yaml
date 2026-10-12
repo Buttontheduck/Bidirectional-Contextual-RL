@@ -36,6 +36,10 @@ training:
   # One of: auto, cpu, cuda, mps. CPU is correct here: SB3 itself recommends CPU for MlpPolicy PPO,
   # and an M-series GPU is slower than the CPU for 256x256 nets.
   device: cpu
+  # PyTorch threads of this process, as in Contextual_PPO's config. A run is mostly single-threaded Python, so
+  # more threads barely help (1 -> 4: ~15% faster on the 9950X); run_step0.py runs many runs side by side instead.
+  num_threads: 4
+  num_interop_threads: 1
 
 ppo:
   policy: MlpPolicy

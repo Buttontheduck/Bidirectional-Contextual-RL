@@ -29,6 +29,7 @@ from typing import Any
 
 import gymnasium as gym
 import hydra
+import torch
 import torch.nn as nn
 import wandb
 from omegaconf import DictConfig, OmegaConf
@@ -229,6 +230,10 @@ def validate_ppo(cfg: DictConfig) -> None:
         )
     if str(cfg.ppo.activation_fn).lower() not in ACTIVATIONS:
         raise ValueError(f"ppo.activation_fn must be one of {tuple(ACTIVATIONS)}")
+    for key in ("training.num_threads", "training.num_interop_threads"):
+        value = OmegaConf.select(cfg, key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} must be a positive integer, got {value!r}")
     # Env copy i is first reset with seed * 100 + i (make_train_env), then SB3 re-seeds it with seed + i when
     # learning starts; that stream drives training. Neither may reach an evaluation seed.
     seed = int(cfg.training.seed)
@@ -237,10 +242,19 @@ def validate_ppo(cfg: DictConfig) -> None:
         raise ValueError("Training and evaluation seeds must be disjoint")
 
 
+def configure_cpu_threads(cfg: DictConfig) -> None:
+    """PyTorch thread pools of this run; launchers limit the BLAS pools through OMP_NUM_THREADS and friends."""
+    torch.set_num_threads(int(cfg.training.num_threads))
+    interop = int(cfg.training.num_interop_threads)
+    if torch.get_num_interop_threads() != interop:
+        torch.set_num_interop_threads(interop)
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="battery_plane_ppo")
 def main(cfg: DictConfig) -> None:
     validate_eval_reset_grid(cfg.evaluation.reset_grid)
     validate_ppo(cfg)
+    configure_cpu_threads(cfg)
     eval_reset_schedule = list(iter_eval_resets(cfg.evaluation.reset_grid))
     n_envs = int(cfg.training.n_envs)
 
@@ -285,7 +299,8 @@ def main(cfg: DictConfig) -> None:
         f" | {int(cfg.training.total_timesteps) // (n_envs * int(cfg.ppo.n_steps))} updates"
         f" | eval episodes: {len(eval_reset_schedule)}"
     )
-    run.config.update({"effective_env": core._kw, "algorithm": "PPO"}, allow_val_change=True)
+    run.config.update({"effective_env": core._kw, "algorithm": "PPO", "torch_threads": torch.get_num_threads(),
+                       "torch_interop_threads": torch.get_num_interop_threads()}, allow_val_change=True)
 
     net_arch = list(cfg.ppo.net_arch)
     policy_kwargs = {

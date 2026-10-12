@@ -29,6 +29,14 @@ def plain_ppo_config(*overrides):
         return compose(config_name="battery_plane_ppo", overrides=list(overrides))
 
 
+def plain_ppo_script():
+    """The plain-PPO training script as a module (main() is not run)."""
+    spec = importlib.util.spec_from_file_location("plain_ppo_script", training.PROJECT_ROOT / "ppo" / "main_battery_plane_ppo.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    return script
+
+
 def plain_ppo(cfg, env):
     """SB3 PPO with the policy settings of plain PPO (Env_BatteryPlane/ppo) for the same cppo section."""
     net_arch = list(cfg.cppo.net_arch)
@@ -57,9 +65,7 @@ class Step0Checks(unittest.TestCase):
     def test_plain_ppo_runs_match_0c_except_the_learner(self):
         import report_step0
 
-        spec = importlib.util.spec_from_file_location("plain_ppo_script", training.PROJECT_ROOT / "ppo" / "main_battery_plane_ppo.py")
-        script = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(script)
+        script = plain_ppo_script()
         protocols = {"0c": report_step0.evaluation_protocol(config(), "0c")}
         for condition, name, batch_size in (("0a", "S0a_observed_bs256", 256), ("0b", "S0b_observed_bs1024", 1024)):
             with self.subTest(condition=condition):
@@ -69,6 +75,34 @@ class Step0Checks(unittest.TestCase):
                 # Same environment, evaluation grid, budget and shared PPO settings as 0c
                 protocols[condition] = report_step0.evaluation_protocol(cfg, condition)
                 self.assertEqual(protocols[condition], protocols["0c"])
+
+    def test_parallel_launcher_runs_each_condition_and_seed_as_its_own_process(self):
+        import run_step0
+
+        args = run_step0.parse_args(["--output", "/tmp/step0_launch"])
+        self.assertEqual((args.conditions, args.seeds, args.threads), (["0a", "0b", "0c"], [0, 1, 2], 2))
+        self.assertGreaterEqual(args.jobs, 1)
+        script = plain_ppo_script()
+        for condition in args.conditions:
+            for seed in args.seeds:
+                with self.subTest(condition=condition, seed=seed):
+                    command = run_step0.command_for(condition, seed, 2, args.output)
+                    # A single run per process (no Hydra multirun) with its own thread limit
+                    self.assertNotIn("-m", command)
+                    overrides = [item for item in command[2:] if not item.startswith("hydra.")]
+                    if condition == "0c":
+                        cfg = config(*overrides, step0=False)
+                        training.validate_config(cfg)
+                        self.assertEqual(cfg.cppo.context_source, "oracle")
+                    else:
+                        cfg = plain_ppo_config(*overrides)
+                        script.validate_ppo(cfg)
+                        self.assertEqual(cfg.ppo.batch_size, 256 if condition == "0a" else 1024)
+                    self.assertEqual((cfg.training.seed, cfg.training.num_threads, cfg.env.observation_mode),
+                                     (seed, 2, "observed"))
+        self.assertEqual(run_step0.child_environment(2)["OMP_NUM_THREADS"], "2")
+        with self.assertRaises(ValueError):
+            script.validate_ppo(plain_ppo_config("training.num_threads=0"))
 
     def test_oracle_rejects_settings_that_need_an_encoder(self):
         for override in ("env.observation_mode=hidden", "cppo.encoder_objective=supervised",

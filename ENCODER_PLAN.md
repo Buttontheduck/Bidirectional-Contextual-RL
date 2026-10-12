@@ -71,14 +71,17 @@ Seeds, the same for all three conditions:
 A full-size smoke run showed `encoder: 0` parameters and actor/critic parameter counts identical to plain PPO's (67,844 / 67,585). A training round took about 0.2 s, so a 2M-step run should take minutes, not the 5.5–7 h of A–F. If a 0c run takes hours, the encoder is running and something is wrong.
 
 ```bash
-# All nine runs from this repo: the three conditions side by side, logs in runs_step0/
-nohup bash run_step0.sh > run_step0.log 2>&1 &
+# All nine runs at once, one process per condition and seed; logs and runs.json in runs_step0/<time>/
+nohup python run_step0.py > run_step0.log 2>&1 &
+python run_step0.py --conditions 0a 0b      # a subset
 
-# Or one condition at a time
-python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2          # 0c
-python ppo/main_battery_plane_ppo.py -m +experiment=S0a_observed_bs256 training.seed=0,1,2      # 0a
-python ppo/main_battery_plane_ppo.py -m +experiment=S0b_observed_bs1024 training.seed=0,1,2     # 0b
+# Or a single run
+python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0          # 0c
+python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0      # 0a
+python ppo/main_battery_plane_ppo.py +experiment=S0b_observed_bs1024 training.seed=0     # 0b
 ```
+
+`run_step0.py` starts up to one run per physical core with 2 threads each. A run is mostly single-threaded Python: on the 16-core Ryzen 9 9950X, 1 → 4 threads made a run only ~15% faster, while nine runs side by side took ~1.25× the wall time of one run alone (measured 2026-10-12).
 
 The plain-PPO script used for 0a and 0b now lives in this repo under `ppo/`. It was copied from Env_BatteryPlane, with its p01–p04 configs, so a `git pull` sets up any server. It writes to `runs_ppo/<run id>/`, including the resolved `config.yaml`. `checks.step0_checks` verifies that 0a, 0b and 0c share the environment, evaluation grid, budget and PPO settings, and differ only in learner and minibatch size.
 

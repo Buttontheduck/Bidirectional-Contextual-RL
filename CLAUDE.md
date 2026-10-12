@@ -25,11 +25,11 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 python evaluate_final
 python -m unittest checks.grid_checks -v
 python -m unittest checks.grid_checks.GridChecks.test_held_out_seeds_cannot_overlap -v
 
-# Step 0 of ENCODER_PLAN.md: all nine runs side by side (logs in runs_step0/), or one condition at a time
-nohup bash run_step0.sh > run_step0.log 2>&1 &
-python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2       # 0c: CPPO, true battery
-python ppo/main_battery_plane_ppo.py -m +experiment=S0a_observed_bs256 training.seed=0,1,2   # 0a: plain PPO
-python ppo/main_battery_plane_ppo.py -m +experiment=S0b_observed_bs1024 training.seed=0,1,2  # 0b: plain PPO, batch 1024
+# Step 0 of ENCODER_PLAN.md: every (condition, seed) as its own process, all at once (16 cores x 2 threads on the 9950X)
+nohup python run_step0.py > run_step0.log 2>&1 &     # logs and runs.json in runs_step0/<time>/; --conditions 0a 0b, --dry-run
+python run_step0.py --smoke                          # tiny budget, W&B disabled, runs under runs_step0/<time>-smoke/
+python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0       # one 0c run: CPPO, true battery
+python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0   # one 0a run (S0b_observed_bs1024: 0b)
 python -m unittest checks.step0_checks -v
 python -m unittest checks.logging_checks -v          # flight_logging.py: metric definitions, both learners log the same
 
