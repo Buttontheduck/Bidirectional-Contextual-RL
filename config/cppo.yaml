@@ -37,7 +37,8 @@ training:
   total_timesteps: 1000000
   n_envs: 8
   vec_env: dummy
-  # Network init, action sampling and each env copy's stream (seed * 100 + index). Run seeds 0, 1, 2.
+  # Network init, action sampling and the env streams: SB3 resets env copy i with seed + index when learning
+  # starts (0-9 for seeds 0-2), far from validation (1000-1002) and final test (2000-2002). Run seeds 0, 1, 2.
   seed: 0
   device: cpu
   num_threads: 4                         # per training process; launcher also limits BLAS pools
@@ -134,6 +135,11 @@ evaluation:
     eval_vx0: null
   render: false
   render_fps: 120
+  # Episode plots (episode_plots/*): altitude, speed, battery and actions of the first validation flight at each of
+  # these starting charges, every `frequency` environment steps (a multiple of evaluation.frequency) and at the end.
+  plots:
+    frequency: 100000
+    initial_battery: [0.2, 0.5, 0.7]
 
 # Reserved held-out episodes. Only evaluate_final_test.py consumes this grid, after all training/selection.
 final_test:

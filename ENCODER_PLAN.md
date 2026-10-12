@@ -36,6 +36,12 @@ The learning rate is the same, so CPPO makes a quarter as many weight updates, b
 
 **Primary runs: three conditions × three seeds = nine fresh runs.** All use 8 environments × 512 steps, 10 epochs, 2M requested environment transitions (rounded to complete rollouts), and training seeds 0, 1, 2.
 
+Seeds, the same for all three conditions:
+- Training env `i` starts from reset seed `seed + i`, so 0–9. SB3 re-seeds the envs when learning starts. The same seed in 0a, 0b and 0c starts from the same first flights.
+- Validation uses seeds 1000–1002. The final-test seeds 2000–2002 stay unused.
+- Both scripts reject training seeds that reach the held-out seeds, and `checks.grid_checks` verifies the real start seeds.
+- Neighbouring training seeds share their first flight in 7 of the 8 envs, then diverge. This is negligible, and it is kept for comparability with A–F and p04.
+
 | Run | Learner and battery input | Minibatch | Optimizer steps per rollout | Purpose |
 |---|---|---|---:|---|
 | 0a | Plain PPO, true battery (`observed` mode) | 256 shuffled transitions | 160 | Reproduce the original baseline |
@@ -70,12 +76,24 @@ python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=
 
 # 0a and 0b, from ../Env_BatteryPlane
 python ppo/main_battery_plane_ppo.py -m +experiment=p04_observed ppo.batch_size=256 training.total_timesteps=2000000 training.seed=0,1,2 \
-  'wandb.run_name=S0a_observed_bs256_s${training.seed}' wandb.group=S0a_observed_bs256
+  'wandb.run_name=S0a_observed_bs256_s${training.seed}' wandb.group=S0a_observed_bs256 wandb.project=cppo
 python ppo/main_battery_plane_ppo.py -m +experiment=p04_observed ppo.batch_size=1024 training.total_timesteps=2000000 training.seed=0,1,2 \
-  'wandb.run_name=S0b_observed_bs1024_s${training.seed}' wandb.group=S0b_observed_bs1024
+  'wandb.run_name=S0b_observed_bs1024_s${training.seed}' wandb.group=S0b_observed_bs1024 wandb.project=cppo
 ```
 
 **Evaluation, fixed before starting.** Evaluate deterministically every 50k transitions on validation seeds 1000–1002 × starting battery 0.2–0.7, with speed noise 5 and the same seeded initial states. For each training seed, the primary score is the mean of scheduled validation returns from 1.5M through 2M transitions. Report all three seed scores and their mean/spread, together with the full learning curves, final return, completion, ground-crash, and battery-empty rates. Keep final-test seeds 2000–2002 untouched. Do not compare this late-training score directly with the historical final-only score of 212.
+
+**Logging (identical for 0a, 0b and 0c).** Both training scripts use `flight_logging.py`; Env_BatteryPlane reaches it through a symlink. `wandb.project=cppo` puts all nine runs in one W&B project, next to A–F. Metric names follow A–F where those exist.
+- **Every evaluation (50k):** `validation/*`, at the same step as `eval/mean_reward`:
+  - Return, and completion, ground-crash and battery-empty rates.
+  - Time in the reward band and at goal speed, time at the speed cap, speed, distance, battery used and left on completion.
+  - Altitude (mean and lowest), throttle and lift, and action size and change.
+  - `by_b0/b0_<pct>pct/*`: return, outcomes, behaviour, throttle and lift for each starting battery.
+  - `by_b0/throttle_mean_range` and `lift_mean_range`. A value of 0 means the policy flies the same whatever its battery.
+- **Every rollout:** `rollout/*`, the same outcomes and behaviour over the last 100 training flights. Also `train/optimizer_steps`, `train/grad_norm`, `train/grad_norm_max` and `train/grad_clipped_fraction`: the actor and critic gradient before clipping, which compares 40 large updates with 160 small ones directly.
+- **Every 100k steps and at the end:** `episode_plots/validation` and `episode_plots/final_validation`, showing altitude, speed, battery and actions of the first validation flight at b0 = 0.2, 0.5 and 0.7.
+- **At the end:** `final_validation/*` holds the same metrics for the final checkpoint. CPPO's `final_validation.json` also stores them under `flight_metrics`.
+- Each metric is derived from the environment's own definitions (see the `flight_logging.py` docstring). They were written without the server code that produced A–F, so a few A–F metrics (for example `mean_abs_action`) may be defined slightly differently.
 
 **How to read the results.** These are diagnostic patterns, not proofs from a single run. If the seed results are mixed, add seeds before changing the pipeline.
 

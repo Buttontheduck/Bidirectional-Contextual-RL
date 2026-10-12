@@ -28,6 +28,7 @@ python -m unittest checks.grid_checks.GridChecks.test_held_out_seeds_cannot_over
 # Step 0 of ENCODER_PLAN.md, run 0c: CPPO with the true battery instead of the encoder (minutes per run, not hours)
 python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2
 python -m unittest checks.step0_checks -v
+python -m unittest checks.logging_checks -v          # flight_logging.py: metric definitions, both learners log the same
 
 # Learner unit tests: plain functions; each file's __main__ runs every test_* in it
 python contextual_ppo/test_contextual_ppo.py
@@ -43,6 +44,7 @@ python battery_plane.py
 
 - `~/anaconda3/envs/carlos/lib/python3.11/site-packages/stable_baselines3/contextual_ppo` → this repo's `contextual_ppo/`
 - `../Env_BatteryPlane/battery_plane.py` → this repo's `battery_plane.py`
+- `../Env_BatteryPlane/flight_logging.py` → this repo's `flight_logging.py` (the plain-PPO script logs the same flight metrics)
 
 Edits here also change the sibling `Env_BatteryPlane` project. The training script itself does not need the links: it puts the repo root on `sys.path` and imports top-level `contextual_ppo` and `battery_plane`.
 
@@ -63,12 +65,22 @@ There are three layers, and the dependencies point one way only:
 3. **Project glue**:
    - `main_battery_plane_contextual_ppo.py` is the Hydra entry point (`config/cppo.yaml`). It provides `validate_config` (cross-field constraints, enforced before any logging or worker starts), `build_model` (maps `cfg.cppo.*` to `ContextualPPO`/`policy_kwargs`), env factories, the `TrueSpeedInfo` wrapper (adds `vx_ratio` to infos as the velocity-head target), `ScheduledEvalResets` (replays a fixed eval grid), and W&B/TensorBoard logging.
    - `step0_oracle.py` holds `TrueBatteryEncoder` (no parameters, no state, `z_t = b_t` read from the observed-mode observation) and `TrueBatteryPolicy` (the actor and critic read the observation only). `cppo.context_source=oracle` selects them. The default is `encoder`, and `config/step0/` sits outside the A–F grid.
+   - `flight_logging.py` holds algorithm-agnostic SB3 callbacks that log flight diagnostics from the env infos and executed actions, shared with the plain-PPO script through a symlink:
+     - `FlightLoggingEvalCallback`: `validation/*` with per-starting-battery `by_b0/*`, and `episode_plots/*`
+     - `RolloutFlightLogger`: `rollout/*`
+     - `GradNormLogger`: `train/grad_norm*` and `train/optimizer_steps`. It wraps `torch.nn.utils.clip_grad_norm_` only while the model trains.
+     - `FlightRecorder` and `evaluate_flights`: the final validation (`final_validation/*`)
    - Each run writes to `runs_cppo/<wandb run id>/`, or to `paths.run_dir`: the resolved config, metadata, checkpoints, best model, `final_model.zip`, and `final_validation.json`. `wandb/` is at the repo root. All of these are gitignored.
 
 ## Experiment protocol invariants
 
 - `config/cppo.yaml` *is* experiment A. Each `config/experiment/*.yaml` (`# @package _global_`) changes only `context_head`, `context_variance_input`, `supervised.nll_beta`, `velocity_head.enabled`, and the W&B naming. `checks/grid_checks.py` asserts this, so changing a shared setting in a single experiment breaks that check on purpose.
 - E and F need `selected_gaussian.nll_beta` set to 0.0 (C wins) or 0.5 (D wins); `validate_config` rejects null and any other value. `run_grid.py` picks the winner from the mean final-checkpoint validation return across seeds (a tie goes to C) and writes `selection.json`.
-- The seeds are disjoint by construction, and `validate_config` checks it: training env copies use `seed*100+i`, validation uses 1000–1002, and the reserved final test uses 2000–2002. Only `evaluate_final_test.py` may use the `final_test` grid. Never use it for tuning or selection.
+- The seeds are disjoint by construction, and `validate_config` checks it:
+  - Training env copy `i` starts training from reset seed `seed+i`, so 0–9 for seeds 0–2. The env factories reset with `seed*100+i`, but SB3 re-seeds the VecEnv when learning starts.
+  - Validation uses 1000–1002, and the reserved final test uses 2000–2002.
+  - `checks.grid_checks` verifies the real start seeds for both CPPO and plain PPO.
+  - Neighbouring training seeds share one starting flight in 7 of the 8 envs (seed `s` env `i+1` matches seed `s+1` env `i`). The streams diverge once those flights end at different steps. This is kept so runs stay comparable with A–F and p04.
+  - Only `evaluate_final_test.py` may use the `final_test` grid. Never use it for tuning or selection.
 - `run_grid.py` writes a `manifest.json` containing a SHA-256 of the main script, `battery_plane.py`, `run_grid.py`, every config YAML, and the non-test `contextual_ppo/*.py`, plus package versions, seeds, steps, and threads. After any code or config change, existing grid output directories refuse to resume, so use a new `--output`. Completed runs are reused only through their `result.json` pointers.
 - Thread limits: `run_grid.py` sets the BLAS env vars for each child, and the training script sets `torch.set_num_threads(training.num_threads)` and interop threads = 1.

@@ -32,6 +32,7 @@ SMOKE_OVERRIDES = [
     "cppo.supervised.episode_batch_size=2", "cppo.supervised.gradient_steps=1",
     "+env.kwargs.T=4", "evaluation.frequency=16", "cppo.verbose=0",
     "evaluation.reset_grid.eval_seeds=[1000,1001]", "evaluation.reset_grid.eval_initial_battery=[0.3,0.6]",
+    "evaluation.plots.frequency=32", "evaluation.plots.initial_battery=[0.3,0.6]",
 ]
 
 
@@ -46,7 +47,8 @@ def read_json(path: Path):
 
 
 def source_digest() -> str:
-    files = [ROOT / "main_battery_plane_contextual_ppo.py", ROOT / "battery_plane.py", ROOT / "run_grid.py"]
+    files = [ROOT / "main_battery_plane_contextual_ppo.py", ROOT / "battery_plane.py", ROOT / "run_grid.py",
+             ROOT / "flight_logging.py", ROOT / "step0_oracle.py"]
     files += list((ROOT / "config").rglob("*.yaml"))
     files += [p for p in (ROOT / "contextual_ppo").glob("*.py") if not p.name.startswith("test_")]
     digest = hashlib.sha256()

@@ -6,11 +6,24 @@ import unittest
 from unittest.mock import patch
 
 from hydra import compose, initialize_config_dir
+import numpy as np
 from omegaconf import OmegaConf
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 import torch
 
 import main_battery_plane_contextual_ppo as training
 import run_grid
+
+
+class StartObservations(BaseCallback):
+    """The observations of the reset that learn() starts from."""
+
+    def _on_training_start(self):
+        self.observations = np.array(self.model._last_obs, copy=True)
+
+    def _on_step(self):
+        return True
 
 
 def config(letter, beta=None, extra=()):
@@ -86,6 +99,31 @@ class GridChecks(unittest.TestCase):
             self.assertTrue(model.policy.parameter_groups()["encoder"])
         finally:
             env.close()
+
+    def test_training_envs_start_from_seed_plus_index_far_from_held_out_seeds(self):
+        # SB3 re-seeds the VecEnv when learning starts: env copy i starts from reset seed training.seed + i, for
+        # CPPO and for plain PPO (Env_BatteryPlane's factory is a copy of make_train_env).
+        torch.set_num_threads(1)
+        for seed in (0, 1, 2):
+            cfg = config("A", extra=[*run_grid.SMOKE_OVERRIDES, "training.n_envs=8", f"training.seed={seed}"])
+            held_out = set(cfg.evaluation.reset_grid.eval_seeds) | set(cfg.final_test.reset_grid.eval_seeds)
+            reference = training.bp.BatteryPlaneEnv(observation_mode=cfg.env.observation_mode,
+                                                    **training.env_kwargs_from(cfg))
+            expected = np.stack([reference.reset(seed=seed + i)[0] for i in range(8)])
+            for learner in ("cppo", "ppo"):
+                with self.subTest(seed=seed, learner=learner):
+                    env = training.make_train_env(cfg)
+                    try:
+                        if learner == "cppo":
+                            model = training.build_model(cfg, env)
+                        else:
+                            model = PPO("MlpPolicy", env, n_steps=8, batch_size=64, seed=seed, device="cpu")
+                        start = StartObservations()
+                        model.learn(total_timesteps=64, callback=start)
+                        np.testing.assert_array_equal(start.observations, expected)
+                    finally:
+                        env.close()
+            self.assertFalse({seed + i for i in range(8)} & held_out)
 
     def test_held_out_seeds_cannot_overlap(self):
         for override in ("final_test.reset_grid.eval_seeds=[1000]",

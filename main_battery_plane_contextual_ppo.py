@@ -38,9 +38,8 @@ import torch
 import torch.nn as nn
 import wandb
 from omegaconf import DictConfig, OmegaConf
-from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 from wandb.integration.sb3 import WandbCallback
 
@@ -55,6 +54,9 @@ from battery_plane import iter_eval_resets  # noqa: E402
 from contextual_ppo import ContextualPPO  # noqa: E402
 from contextual_ppo.policies import CONTEXT_VARIANCE_INPUTS  # noqa: E402
 from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS  # noqa: E402
+from flight_logging import (  # noqa: E402
+    FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights, terminal_outcome,
+)
 from step0_oracle import TrueBatteryPolicy  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
@@ -92,8 +94,9 @@ class ScheduledEvalResets(gym.Wrapper):
         return self.env.reset(seed=reset_kwargs["seed"], options=merged_options)
 
 
-class RenderingEvalCallback(EvalCallback):
-    """EvalCallback that opens the pygame window only while it is evaluating.
+class RenderingEvalCallback(FlightLoggingEvalCallback):
+    """EvalCallback that logs the flights of every evaluation (FlightLoggingEvalCallback) and opens the pygame
+    window only while it is evaluating.
 
     `render_env` must be the *unwrapped* BatteryPlaneEnv behind the eval env: it renders
     itself inside step()/reset() whenever render_mode == "human", so flipping that
@@ -176,7 +179,8 @@ def make_train_env(cfg: DictConfig) -> VecEnv:
             if speed_labels:
                 env = TrueSpeedInfo(env)
             env = Monitor(env)
-            # Seeds this copy's stream; kept far from the evaluation seeds (1000+).
+            # Only until learning starts: SB3 then re-seeds the VecEnv (env.seed(training.seed)), so copy i
+            # starts training from reset seed training.seed + i. validate_config keeps both from the held-out seeds.
             seed = base_seed * 100 + index
             env.action_space.seed(seed)
             env.reset(seed=seed)
@@ -253,9 +257,20 @@ def validate_config(cfg: DictConfig) -> None:
     """Reject invalid settings before starting logging or worker processes."""
     validate_eval_reset_grid(cfg.evaluation.reset_grid)
     validate_eval_reset_grid(cfg.final_test.reset_grid)
+    plots = cfg.evaluation.get("plots")
+    if plots is not None:
+        _positive_int(cfg, "evaluation.plots.frequency")
+        _positive_int(cfg, "evaluation.frequency")
+        if int(plots.frequency) % int(cfg.evaluation.frequency):
+            raise ValueError("evaluation.plots.frequency must be a multiple of evaluation.frequency")
+        grid = cfg.evaluation.reset_grid.eval_initial_battery
+        if grid is not None and not set(plots.initial_battery) <= set(grid):
+            raise ValueError("evaluation.plots.initial_battery must be starting charges of the validation grid")
     validation_seeds = set(cfg.evaluation.reset_grid.eval_seeds)
     test_seeds = set(cfg.final_test.reset_grid.eval_seeds)
     seed, n_envs = int(cfg.training.seed), int(cfg.training.n_envs)
+    # Env copy i is first reset with seed * 100 + i (make_train_env), then SB3 re-seeds it with seed + i when
+    # learning starts; that stream drives training. Neither may reach a validation or final-test seed.
     training_seeds = {seed * 100 + i for i in range(n_envs)} | {seed + i for i in range(n_envs)}
     if validation_seeds & test_seeds or (validation_seeds | test_seeds) & training_seeds:
         raise ValueError("Training, validation and final-test seeds must be disjoint")
@@ -420,40 +435,28 @@ def configure_cpu_threads(cfg: DictConfig) -> None:
         torch.set_num_interop_threads(interop)
 
 
-def terminal_outcome(info: Mapping[str, Any]) -> str:
-    """One outcome per flight; battery depletion takes precedence on simultaneous failures, as in the env UI."""
-    if float(info["b"]) <= 0:
-        return "battery_empty"
-    if float(info["y"]) <= 0:
-        return "ground_crash"
-    if info["mission_complete"]:
-        return "completed"
-    if info.get("TimeLimit.truncated", False):
-        return "truncated"
-    raise ValueError("Evaluation episode ended without a recognized BatteryPlane outcome")
+def plot_batteries_from(cfg: DictConfig) -> list[float]:
+    """Starting charges of the episode plots; configs saved before evaluation.plots have none."""
+    plots = cfg.evaluation.get("plots")
+    return [] if plots is None else list(plots.initial_battery)
 
 
-def evaluate_schedule(model, cfg: DictConfig, reset_grid: DictConfig) -> dict:
+def run_schedule(model, cfg: DictConfig, reset_grid: DictConfig, plot_batteries=()):
+    """Evaluate the scheduled episodes: the result (JSON-ready) and the recorder of their flights."""
     schedule = list(iter_eval_resets(reset_grid))
-    env, scheduler, _ = make_eval_env(cfg, schedule)
-    outcomes: list[str] = []
-
-    def record_outcome(local_vars, _global_vars):
-        # SB3's callback exposes the ending episode's info, even after VecEnv has reset the environment.
-        # These privileged diagnostics are used only for the report, never as model inputs.
-        if local_vars["done"]:
-            outcomes.append(terminal_outcome(local_vars["info"]))
-
+    env, scheduler, raw_env = make_eval_env(cfg, schedule)
     try:
         scheduler.rewind()
-        rewards, lengths = evaluate_policy(
-            model, env, n_eval_episodes=len(schedule), deterministic=bool(cfg.evaluation.deterministic),
-            return_episode_rewards=True, callback=record_outcome,
+        # SB3's callback exposes the ending episode's info, even after VecEnv has reset the environment.
+        # These privileged diagnostics are used only for reports, never as model inputs.
+        rewards, lengths, recorder = evaluate_flights(
+            model, env, len(schedule), bool(cfg.evaluation.deterministic), raw_env.core, plot_batteries,
         )
     finally:
         env.close()
     if not np.isfinite(rewards).all():
         raise ValueError("Non-finite evaluation return")
+    outcomes = [flight["outcome"] for flight in recorder.flights]
     if len(outcomes) != len(schedule):
         raise ValueError("Evaluation did not record exactly one outcome per scheduled episode")
     return {
@@ -465,8 +468,14 @@ def evaluate_schedule(model, cfg: DictConfig, reset_grid: DictConfig) -> dict:
         "battery_empty_rate": outcomes.count("battery_empty") / len(outcomes),
         "truncated_rate": outcomes.count("truncated") / len(outcomes),
         "outcome_rule": "Exclusive categories; battery_empty takes precedence over simultaneous ground contact.",
+        # Return, outcomes and flying behaviour overall and per starting charge (flight_logging.summarize)
+        "flight_metrics": recorder.metrics(),
         "reset_schedule": schedule, "checkpoint": "final_model.zip", "timesteps": model.num_timesteps,
-    }
+    }, recorder
+
+
+def evaluate_schedule(model, cfg: DictConfig, reset_grid: DictConfig) -> dict:
+    return run_schedule(model, cfg, reset_grid)[0]
 
 
 @hydra.main(version_base=None, config_path="config", config_name="cppo")
@@ -580,7 +589,13 @@ def main(cfg: DictConfig) -> None:
                 render_env=raw_eval_env if cfg.evaluation.render else None,
                 render_fps=cfg.evaluation.render_fps,
                 reset_scheduler=scheduler,
+                flight_core=core,
+                plot_every=int(cfg.evaluation.plots.frequency),
+                plot_batteries=plot_batteries_from(cfg),
             ),
+            # rollout/* flight metrics of the training envs and train/grad_norm* of every update
+            RolloutFlightLogger(core),
+            GradNormLogger(),
             CheckpointCallback(
                 save_freq=max(int(cfg.checkpoint.frequency) // n_envs, 1),
                 save_path=str(checkpoint_dir),
@@ -599,11 +614,12 @@ def main(cfg: DictConfig) -> None:
         model.save(run_dir / "final_model")
         # A fixed final-checkpoint validation score selects C versus D across all training seeds.
         # The separate final_test grid is never evaluated during training or selection.
-        validation = evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)
+        validation, recorder = run_schedule(model, cfg, cfg.evaluation.reset_grid, plot_batteries_from(cfg))
         (run_dir / "final_validation.json").write_text(json.dumps(validation, indent=2) + "\n")
         run.summary["validation/final_mean_reward"] = validation["mean_reward"]
         for metric in ("completion_rate", "ground_crash_rate", "battery_empty_rate", "truncated_rate"):
             run.summary[f"validation/final_{metric}"] = validation[metric]
+        log_final_flights(run, recorder, model.num_timesteps)
         metadata["elapsed_seconds"] = time.monotonic() - started
         metadata["actual_timesteps"] = model.num_timesteps
         (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
