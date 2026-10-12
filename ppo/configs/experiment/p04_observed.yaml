@@ -1,0 +1,36 @@
+# @package _global_
+# =============================================================================
+# p04_observed  --  battery VISIBLE, speed reading NOISY (PPO twin of e04)
+#
+# OBJECTIVE
+#   The other half of the split: how much the noisy sensor costs even when the
+#   battery is known. Together with p03 it divides the p01 - p02 gap into
+#   "cost of not knowing the battery" and "cost of the noisy sensor itself".
+#
+# WHAT IT CHANGES
+#   - observation_mode: observed  (battery in the observation, speed noise 5.0)
+#
+# WHAT THE RESULTS MEAN
+#   - p04 close to p01 -> the noise only matters for inferring the battery, so the
+#     p01 - p02 gap is purely a context-inference gap. (Expected.)
+#   - p04 clearly below p01 -> part of the gap is noise hurting control; subtract it
+#     before reporting the context gap.
+#
+# RUN
+#   python ppo/main_battery_plane_ppo.py -m +experiment=p04_observed training.seed=0,1,2
+# =============================================================================
+env:
+  observation_mode: observed
+
+wandb:
+  run_name: p04_observed_s${training.seed}
+  group: p04_observed
+
+evaluation:
+  render: false
+  reset_grid:
+    eval_seeds: [1000, 1001, 1002]
+    eval_initial_battery: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    eval_vx_obs_noise: [5.0]
+    eval_y0: null                      # seeded random start, including in noiseless modes
+    eval_vx0: null

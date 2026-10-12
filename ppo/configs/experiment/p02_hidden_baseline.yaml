@@ -1,0 +1,40 @@
+# @package _global_
+# =============================================================================
+# p02_hidden_baseline  --  PPO main comparison (battery hidden, noisy speed)
+#
+# OBJECTIVE
+#   The PPO twin of e02, and the baseline that phase 1 has to beat: a MEMORYLESS
+#   PPO agent on the hidden task. RecurrentPPO later differs from this run only
+#   by the recurrent policy, so this is the honest "no memory" reference point.
+#
+# WHAT IT CHANGES
+#   - observation_mode: hidden (already the default; explicit here)
+#   - same 18-episode grid as p01/e01/e02
+#
+# WHAT THE RESULTS MEAN
+#   - The p01 - p02 gap is PPO's version of the value of context. Report it next to
+#     the e01 - e02 gap as a PERCENTAGE of the full-mode return: the absolute
+#     returns of two algorithms are not directly comparable, the gaps are.
+#   - p02 should land near the blind-rule line (~283, printed by `python battery_plane.py`).
+#     Far below it means training, not context, is the problem.
+#   - Watch train/std in W&B: if the policy std collapses in the first 200k steps the
+#     agent stopped exploring; try ppo.ent_coef=0.001 or ppo.log_std_init=-0.5.
+#
+# RUN
+#   python ppo/main_battery_plane_ppo.py -m +experiment=p02_hidden_baseline training.seed=0,1,2
+# =============================================================================
+env:
+  observation_mode: hidden
+
+wandb:
+  run_name: p02_hidden_baseline_s${training.seed}
+  group: p02_hidden_baseline
+
+evaluation:
+  render: false
+  reset_grid:
+    eval_seeds: [1000, 1001, 1002]
+    eval_initial_battery: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    eval_vx_obs_noise: [5.0]
+    eval_y0: null                      # seeded random start, including in noiseless modes
+    eval_vx0: null

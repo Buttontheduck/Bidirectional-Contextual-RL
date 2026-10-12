@@ -9,6 +9,12 @@ results_figures/
 
 # Training runs (configs, metrics, checkpoints) and Hydra multirun folders
 runs_cppo/
+runs_ppo/
+runs_step0/
+runs_encoder/
+
+# Hydra job logs and launcher logs
+*.log
 
 # Weights & Biases
 wandb/

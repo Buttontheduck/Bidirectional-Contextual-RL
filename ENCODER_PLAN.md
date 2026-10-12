@@ -71,19 +71,20 @@ Seeds, the same for all three conditions:
 A full-size smoke run showed `encoder: 0` parameters and actor/critic parameter counts identical to plain PPO's (67,844 / 67,585). A training round took about 0.2 s, so a 2M-step run should take minutes, not the 5.5–7 h of A–F. If a 0c run takes hours, the encoder is running and something is wrong.
 
 ```bash
-# 0c, from this repo
-python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2
+# All nine runs from this repo: the three conditions side by side, logs in runs_step0/
+nohup bash run_step0.sh > run_step0.log 2>&1 &
 
-# 0a and 0b, from ../Env_BatteryPlane
-python ppo/main_battery_plane_ppo.py -m +experiment=p04_observed ppo.batch_size=256 training.total_timesteps=2000000 training.seed=0,1,2 \
-  'wandb.run_name=S0a_observed_bs256_s${training.seed}' wandb.group=S0a_observed_bs256 wandb.project=cppo
-python ppo/main_battery_plane_ppo.py -m +experiment=p04_observed ppo.batch_size=1024 training.total_timesteps=2000000 training.seed=0,1,2 \
-  'wandb.run_name=S0b_observed_bs1024_s${training.seed}' wandb.group=S0b_observed_bs1024 wandb.project=cppo
+# Or one condition at a time
+python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2          # 0c
+python ppo/main_battery_plane_ppo.py -m +experiment=S0a_observed_bs256 training.seed=0,1,2      # 0a
+python ppo/main_battery_plane_ppo.py -m +experiment=S0b_observed_bs1024 training.seed=0,1,2     # 0b
 ```
+
+The plain-PPO script used for 0a and 0b now lives in this repo under `ppo/`. It was copied from Env_BatteryPlane, with its p01–p04 configs, so a `git pull` sets up any server. It writes to `runs_ppo/<run id>/`, including the resolved `config.yaml`. `checks.step0_checks` verifies that 0a, 0b and 0c share the environment, evaluation grid, budget and PPO settings, and differ only in learner and minibatch size.
 
 **Evaluation, fixed before starting.** Evaluate deterministically every 50k transitions on validation seeds 1000–1002 × starting battery 0.2–0.7, with speed noise 5 and the same seeded initial states. For each training seed, the primary score is the mean of scheduled validation returns from 1.5M through 2M transitions. Report all three seed scores and their mean/spread, together with the full learning curves, final return, completion, ground-crash, and battery-empty rates. Keep final-test seeds 2000–2002 untouched. Do not compare this late-training score directly with the historical final-only score of 212.
 
-**Logging (identical for 0a, 0b and 0c).** Both training scripts use `flight_logging.py`; Env_BatteryPlane reaches it through a symlink. `wandb.project=cppo` puts all nine runs in one W&B project, next to A–F. Metric names follow A–F where those exist.
+**Logging (identical for 0a, 0b and 0c).** Both training scripts (`main_battery_plane_contextual_ppo.py` and `ppo/main_battery_plane_ppo.py`) use `flight_logging.py`. All nine runs log to the `cppo` W&B project, next to A–F. Metric names follow A–F where those exist.
 - **Every evaluation (50k):** `validation/*`, at the same step as `eval/mean_reward`:
   - Return, and completion, ground-crash and battery-empty rates.
   - Time in the reward band and at goal speed, time at the speed cap, speed, distance, battery used and left on completion.

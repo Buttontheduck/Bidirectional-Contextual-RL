@@ -1,0 +1,38 @@
+# @package _global_
+# =============================================================================
+# p03_clean  --  battery hidden, speed reading EXACT (PPO twin of e03)
+#
+# OBJECTIVE
+#   Split the hidden task into "battery is not in the observation" and "the speed
+#   sensor is noisy". The probe showed the battery is decodable from ONE exact
+#   observation (R^2 ~ 0.9), so a converged agent should be close to p01 here.
+#
+# WHAT IT CHANGES
+#   - observation_mode: clean  (battery hidden, speed noise forced to 0)
+#
+# WHAT THE RESULTS MEAN
+#   - p03 close to p01 -> hiding the battery alone costs little; the NOISE is the
+#     difficulty, and sigma is the dial for later experiments.
+#   - p03 close to p02 -> the agent cannot even use an exact reading. For PPO check
+#     convergence first (p01 vs e01) before concluding anything about the env.
+#   - This is also Gate B's sanity check: a memory agent that cannot reach full-mode
+#     performance on clean means the pipeline is broken, not the task.
+#
+# RUN
+#   python ppo/main_battery_plane_ppo.py -m +experiment=p03_clean training.seed=0,1,2
+# =============================================================================
+env:
+  observation_mode: clean
+
+wandb:
+  run_name: p03_clean_s${training.seed}
+  group: p03_clean
+
+evaluation:
+  render: false
+  reset_grid:
+    eval_seeds: [1000, 1001, 1002]
+    eval_initial_battery: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    eval_vx_obs_noise: [5.0]
+    eval_y0: null                      # seeded random start, including in noiseless modes
+    eval_vx0: null

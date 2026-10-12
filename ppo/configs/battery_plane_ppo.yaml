@@ -1,0 +1,137 @@
+# Plain PPO configuration for BatteryPlane, read only by ppo/main_battery_plane_ppo.py (copied from the
+# Env_BatteryPlane project). Contextual_PPO has its own config/ folder.
+#
+# Experiments: ppo/configs/experiment/*.yaml override this file (p01-p04 baselines, S0a/S0b of step 0).
+# Run one over three training seeds with
+#     python ppo/main_battery_plane_ppo.py -m +experiment=p02_hidden_baseline training.seed=0,1,2
+# (-m = Hydra multirun, sequential; the W&B run name carries the seed.) Command-line overrides still
+# work on top:  ... +experiment=p02_hidden_baseline training.total_timesteps=500000
+
+env:
+  # Recorded in W&B only. The environment always comes from the project's battery_plane.py.
+  id: BatteryPlane-v0
+  observation_mode: hidden
+  # Use null to keep the environment's default crash penalty (300).
+  crash_penalty: null
+  # Extra BatteryPlaneVec constructor arguments, identical keys to the SAC config, so both
+  # algorithms fly exactly the same physics. Empty = environment defaults.
+  kwargs: {}
+
+training:
+  # PPO is on-policy: it throws every sample away after one update, so it needs several times
+  # more environment steps than SAC for the same policy. Each step is much cheaper, though
+  # (no gradient step per environment step), so 2M PPO steps take LESS wall time than 500k SAC
+  # steps. For an equal-sample-budget comparison instead, override training.total_timesteps=500000.
+  total_timesteps: 2000000
+  # Parallel copies of the environment. The env is pure numpy, so 8 copies cost almost nothing
+  # and give PPO the decorrelated batch it needs. One rollout = ppo.n_steps x n_envs transitions.
+  n_envs: 8
+  # dummy = all copies in this process (right for a cheap env). subproc = one process each,
+  # only worth it if the environment itself becomes expensive.
+  vec_env: dummy
+  # Training seed: network init, action sampling, and the env streams: SB3 resets env copy i with
+  # seed + index when learning starts (0-9 for seeds 0-2), far from the evaluation seeds (1000+).
+  # Never compare runs with one seed; use -m training.seed=0,1,2 (see top of file).
+  seed: 0
+  # One of: auto, cpu, cuda, mps. CPU is correct here: SB3 itself recommends CPU for MlpPolicy PPO,
+  # and an M-series GPU is slower than the CPU for 256x256 nets.
+  device: cpu
+
+ppo:
+  policy: MlpPolicy
+  learning_rate: 0.0003
+  # Steps collected per environment per update: 512 x 8 envs = 4096 transitions per update,
+  # i.e. ~6 episodes' worth (T = 700). Lower n_steps = more frequent, noisier updates.
+  n_steps: 512
+  # Minibatch for the epochs below. One rollout (4096) must divide evenly by this; the script
+  # refuses to start otherwise, because PPO would silently drop the remainder.
+  batch_size: 256
+  n_epochs: 10
+  # Same discount as the SAC config, so the two algorithms optimise the same objective.
+  # The 700-step horizon is long: if the SAC gamma study (e05/e06) says 0.995 is better, change it here too.
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  # null = do not clip the value function update (SB3 default).
+  clip_range_vf: null
+  normalize_advantage: true
+  # 0.0 is the usual choice for continuous control; raise to ~0.001 only if the policy collapses
+  # to one action early (watch train/std in W&B: if it falls below ~0.1 in the first 200k steps).
+  ent_coef: 0.0
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  # null = no early stop on KL. Set e.g. 0.02 if updates ever blow up.
+  target_kl: null
+  # Same width as the SAC config, so a difference between the two is about the algorithm, not capacity.
+  # Used for BOTH the policy and the value network.
+  net_arch: [256, 256]
+  # tanh is the PPO default and is the safer choice with ortho_init; relu, elu, gelu also accepted.
+  activation_fn: tanh
+  ortho_init: true
+  # Initial log std of the Gaussian policy (actions are clipped to [-1, 1]). 0.0 = std 1,
+  # i.e. very exploratory at the start; -0.5 starts calmer if early training looks chaotic.
+  log_std_init: 0.0
+  verbose: 1
+
+evaluation:
+  # In ENVIRONMENT steps, exactly like the SAC config (the script converts it to SB3's
+  # per-call frequency internally). Each evaluation is 18 episodes x 700 steps = 12,600 steps
+  # on a single env, so a small number here would cost more than the training itself.
+  # 50000 gives 40 points over the 2M default.
+  frequency: 50000
+  deterministic: true
+  # IDENTICAL to the SAC experiment configs. Do not change one without the other, or PPO and SAC
+  # are no longer scored on the same episodes and the comparison is meaningless.
+  reset_grid:
+    eval_seeds: [1000, 1001, 1002]
+    eval_initial_battery: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    eval_vx_obs_noise: [5.0]
+    # Sample starts by seed; fixed starts duplicate full/clean episodes (no observation noise).
+    eval_y0: null
+    eval_vx0: null
+  # Rendering is enabled only during evaluation, never during training.
+  render: false
+  # Use null for the environment's real-time rate (1 / dt = 20 FPS).
+  render_fps: 120
+  # Episode plots (episode_plots/*, flight_logging.py): altitude, speed, battery and actions of the first
+  # validation flight at each of these starting charges, every `frequency` environment steps (a multiple of
+  # evaluation.frequency) and at the end. Same as Contextual_PPO's config/cppo.yaml.
+  plots:
+    frequency: 100000
+    initial_battery: [0.2, 0.5, 0.7]
+
+checkpoint:
+  # Also in environment steps. PPO has no replay buffer, so a checkpoint is just the ~3 MB policy.
+  frequency: 500000
+  name_prefix: ppo_battery_plane
+
+wandb:
+  # Separate project keeps the PPO runs out of the SAC workspace. Set it to battery-plane-sac
+  # if you would rather have every BatteryPlane run in one place and filter by the "ppo" tag.
+  project: battery-plane-ppo
+  entity: null
+  run_name: null
+  # Seeds of one experiment share a group, so W&B can show mean +- std across seeds.
+  group: null
+  tags: [ppo]
+  sync_tensorboard: true
+  save_code: true
+  tensorboard_log_name: PPO
+  gradient_save_frequency: 0
+  callback_verbose: 2
+
+paths:
+  # Next to the SAC runs/ folder and resolved from the project root, so it does not matter
+  # which directory you start the script from. SAC's runs/ is never touched.
+  output_dir: runs_ppo
+
+# Keep Hydra from changing the working directory, as in the SAC config.
+hydra:
+  run:
+    dir: .
+  sweep:
+    dir: runs_ppo/_hydra_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+  output_subdir: null
+  job:
+    chdir: false

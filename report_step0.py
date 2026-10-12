@@ -1,18 +1,17 @@
 """Report Step 0 validation curves and frozen-final-checkpoint outcomes.
 
-Pass each run's actual resolved configuration explicitly. Plain PPO does not save
-one in its run directory; export it with the training command's same overrides
-and ``--cfg job --resolve``. This script never evaluates the reserved final test.
+Pass each run's actual resolved configuration explicitly. Both training scripts save it
+in the run directory as config.yaml (plain PPO: runs_ppo/<run id>/, CPPO: runs_cppo/<run id>/).
+This script never evaluates the reserved final test.
 
 Example (repeat --run for every condition and seed):
-    python report_step0.py --run 0a /path/to/resolved_s0.yaml /path/to/ppo_run \
-        --run 0c /path/to/cppo_run/config.yaml /path/to/cppo_run --output step0_report.json
+    python report_step0.py --run 0a runs_ppo/<id>/config.yaml runs_ppo/<id> \
+        --run 0c runs_cppo/<id>/config.yaml runs_cppo/<id> --output step0_report.json
 
-Export a plain-PPO configuration from ../Env_BatteryPlane with the same overrides
-used for that individual run, including its seed and minibatch size:
+Plain-PPO runs made with the old Env_BatteryPlane script have no config.yaml: export one with the same
+overrides used for that individual run, including its seed and minibatch size:
     python ppo/main_battery_plane_ppo.py +experiment=p04_observed ppo.batch_size=256 \
         training.total_timesteps=2000000 training.seed=0 --cfg job --resolve > /path/to/resolved_s0.yaml
-Supply any additional overrides from the actual training command as well.
 """
 from __future__ import annotations
 

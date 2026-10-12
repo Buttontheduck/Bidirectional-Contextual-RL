@@ -1,4 +1,5 @@
 """CPU checks of step 0 (ENCODER_PLAN.md), run 0c: python -m unittest checks.step0_checks -v"""
+import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
@@ -20,6 +21,12 @@ SMALL = ["training.n_envs=2", "cppo.n_steps=8", "cppo.n_minibatches=2", "cppo.n_
 def config(*overrides, step0=True):
     with initialize_config_dir(version_base=None, config_dir=str(training.PROJECT_ROOT / "config")):
         return compose(config_name="cppo", overrides=[*(["+step0=cppo_oracle"] if step0 else []), *overrides])
+
+
+def plain_ppo_config(*overrides):
+    """A config of the plain-PPO script (ppo/), which runs 0a and 0b."""
+    with initialize_config_dir(version_base=None, config_dir=str(training.PROJECT_ROOT / "ppo" / "configs")):
+        return compose(config_name="battery_plane_ppo", overrides=list(overrides))
 
 
 def plain_ppo(cfg, env):
@@ -46,6 +53,22 @@ class Step0Checks(unittest.TestCase):
         self.assertEqual(learner, baseline)
         for section in ("evaluation", "final_test"):
             self.assertEqual(cfg[section], base[section])
+
+    def test_plain_ppo_runs_match_0c_except_the_learner(self):
+        import report_step0
+
+        spec = importlib.util.spec_from_file_location("plain_ppo_script", training.PROJECT_ROOT / "ppo" / "main_battery_plane_ppo.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        protocols = {"0c": report_step0.evaluation_protocol(config(), "0c")}
+        for condition, name, batch_size in (("0a", "S0a_observed_bs256", 256), ("0b", "S0b_observed_bs1024", 1024)):
+            with self.subTest(condition=condition):
+                cfg = plain_ppo_config(f"+experiment={name}", "training.seed=2")
+                script.validate_ppo(cfg)
+                self.assertEqual((cfg.ppo.batch_size, cfg.wandb.project), (batch_size, "cppo"))
+                # Same environment, evaluation grid, budget and shared PPO settings as 0c
+                protocols[condition] = report_step0.evaluation_protocol(cfg, condition)
+                self.assertEqual(protocols[condition], protocols["0c"])
 
     def test_oracle_rejects_settings_that_need_an_encoder(self):
         for override in ("env.observation_mode=hidden", "cppo.encoder_objective=supervised",

@@ -1,0 +1,17 @@
+# @package _global_
+# Step 0, run 0a of ENCODER_PLAN.md: plain PPO with the true battery (observed mode), minibatches of 256 shuffled
+# transitions, 160 optimizer steps per rollout. The original p04 baseline, rerun under step 0's scoring.
+#
+#   python ppo/main_battery_plane_ppo.py -m +experiment=S0a_observed_bs256 training.seed=0,1,2
+env:
+  observation_mode: observed
+training:
+  total_timesteps: 2000000
+ppo:
+  batch_size: 256
+wandb:
+  # Next to 0c (and A-F) in the cppo project
+  project: cppo
+  run_name: S0a_observed_bs256_s${training.seed}
+  group: S0a_observed_bs256
+  tags: [ppo, step0]

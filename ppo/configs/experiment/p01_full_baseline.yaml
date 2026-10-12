@@ -1,0 +1,40 @@
+# @package _global_
+# =============================================================================
+# p01_full_baseline  --  PPO upper bound (agent can see the battery)
+#
+# OBJECTIVE
+#   The PPO twin of e01. Every hidden PPO result is compared against this number,
+#   and p01 vs e01 tells you whether PPO is a fair stand-in for SAC on this task
+#   at all -- which matters, because the memory architectures of phase 1
+#   (RecurrentPPO / sLSTM / Transformer) are PPO-based.
+#
+# WHAT IT CHANGES (compared to ppo/configs/battery_plane_ppo.yaml)
+#   - observation_mode: full
+#   - the evaluation grid written out explicitly: the SAME 18 episodes as e01
+#     (seeded random starts, eval seeds 1000-1002, noise 5.0)
+#
+# WHAT THE RESULTS MEAN
+#   - eval/mean_ep_length should reach 700 (a full agent never crashes). If not,
+#     PPO has not converged: raise training.total_timesteps before comparing.
+#   - p01 clearly below e01 = PPO needs more steps or different hyperparameters,
+#     NOT that context is worth less. Fix this gap before reading p02.
+#   - Compare with e11 on the same seeded starts; the fixed-start oracle table uses a different grid.
+#
+# RUN
+#   python ppo/main_battery_plane_ppo.py -m +experiment=p01_full_baseline training.seed=0,1,2
+# =============================================================================
+env:
+  observation_mode: full
+
+wandb:
+  run_name: p01_full_baseline_s${training.seed}
+  group: p01_full_baseline
+
+evaluation:
+  render: false
+  reset_grid:
+    eval_seeds: [1000, 1001, 1002]
+    eval_initial_battery: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    eval_vx_obs_noise: [5.0]
+    eval_y0: null                      # seeded random start, including in noiseless modes
+    eval_vx0: null

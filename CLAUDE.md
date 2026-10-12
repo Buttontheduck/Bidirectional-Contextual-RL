@@ -25,8 +25,11 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 python evaluate_final
 python -m unittest checks.grid_checks -v
 python -m unittest checks.grid_checks.GridChecks.test_held_out_seeds_cannot_overlap -v
 
-# Step 0 of ENCODER_PLAN.md, run 0c: CPPO with the true battery instead of the encoder (minutes per run, not hours)
-python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2
+# Step 0 of ENCODER_PLAN.md: all nine runs side by side (logs in runs_step0/), or one condition at a time
+nohup bash run_step0.sh > run_step0.log 2>&1 &
+python main_battery_plane_contextual_ppo.py -m +step0=cppo_oracle training.seed=0,1,2       # 0c: CPPO, true battery
+python ppo/main_battery_plane_ppo.py -m +experiment=S0a_observed_bs256 training.seed=0,1,2   # 0a: plain PPO
+python ppo/main_battery_plane_ppo.py -m +experiment=S0b_observed_bs1024 training.seed=0,1,2  # 0b: plain PPO, batch 1024
 python -m unittest checks.step0_checks -v
 python -m unittest checks.logging_checks -v          # flight_logging.py: metric definitions, both learners log the same
 
@@ -44,7 +47,7 @@ python battery_plane.py
 
 - `~/anaconda3/envs/carlos/lib/python3.11/site-packages/stable_baselines3/contextual_ppo` → this repo's `contextual_ppo/`
 - `../Env_BatteryPlane/battery_plane.py` → this repo's `battery_plane.py`
-- `../Env_BatteryPlane/flight_logging.py` → this repo's `flight_logging.py` (the plain-PPO script logs the same flight metrics)
+- `../Env_BatteryPlane/flight_logging.py` → this repo's `flight_logging.py` (only for Env_BatteryPlane's own copy of the plain-PPO script; step 0 uses this repo's `ppo/`)
 
 Edits here also change the sibling `Env_BatteryPlane` project. The training script itself does not need the links: it puts the repo root on `sys.path` and imports top-level `contextual_ppo` and `battery_plane`.
 
@@ -64,6 +67,7 @@ There are three layers, and the dependencies point one way only:
 
 3. **Project glue**:
    - `main_battery_plane_contextual_ppo.py` is the Hydra entry point (`config/cppo.yaml`). It provides `validate_config` (cross-field constraints, enforced before any logging or worker starts), `build_model` (maps `cfg.cppo.*` to `ContextualPPO`/`policy_kwargs`), env factories, the `TrueSpeedInfo` wrapper (adds `vx_ratio` to infos as the velocity-head target), `ScheduledEvalResets` (replays a fixed eval grid), and W&B/TensorBoard logging.
+   - `ppo/main_battery_plane_ppo.py` (configs in `ppo/configs/`) is plain SB3 PPO, copied from Env_BatteryPlane: the p01–p04 baselines and step 0's runs 0a/0b (`+experiment=S0a_observed_bs256` / `S0b_observed_bs1024`). It imports `battery_plane.py` and `flight_logging.py` from the repo root and writes to `runs_ppo/<run id>/`, including `config.yaml`.
    - `step0_oracle.py` holds `TrueBatteryEncoder` (no parameters, no state, `z_t = b_t` read from the observed-mode observation) and `TrueBatteryPolicy` (the actor and critic read the observation only). `cppo.context_source=oracle` selects them. The default is `encoder`, and `config/step0/` sits outside the A–F grid.
    - `flight_logging.py` holds algorithm-agnostic SB3 callbacks that log flight diagnostics from the env infos and executed actions, shared with the plain-PPO script through a symlink:
      - `FlightLoggingEvalCallback`: `validation/*` with per-starting-battery `by_b0/*`, and `episode_plots/*`

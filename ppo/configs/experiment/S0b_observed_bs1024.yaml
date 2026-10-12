@@ -1,0 +1,17 @@
+# @package _global_
+# Step 0, run 0b of ENCODER_PLAN.md: plain PPO with the true battery (observed mode), minibatches of 1,024 shuffled
+# transitions, 40 optimizer steps per rollout: CPPO's batch size and step count.
+#
+#   python ppo/main_battery_plane_ppo.py -m +experiment=S0b_observed_bs1024 training.seed=0,1,2
+env:
+  observation_mode: observed
+training:
+  total_timesteps: 2000000
+ppo:
+  batch_size: 1024
+wandb:
+  # Next to 0c (and A-F) in the cppo project
+  project: cppo
+  run_name: S0b_observed_bs1024_s${training.seed}
+  group: S0b_observed_bs1024
+  tags: [ppo, step0]
