@@ -1,0 +1,21 @@
+# @package _global_
+# Experiment A rerun with step 0's settings (ENCODER_PLAN.md): the learned xLSTM point encoder in hidden mode, exactly as
+# experiment A (config/cppo.yaml), except discount 0.99, reward scale 0.1 and 2M steps (the A-F runs also trained 2M
+# steps). It checks whether A failed because of the encoder or because of its unscaled rewards. Scored like step 0:
+# report_step0.py, condition A.
+#
+#   python run_step0.py --conditions A --threads 4      # seeds 0, 1, 2 side by side
+experiment_id: A_rerun
+training:
+  total_timesteps: 2000000
+cppo:
+  gamma: 0.99
+  reward_scale: 0.1
+wandb:
+  # Name and group carry the settings; with the inherited "cppo_" prefix: cppo_A_point_baseline_gamma0.99_rs0.1_s0 in
+  # group cppo_A_point_baseline_gamma0.99_rs0.1. The original A runs are cppo_A_point_baseline_s<seed>.
+  # Label of a follow-up study, e.g. _confirm1 (run_step0.py --study confirm1); empty for the first run
+  study: ""
+  run_name: A_point_baseline_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: A_point_baseline_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, point_context, rerun]

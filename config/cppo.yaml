@@ -28,6 +28,9 @@ env:
   # Recorded in W&B only. The environment always comes from the project's battery_plane.py.
   id: BatteryPlane-v0
   observation_mode: hidden
+  # Std of Gaussian noise on the visible battery (observed mode only): step 1's noisy oracle (step1_controls.py).
+  # 0 = no noise (A-F and step 0).
+  battery_noise: 0.0
   # null keeps the environment's default crash penalty (300).
   crash_penalty: null
   # Extra BatteryPlaneVec constructor arguments. Empty = environment defaults.

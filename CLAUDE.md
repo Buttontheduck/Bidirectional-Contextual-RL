@@ -28,6 +28,9 @@ python -m unittest checks.grid_checks.GridChecks.test_held_out_seeds_cannot_over
 # Step 0 of ENCODER_PLAN.md: every (condition, seed) as its own process, all at once (16 cores x 2 threads on the 9950X)
 nohup python run_step0.py > run_step0.log 2>&1 &     # logs and runs.json in runs_step0/<time>/; --conditions 0a 0b, --dry-run
 python run_step0.py --smoke                          # tiny budget, W&B disabled, runs under runs_step0/<time>-smoke/
+nohup python run_step0.py --conditions A --threads 4 > run_A.log 2>&1 &   # experiment A rerun (config/rerun/), ~4.5 h
+nohup python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12 --jobs 27 --threads 1 > run_step1.log 2>&1 &   # step 1 noisy oracle, ~15 min
+python -m unittest checks.step1_checks -v
 python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0       # one 0c run: CPPO, true battery
 python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0   # one 0a run (S0b_observed_bs1024: 0b)
 python -m unittest checks.step0_checks -v
@@ -70,6 +73,7 @@ There are three layers, and the dependencies point one way only:
    - `ppo/main_battery_plane_ppo.py` (configs in `ppo/configs/`) is plain SB3 PPO, copied from Env_BatteryPlane: the p01–p04 baselines and step 0's runs 0a/0b (`+experiment=S0a_observed_bs256` / `S0b_observed_bs1024`). It imports `battery_plane.py` and `flight_logging.py` from the repo root and writes to `runs_ppo/<run id>/`, including `config.yaml`.
    - `cppo.reward_scale` / `ppo.reward_scale` multiply the rewards the learner trains on (gymnasium `TransformReward` outside each training env's `Monitor`, so episode returns, evaluation and reports stay in env units). Step 0 uses 0.1 in all three conditions (screened 1–0.001, confirmed against 0.01 on 8 seeds), with gamma 0.99, chosen from discount screens of 0.9–0.999. The step 0 W&B names and groups are built from both settings, e.g. `S0a_observed_bs256_gamma0.99_rs0.01_s0` (earlier discount screens: no suffix for 0.999, `_gamma0995`, `_gamma09`, `_gamma095`); `run_step0.py --reward-scales ...` runs the nine runs once per scale, and `--study confirm1` appends `_confirm1` to the names and groups of follow-up seeds; the base configs keep 1.0 and 0.99, so A–F and p01–p04 are unchanged. `report_step0.py` rejects runs whose PPO settings, reward scale included, differ.
    - `step0_oracle.py` holds `TrueBatteryEncoder` (no parameters, no state, `z_t = b_t` read from the observed-mode observation) and `TrueBatteryPolicy` (the actor and critic read the observation only). `cppo.context_source=oracle` selects them. The default is `encoder`, and `config/step0/` sits outside the A–F grid.
+   - `step1_controls.py` holds step 1's controls: `NoisyBattery` (the noisy oracle) adds Gaussian noise of std `env.battery_noise` to the observed-mode battery, with its own random stream, reseeded at seeded resets. Runs 1a/1b/1c (`config/step1/`, `ppo/configs/experiment/S1*`) are 0a/0b/0c with that noise.
    - `flight_logging.py` holds algorithm-agnostic SB3 callbacks that log flight diagnostics from the env infos and executed actions, shared with the plain-PPO script through a symlink:
      - `FlightLoggingEvalCallback`: `validation/*` with per-starting-battery `by_b0/*`, and `episode_plots/*`
      - `RolloutFlightLogger`: `rollout/*`

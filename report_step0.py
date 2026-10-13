@@ -2,7 +2,9 @@
 
 Pass each run's actual resolved configuration explicitly. Both training scripts save it
 in the run directory as config.yaml (plain PPO: runs_ppo/<run id>/, CPPO: runs_cppo/<run id>/).
-This script never evaluates the reserved final test.
+This script never evaluates the reserved final test. Condition A is experiment A (learned encoder, hidden mode)
+rerun with step 0's settings (config/rerun/), and 1a, 1b, 1c are step 1's noisy oracle (0a, 0b, 0c seeing the battery
+plus noise); each is scored the same way, in a report of its own setting (the protocol includes the battery noise).
 
 Example (repeat --run for every condition and seed):
     python report_step0.py --run 0a runs_ppo/<id>/config.yaml runs_ppo/<id> \
@@ -25,8 +27,12 @@ from stable_baselines3 import PPO
 import torch
 
 import main_battery_plane_contextual_ppo as training
+from contextual_ppo.torch_layers import XLSTMRolloutEncoder
 
 
+CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c")
+# Step 1's noisy oracle: the step 0 run each condition repeats with noise on the battery
+NOISY_REPEATS = {"1a": "0a", "1b": "0b", "1c": "0c"}
 LATE_START = 1_500_000
 LATE_END = 2_000_000
 EVAL_FREQUENCY = 50_000
@@ -48,10 +54,16 @@ VALIDATION_GRID = {
 
 def evaluation_protocol(cfg, condition: str) -> dict:
     """Reject mislabeled controls or a different Step 0 validation protocol."""
-    if condition not in ("0a", "0b", "0c"):
-        raise ValueError("condition must be 0a, 0b or 0c")
-    if cfg.env.observation_mode != "observed":
-        raise ValueError("Step 0 requires env.observation_mode=observed")
+    if condition not in CONDITIONS:
+        raise ValueError(f"condition must be one of {CONDITIONS}")
+    # A noisy oracle repeats a step 0 run with noise on the visible battery
+    kind = NOISY_REPEATS.get(condition, condition)
+    noise = float(cfg.env.get("battery_noise", 0.0))
+    if (noise > 0) != (condition in NOISY_REPEATS):
+        raise ValueError(f"{condition} requires " + ("env.battery_noise > 0" if condition in NOISY_REPEATS else "no battery noise"))
+    mode = "hidden" if kind == "A" else "observed"
+    if cfg.env.observation_mode != mode:
+        raise ValueError(f"Step 0 requires env.observation_mode={mode} for {condition}")
     if not cfg.evaluation.deterministic or int(cfg.evaluation.frequency) != EVAL_FREQUENCY:
         raise ValueError("Step 0 requires deterministic evaluation every 50,000 transitions")
     grid = OmegaConf.to_container(cfg.evaluation.reset_grid, resolve=True)
@@ -61,20 +73,26 @@ def evaluation_protocol(cfg, condition: str) -> dict:
         raise ValueError("Step 0 requires 2,000,000 requested training transitions")
     if int(cfg.training.n_envs) != 8:
         raise ValueError("Step 0 requires eight training environments")
-    if condition == "0c":
+    if kind == "0c":
         if "cppo" not in cfg or cfg.cppo.get("context_source") != "oracle":
-            raise ValueError("0c requires CPPO with context_source=oracle")
+            raise ValueError(f"{condition} requires CPPO with context_source=oracle")
         training.validate_config(cfg)
         if int(cfg.cppo.n_minibatches) != 4:
-            raise ValueError("0c requires four whole-stream minibatches")
+            raise ValueError(f"{condition} requires four whole-stream minibatches")
+    elif kind == "A":
+        c = cfg.get("cppo")
+        if (c is None or c.get("context_source", "encoder") != "encoder" or c.encoder_objective != "supervised"
+                or c.context_head != "point" or c.velocity_head.enabled or int(c.n_minibatches) != 4):
+            raise ValueError("A requires CPPO with experiment A's learned point encoder and four whole-stream minibatches")
+        training.validate_config(cfg)
     elif "cppo" in cfg or "ppo" not in cfg:
         raise ValueError(f"{condition} requires plain PPO")
-    elif int(cfg.ppo.batch_size) != (256 if condition == "0a" else 1024):
+    elif int(cfg.ppo.batch_size) != (256 if kind == "0a" else 1024):
         raise ValueError(f"Unexpected plain-PPO batch size for {condition}")
-    learner = cfg.cppo if condition == "0c" else cfg.ppo
+    learner = cfg.cppo if kind in ("0c", "A") else cfg.ppo
     if int(learner.n_steps) != 512 or int(learner.n_epochs) != 10:
         raise ValueError("Step 0 requires 512 steps per environment and ten training epochs")
-    env = training.bp.BatteryPlaneEnv(observation_mode="observed", **training.env_kwargs_from(cfg))
+    env = training.bp.BatteryPlaneEnv(observation_mode=mode, **training.env_kwargs_from(cfg))
     try:
         # Normalize tuples/lists so equivalent environment settings compare equally.
         effective_env = json.loads(json.dumps(env.core._kw))
@@ -85,7 +103,7 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     settings = OmegaConf.to_container(learner, resolve=True)
     # Configs from before reward_scale trained on unscaled rewards
     settings.setdefault("reward_scale", 1.0)
-    return {"environment": effective_env, "reset_grid": VALIDATION_GRID,
+    return {"environment": effective_env, "battery_noise": noise, "reset_grid": VALIDATION_GRID,
             "deterministic": True, "frequency": EVAL_FREQUENCY,
             "shared_ppo_settings": {key: settings[key] for key in SHARED_PPO_SETTINGS}}
 
@@ -177,9 +195,13 @@ def main() -> None:
             raise ValueError(f"Checkpoint training duration or seed does not match the supplied config: {directory}")
         if (model.n_envs, model.n_steps, model.n_epochs) != (8, 512, 10):
             raise ValueError(f"Checkpoint rollout/epoch settings do not match Step 0: {directory}")
-        if condition == "0c":
+        kind = NOISY_REPEATS.get(condition, condition)
+        if kind == "0c":
             if model.n_minibatches != 4 or not isinstance(model.policy, training.TrueBatteryPolicy):
-                raise ValueError(f"0c checkpoint must use the oracle policy and four minibatches: {directory}")
+                raise ValueError(f"{condition} checkpoint must use the oracle policy and four minibatches: {directory}")
+        elif kind == "A":
+            if model.n_minibatches != 4 or not isinstance(model.policy.encoder, XLSTMRolloutEncoder):
+                raise ValueError(f"A checkpoint must use the learned xLSTM encoder and four minibatches: {directory}")
         elif model.batch_size != int(cfg.ppo.batch_size):
             raise ValueError(f"Checkpoint batch size does not match the supplied config: {directory}")
         validation = training.evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)

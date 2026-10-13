@@ -160,6 +160,48 @@ class Step0Checks(unittest.TestCase):
         with self.assertRaises(ValueError):
             script.validate_ppo(plain_ppo_config("training.num_threads=0"))
 
+    def test_experiment_A_rerun_changes_only_step0_settings(self):
+        import report_step0
+        import run_step0
+
+        cfg, base = config("+rerun=A_point_baseline", step0=False), config(step0=False)
+        training.validate_config(cfg)
+        # Experiment A, with only discount 0.99, reward scale 0.1 and 2M steps from step 0
+        learner, baseline = (OmegaConf.to_container(c.cppo, resolve=True) for c in (cfg, base))
+        self.assertEqual((learner.pop("reward_scale"), baseline.pop("reward_scale")), (0.1, 1.0))
+        self.assertEqual((learner["gamma"], learner["context_source"], learner["encoder_objective"], learner["context_head"]),
+                         (0.99, "encoder", "supervised", "point"))
+        self.assertEqual(learner, baseline)
+        self.assertEqual((cfg.training.total_timesteps, base.training.total_timesteps), (2_000_000, 1_000_000))
+        training_cfg, base_training = (OmegaConf.to_container(c.training) for c in (cfg, base))
+        del training_cfg["total_timesteps"], base_training["total_timesteps"]
+        self.assertEqual(training_cfg, base_training)
+        for section in ("env", "evaluation", "final_test", "checkpoint"):
+            self.assertEqual(cfg[section], base[section])
+        self.assertEqual(cfg.env.observation_mode, "hidden")
+        self.assertEqual((cfg.wandb.project, cfg.wandb.run_name_prefix, cfg.wandb.run_name, cfg.wandb.group),
+                         ("cppo", "cppo_", "A_point_baseline_gamma0.99_rs0.1_s0", "A_point_baseline_gamma0.99_rs0.1"))
+        # Scored like step 0, in its own report: same PPO settings as 0c, only the observation mode differs
+        protocol, protocol_0c = report_step0.evaluation_protocol(cfg, "A"), report_step0.evaluation_protocol(config(), "0c")
+        self.assertEqual(protocol["shared_ppo_settings"], protocol_0c["shared_ppo_settings"])
+        self.assertEqual({key for key in protocol["environment"] if protocol["environment"][key] != protocol_0c["environment"][key]},
+                         {"observation_mode"})
+        with self.assertRaisesRegex(ValueError, "observation_mode=hidden"):
+            report_step0.evaluation_protocol(config("+rerun=A_point_baseline", "env.observation_mode=observed", step0=False), "A")
+        with self.assertRaisesRegex(ValueError, "learned point encoder"):
+            report_step0.evaluation_protocol(config("+rerun=A_point_baseline", "cppo.context_head=gaussian", step0=False), "A")
+        # The launcher runs it only when asked, as single runs with the reward scaling in every training env
+        self.assertNotIn("A", run_step0.parse_args(["--output", "/tmp/step0_launch"]).conditions)
+        overrides = [item for item in run_step0.command_for("A", 1, 4, Path("/tmp/step0_launch"))[2:] if not item.startswith("hydra.")]
+        launched = config(*overrides, step0=False)
+        self.assertEqual((launched.training.seed, launched.training.num_threads, launched.wandb.run_name),
+                         (1, 4, "A_point_baseline_gamma0.99_rs0.1_s1"))
+        env = training.make_train_env(config(*overrides, "training.n_envs=2", step0=False))
+        try:
+            self.assertTrue(all(env.env_is_wrapped(TransformReward)))
+        finally:
+            env.close()
+
     def test_oracle_rejects_settings_that_need_an_encoder(self):
         for override in ("env.observation_mode=hidden", "cppo.encoder_objective=supervised",
                          "cppo.velocity_head.enabled=true", "cppo.context_head=gaussian", "cppo.context_dim=2"):

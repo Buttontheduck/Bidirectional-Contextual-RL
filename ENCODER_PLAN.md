@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 done (2026-10-13, results below); steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle done (2026-10-13, results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -161,10 +161,20 @@ The critic predicts returns well at every scale (95–100% explained variance). 
 
 Blind agents run out of battery in 70–82% of flights and never finish a flight that starts at 20% or 30% battery. The observed runs repeat 0b at the same settings (247 vs 213, 276 vs 240, 108 vs 114, 161 vs 148) with the same patterns: 0.995 is the worst discount, and unscaled rewards occasionally collapse (1 of 8 runs).
 
+**Experiment A rerun (discount 0.99, reward scale 0.1, 2M steps, seeds 0–2).** Config `config/rerun/A_point_baseline.yaml`, W&B group `cppo_A_point_baseline_gamma0.99_rs0.1`.
+
+| | Seeds 0 / 1 / 2 | Average | Completed |
+|---|---|---:|---:|
+| A rerun, reward scale 0.1 | 106 / −3 / −37 | 22 | 0–33% |
+| Original A, unscaled | −52 / 14 / −14 | −17 | 0–17% |
+| CPPO with the true battery (0c) | 361 / 272 / 212 | 282 | 87% |
+
+The new settings did not rescue A. It stays at the blind level, and the planes fly like blind agents: fast (36–47% of the time in the reward band), but they run out of battery in 67–100% of flights, and seed 0 flies the same at every battery. The encoder's battery estimate reaches R² 0.80 (typical error about 0.066, the noisy-oracle level of step 1), yet the policy gains almost nothing from it.
+
 **Summary.**
 - **CPPO's training works with a perfect battery.** 0c matches plain PPO with the battery: 249, against 247 for `sb3` observed at 0.99 and 0.01.
 - **Knowing the battery is worth about 200 points.** At 0.99 and 0.01, plain PPO scores 247 with it and 36 without it. That gap is what an encoder can win back.
-- **So the A–F failure lies in the encoder, or in training it together with the policy.** A–F's encoder runs scored around 50, near the blind level. They used unscaled rewards and 1M steps, so rerun one encoder experiment with the new settings before step 1.
+- **So the A–F failure lies in the encoder, or in training it together with the policy.** A–F's encoder runs scored around 50, near the blind level. The A rerun with the new settings (22) confirms it: A's unscaled rewards were not the cause.
 - **Settings from here on:** discount 0.99 and reward scale 0.1 (confirmed on 8 seeds). The blind agent was measured at 0.99 and 0.01 (36); measure it at 0.1 before comparing encoders with it. A blind agent reaches about 100 with discount 0.995.
 - **Low-battery flights fail for every learner and setting**, even with the true battery. This is not a CPPO problem.
 - **Runs are exactly reproducible.** 0c with unscaled rewards repeated its earlier scores (333, 240, 58), so the spread between seeds is the real noise.
@@ -175,8 +185,8 @@ Run the same PPO in every condition and change only the context `z_t` the policy
 
 | Condition | `z_t` | What it answers |
 |---|---|---|
-| **Oracle** | true `b_t` | Can PPO use a perfect estimate? |
-| **Noisy oracle** | `b_t` + noise, σ = 0.03 / 0.06 / 0.12 | How good does the estimate need to be? |
+| **Oracle** | true `b_t` | Can PPO use a perfect estimate? Done in step 0: yes, CPPO 282, plain PPO 246–258 (8 seeds) |
+| **Noisy oracle** | `b_t` + noise, σ = 0.03 / 0.06 / 0.12 | How good does the estimate need to be? Done: better than 0.03; even 0.03 breaks learning |
 | **Frozen encoder** (one per training mix) | pretrained, frozen | The main experiment |
 | **Clock-only** | average battery at step `t` | Return from an "encoder" that learned only time |
 | **No context** | none | Measured (`sb3_confirm1`): 36 at discount 0.99 / scale 0.01, 100 at 0.995 |
@@ -189,6 +199,26 @@ How to read the results:
 - **Oracle and frozen encoder both work:** the encoder is fine, and the failure comes from training it jointly with the policy. Either `z_t` shifting under the policy or CPPO's own update is to blame.
 
 Random noise is gentler than real encoder error, so a passing noisy oracle is necessary but not sufficient.
+
+**Noisy oracle (implemented 2026-10-13).** `step1_controls.NoisyBattery` replaces the visible battery of observed mode with `b_t + noise`: Gaussian, standard deviation `env.battery_noise`, drawn fresh every step and not clipped. Actor and critic never see the true `b_t`; the env infos keep it for logging. The noise has its own random stream (the flights stay those of step 0 until the actions differ), and every validation flight gets the same noise in every evaluation. Runs 1a, 1b and 1c repeat 0a, 0b and 0c with only this change (`ppo/configs/experiment/S1a_noisy_bs256.yaml`, `S1b_noisy_bs1024.yaml`, `config/step1/cppo_noisy_oracle.yaml`), so CPPO's oracle path reads the noisy battery as `z_t`. W&B names carry the noise, e.g. `cppo_S1c_noisy_oracle_noise0.06_gamma0.99_rs0.1_s0`. `report_step0.py` scores each noise level in its own report; `python -m unittest checks.step1_checks -v` covers the wrapper, both scripts and the report.
+
+```bash
+# 3 noise levels x 1a, 1b, 1c x 3 seeds = 27 runs, all at once with 1 thread each (20% faster than 16 x 2), about 15 minutes
+nohup python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12 --jobs 27 --threads 1 > run_step1.log 2>&1 &
+```
+
+**Noisy oracle results (2026-10-13).** Late scores (1.5M–2M), seeds 0–2, discount 0.99, reward scale 0.1; W&B groups `…_noise<σ>_gamma0.99_rs0.1`.
+
+| | No noise (step 0) | σ = 0.03 | σ = 0.06 | σ = 0.12 |
+|---|---:|---:|---:|---:|
+| Plain PPO, batch 256 (1a) | 276 | 86 | 73 | 64 |
+| Plain PPO, batch 1024 (1b) | 275 | 85 | 71 | 51 |
+| CPPO (1c) | 282 | 108 | 122 | 53 |
+| Flights completed | 85–89% | 7–31% | 2–22% | 6–17% |
+
+- **Even σ = 0.03 breaks it.** Scores fall by about two thirds, close to agents that cannot see the battery (16–36). The planes fly fast (32–57% of the time in the reward band), run out of battery in 69–98% of flights, never finish a flight that starts at 20% or 30% battery, and react much less to the battery. Plain PPO and CPPO fail alike.
+- **The noise hurts the learning more than the flying.** CPPO policies trained with the true battery and flown with σ = 0.03 still scored 181 on average (248 without noise) and completed 67–83% of flights. Policies trained with σ = 0.03 and flown with the true battery stayed bad (149, 17–33% completed). With a noisy battery during training, PPO does not learn to use it and settles on flying fast.
+- **For the encoder:** its typical error (about 0.066) is twice the noise that already breaks learning, and the real encoder (A rerun, 22) did worse than random noise of the same size (71–122). An estimate must be better than about 0.03 before a policy can learn from it, at least with noise that changes every step; a real encoder's error changes smoothly. Worth testing next: learn with an accurate battery first and switch to the estimate afterwards (or start from an accurate frozen encoder), and give the policy the estimate's uncertainty or memory.
 
 ### 2. Run every condition through plain PPO
 
@@ -245,7 +275,7 @@ Steps 1–5 currently list 8 conditions × 3 seeds = 24 PPO runs: oracle, three 
 The enc1 setup on the server already covers the offline training step. The new pieces are:
 
 1. **The CPPO oracle bypass.** Done: `cppo.context_source=oracle`, verified by `checks.step0_checks` (see Step 0).
-2. **The step 0 runs.** Done: CPPO can use the true battery, with discount 0.99 and reward scale 0.1 (Step 0 results). Next: rerun one A–F encoder experiment with these settings.
+2. **The step 0 runs.** Done: CPPO can use the true battery, with discount 0.99 and reward scale 0.1 (Step 0 results). The A rerun with these settings scored 22, near the blind level, so the encoder side is the problem. Next: step 1.
 3. **The context wrapper.** If Step 0 supports proceeding, implement the frozen-encoder and control inputs for plain PPO.
 4. **The pilot generator.**
 5. **The remaining controls.** Verify whether Step 0's plain-PPO oracle can be reused; add the clock-only and noisy-oracle conditions when the follow-up scope is fixed.

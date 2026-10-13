@@ -1,0 +1,14 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, noisy oracle for plain PPO (run 1b): run 0b (S0b_observed_bs1024), except that the policy sees the
+# battery plus Gaussian noise of std env.battery_noise (step1_controls.NoisyBattery) instead of the true battery.
+#
+#   python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12
+defaults:
+  - /experiment/S0b_observed_bs1024
+  - _self_
+env:
+  battery_noise: 0.06
+wandb:
+  run_name: S1b_noisy_bs1024_noise${env.battery_noise}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1b_noisy_bs1024_noise${env.battery_noise}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, step1, noisy_oracle]

@@ -1,0 +1,18 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, noisy oracle for CPPO (run 1c): run 0c (config/step0/cppo_oracle.yaml), except that the
+# policy sees the battery plus Gaussian noise of std env.battery_noise (step1_controls.NoisyBattery) instead of the
+# true battery. 0.06 is about the typical error of the learned encoder in the A rerun; the screen also runs 0.03 and 0.12.
+#
+#   python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12
+defaults:
+  - /step0/cppo_oracle
+  - _self_
+experiment_id: S1c
+env:
+  battery_noise: 0.06
+wandb:
+  # With the inherited "cppo_" prefix: cppo_S1c_noisy_oracle_noise0.06_gamma0.99_rs0.1_s0 in group
+  # cppo_S1c_noisy_oracle_noise0.06_gamma0.99_rs0.1
+  run_name: S1c_noisy_oracle_noise${env.battery_noise}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1c_noisy_oracle_noise${env.battery_noise}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, step1, noisy_oracle]

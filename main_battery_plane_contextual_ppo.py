@@ -59,6 +59,7 @@ from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights, terminal_outcome,
 )
 from step0_oracle import TrueBatteryPolicy  # noqa: E402
+from step1_controls import NoisyBattery  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 # cppo.context_source: the xLSTM encoder, or the true battery of step 0 (step0_oracle.py)
@@ -73,6 +74,11 @@ def context_source_from(cfg: DictConfig) -> str:
 def reward_scale_from(cfg: DictConfig) -> float:
     """Saved A–F configs predate reward_scale and trained on unscaled rewards."""
     return float(cfg.cppo.get("reward_scale", 1.0))
+
+
+def battery_noise_from(cfg: DictConfig) -> float:
+    """Std of the noise on the observed battery (step 1's noisy oracle); older saved configs have none."""
+    return float(cfg.env.get("battery_noise", 0.0))
 
 
 class ScheduledEvalResets(gym.Wrapper):
@@ -180,10 +186,13 @@ def make_train_env(cfg: DictConfig) -> VecEnv:
     base_seed = int(cfg.training.seed)
     speed_labels = bool(cfg.cppo.velocity_head.enabled)
     reward_scale = reward_scale_from(cfg)
+    battery_noise = battery_noise_from(cfg)
 
     def factory(index: int):
         def _init() -> gym.Env:
             env = bp.BatteryPlaneEnv(observation_mode=observation_mode, **kwargs)
+            if battery_noise > 0:
+                env = NoisyBattery(env, battery_noise)
             if speed_labels:
                 env = TrueSpeedInfo(env)
             env = Monitor(env)
@@ -208,7 +217,9 @@ def make_train_env(cfg: DictConfig) -> VecEnv:
 def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]]):
     """One environment that replays the fixed evaluation grid, as in the SAC script."""
     raw_env = bp.BatteryPlaneEnv(observation_mode=cfg.env.observation_mode, **env_kwargs_from(cfg))
-    scheduler = ScheduledEvalResets(raw_env, reset_schedule)
+    # The noisy oracle's noise sits inside the scheduler, which reseeds it with every validation flight's seed
+    observed = NoisyBattery(raw_env, battery_noise_from(cfg)) if battery_noise_from(cfg) > 0 else raw_env
+    scheduler = ScheduledEvalResets(observed, reset_schedule)
     env = Monitor(scheduler)
     env.action_space.seed(int(cfg.training.seed) + 1)
     env.reset()
@@ -315,6 +326,11 @@ def validate_config(cfg: DictConfig) -> None:
     scale = cppo.get("reward_scale", 1.0)
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
         raise ValueError("cppo.reward_scale must be a finite number > 0")
+    noise = cfg.env.get("battery_noise", 0.0)
+    if isinstance(noise, bool) or not isinstance(noise, (int, float)) or not math.isfinite(noise) or noise < 0:
+        raise ValueError("env.battery_noise must be a finite number >= 0")
+    if noise > 0 and cfg.env.observation_mode != "observed":
+        raise ValueError("env.battery_noise adds noise to the visible battery: it needs env.observation_mode=observed")
     if cppo.context_activation is not None and cppo.context_activation not in CONTEXT_ACTIVATIONS:
         raise ValueError(f"cppo.context_activation must be null or one of {sorted(CONTEXT_ACTIVATIONS)}")
     if cppo.context_head not in CONTEXT_HEADS:
@@ -570,7 +586,7 @@ def main(cfg: DictConfig) -> None:
         print(
             f"  {n_envs} envs x {n_steps} steps = {n_envs * n_steps} transitions per update, "
             f"{cfg.cppo.n_minibatches} minibatches of {metadata['minibatch_transitions']} x {cfg.cppo.n_epochs} epochs"
-            f" | gamma={cfg.cppo.gamma} reward_scale={reward_scale_from(cfg)}"
+            f" | gamma={cfg.cppo.gamma} reward_scale={reward_scale_from(cfg)} battery_noise={battery_noise_from(cfg)}"
             f" | bptt_len={cfg.cppo.bptt_len} reset_envs_each_rollout={cfg.cppo.reset_envs_each_rollout}"
             f" | context_source={context_source_from(cfg)}"
             f" encoder_objective={cfg.cppo.encoder_objective} encoder_actor_loss_weight={cfg.cppo.encoder_actor_loss_weight}"

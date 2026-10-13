@@ -55,6 +55,8 @@ from battery_plane import iter_eval_resets  # noqa: E402
 from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights,
 )
+# Step 1's noisy oracle: the observed battery plus noise, as in Contextual_PPO
+from step1_controls import NoisyBattery  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 
@@ -141,10 +143,13 @@ def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | 
     observation_mode = cfg.env.observation_mode
     base_seed = int(cfg.training.seed)
     reward_scale = float(cfg.ppo.get("reward_scale", 1.0))
+    battery_noise = float(cfg.env.get("battery_noise", 0.0))
 
     def factory(index: int):
         def _init() -> gym.Env:
             env = bp.BatteryPlaneEnv(observation_mode=observation_mode, **kwargs)
+            if battery_noise > 0:
+                env = NoisyBattery(env, battery_noise)
             if env_wrapper is not None:
                 env = env_wrapper(env)
             env = Monitor(env)
@@ -169,7 +174,10 @@ def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | 
 def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]]):
     """One environment that replays the fixed evaluation grid, as in the SAC script."""
     raw_env = bp.BatteryPlaneEnv(observation_mode=cfg.env.observation_mode, **env_kwargs_from(cfg))
-    scheduler = ScheduledEvalResets(raw_env, reset_schedule)
+    # The noisy oracle's noise sits inside the scheduler, which reseeds it with every validation flight's seed
+    battery_noise = float(cfg.env.get("battery_noise", 0.0))
+    observed = NoisyBattery(raw_env, battery_noise) if battery_noise > 0 else raw_env
+    scheduler = ScheduledEvalResets(observed, reset_schedule)
     env = Monitor(scheduler)
     env.action_space.seed(int(cfg.training.seed) + 1)
     env.reset()
@@ -243,6 +251,11 @@ def validate_ppo(cfg: DictConfig) -> None:
     scale = cfg.ppo.get("reward_scale", 1.0)
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
         raise ValueError("ppo.reward_scale must be a finite number > 0")
+    noise = cfg.env.get("battery_noise", 0.0)
+    if isinstance(noise, bool) or not isinstance(noise, (int, float)) or not math.isfinite(noise) or noise < 0:
+        raise ValueError("env.battery_noise must be a finite number >= 0")
+    if noise > 0 and cfg.env.observation_mode != "observed":
+        raise ValueError("env.battery_noise adds noise to the visible battery: it needs env.observation_mode=observed")
     # Env copy i is first reset with seed * 100 + i (make_train_env), then SB3 re-seeds it with seed + i when
     # learning starts; that stream drives training. Neither may reach an evaluation seed.
     seed = int(cfg.training.seed)
@@ -307,7 +320,7 @@ def main(cfg: DictConfig) -> None:
         f"  {n_envs} train envs x {cfg.ppo.n_steps} steps = {n_envs * int(cfg.ppo.n_steps)} transitions per update"
         f" | {int(cfg.training.total_timesteps) // (n_envs * int(cfg.ppo.n_steps))} updates"
         f" | eval episodes: {len(eval_reset_schedule)}"
-        f" | gamma={cfg.ppo.gamma} reward_scale={cfg.ppo.get('reward_scale', 1.0)}"
+        f" | gamma={cfg.ppo.gamma} reward_scale={cfg.ppo.get('reward_scale', 1.0)} battery_noise={cfg.env.get('battery_noise', 0.0)}"
     )
     run.config.update({"effective_env": core._kw, "algorithm": "PPO", "torch_threads": torch.get_num_threads(),
                        "torch_interop_threads": torch.get_num_interop_threads()}, allow_val_change=True)

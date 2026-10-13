@@ -48,7 +48,7 @@ def read_json(path: Path):
 
 def source_digest() -> str:
     files = [ROOT / "main_battery_plane_contextual_ppo.py", ROOT / "battery_plane.py", ROOT / "run_grid.py",
-             ROOT / "flight_logging.py", ROOT / "step0_oracle.py"]
+             ROOT / "flight_logging.py", ROOT / "step0_oracle.py", ROOT / "step1_controls.py"]
     files += list((ROOT / "config").rglob("*.yaml"))
     files += [p for p in (ROOT / "contextual_ppo").glob("*.py") if not p.name.startswith("test_")]
     digest = hashlib.sha256()

@@ -13,6 +13,8 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --smoke                          # tiny budget, W&B off, everything under runs_step0/
     python run_step0.py --reward-scales 1 0.1 0.001      # the nine runs once per reward scale
     python run_step0.py --seeds 3 4 5 6 7 --study confirm1   # more seeds, W&B names and groups end in _confirm1
+    python run_step0.py --conditions A --threads 4       # experiment A (learned encoder) rerun with step 0's settings
+    python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12   # step 1: noisy oracle
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
@@ -42,7 +44,15 @@ CONDITIONS = {
     "0a": ("ppo/main_battery_plane_ppo.py", "+experiment=S0a_observed_bs256", "ppo"),
     "0b": ("ppo/main_battery_plane_ppo.py", "+experiment=S0b_observed_bs1024", "ppo"),
     "0c": ("main_battery_plane_contextual_ppo.py", "+step0=cppo_oracle", "cppo"),
+    # Experiment A (learned xLSTM encoder, hidden mode) with step 0's settings; hours per run, so never a default
+    "A": ("main_battery_plane_contextual_ppo.py", "+rerun=A_point_baseline", "cppo"),
+    # Step 1, noisy oracle: 0a, 0b and 0c seeing the battery plus noise (env.battery_noise)
+    "1a": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_noisy_bs256", "ppo"),
+    "1b": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_noisy_bs1024", "ppo"),
+    "1c": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_noisy_oracle", "cppo"),
 }
+STEP0_CONDITIONS = ["0a", "0b", "0c"]
+NOISY_CONDITIONS = ["1a", "1b", "1c"]
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -63,23 +73,32 @@ def physical_cores() -> int:
     return len(cores)
 
 
-def launch_name(condition: str, seed: int, reward_scale: float | None = None) -> str:
-    """Name of one run's log: 0a_s0, or 0a_rs0.1_s0 when the launch sets the reward scale."""
-    return f"{condition}_s{seed}" if reward_scale is None else f"{condition}_rs{reward_scale:g}_s{seed}"
+def launch_name(condition: str, seed: int, reward_scale: float | None = None, battery_noise: float | None = None) -> str:
+    """Name of one run's log: 0a_s0, with the reward scale and battery noise the launch sets, e.g. 1c_noise0.06_s0."""
+    parts = [condition]
+    if reward_scale is not None:
+        parts.append(f"rs{reward_scale:g}")
+    if battery_noise is not None:
+        parts.append(f"noise{battery_noise:g}")
+    return "_".join([*parts, f"s{seed}"])
 
 
 def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bool = False,
-                reward_scale: float | None = None, study: str | None = None) -> list[str]:
+                reward_scale: float | None = None, study: str | None = None,
+                battery_noise: float | None = None) -> list[str]:
     script, experiment, learner = CONDITIONS[condition]
     command = [
         sys.executable, str(ROOT / script), experiment, f"training.seed={seed}",
         f"training.num_threads={threads}", "training.num_interop_threads=1",
         # Hydra's job log; the training scripts never change directory
-        f"hydra.run.dir={json.dumps(str(output / 'hydra' / launch_name(condition, seed, reward_scale)))}",
+        f"hydra.run.dir={json.dumps(str(output / 'hydra' / launch_name(condition, seed, reward_scale, battery_noise)))}",
     ]
     if reward_scale is not None:
         # The configs build the W&B name and group from it
         command.append(f"{learner}.reward_scale={reward_scale:g}")
+    if battery_noise is not None:
+        # The step 1 configs build the W&B name and group from it
+        command.append(f"env.battery_noise={battery_noise:g}")
     if study:
         # Appended to the W&B name and group, e.g. ..._rs0.1_confirm1_s3
         command.append(f"wandb.study=_{study}")
@@ -113,8 +132,9 @@ class Launcher:
                 except ProcessLookupError:
                     pass
 
-    def run_one(self, condition: str, seed: int, reward_scale: float | None = None) -> dict:
-        name = launch_name(condition, seed, reward_scale)
+    def run_one(self, condition: str, seed: int, reward_scale: float | None = None,
+                battery_noise: float | None = None) -> dict:
+        name = launch_name(condition, seed, reward_scale, battery_noise)
         log = self.args.output / f"{name}.log"
         environment = child_environment(self.args.threads)
         if self.args.smoke or self.args.wandb_mode is not None:
@@ -123,11 +143,11 @@ class Launcher:
         with log.open("x") as stream:
             with self.lock:
                 if self.stopping.is_set():
-                    return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "status": "not started",
-                            "log": str(log)}
+                    return {"condition": condition, "seed": seed, "reward_scale": reward_scale,
+                            "battery_noise": battery_noise, "status": "not started", "log": str(log)}
                 process = subprocess.Popen(
                     command_for(condition, seed, self.args.threads, self.args.output, self.args.smoke, reward_scale,
-                                self.args.study),
+                                self.args.study, battery_noise),
                     cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
                 )
                 self.children.add(process)
@@ -144,16 +164,20 @@ class Launcher:
         status = "done" if run_dir else "failed"
         print(f"{status.upper()} {name} | {minutes:.1f} min | "
               + (f"run: {run_dir}" if run_dir else f"exit {code}, see {log}"), flush=True)
-        return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "status": status, "exit_code": code, "minutes": round(minutes, 2),
+        return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "battery_noise": battery_noise,
+                "status": status, "exit_code": code, "minutes": round(minutes, 2),
                 "log": str(log), "run_dir": run_dir}
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--conditions", nargs="+", choices=list(CONDITIONS), default=list(CONDITIONS))
+    parser.add_argument("--conditions", nargs="+", choices=list(CONDITIONS), default=STEP0_CONDITIONS)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--reward-scales", type=float, nargs="+", default=None,
                         help="Run every condition and seed once per reward scale (default: the configs' reward scale)")
+    parser.add_argument("--battery-noises", type=float, nargs="+", default=None,
+                        help="Step 1 conditions (1a 1b 1c) only: run every condition and seed once per noise std "
+                             "(default: the configs' 0.06)")
     parser.add_argument("--jobs", type=int, default=physical_cores(), help="Runs at the same time (default: physical cores)")
     parser.add_argument("--threads", type=int, default=2, help="CPU threads per run (default: 2)")
     parser.add_argument("--study", default=None,
@@ -172,6 +196,12 @@ def parse_args(argv=None):
     scales = args.reward_scales
     if scales is not None and (min(scales) <= 0 or len({f"{scale:g}" for scale in scales}) != len(scales)):
         parser.error("Reward scales must be distinct and positive")
+    noises = args.battery_noises
+    if noises is not None:
+        if min(noises) <= 0 or len({f"{noise:g}" for noise in noises}) != len(noises):
+            parser.error("Battery noises must be distinct and positive")
+        if not set(args.conditions) <= set(NOISY_CONDITIONS):
+            parser.error(f"--battery-noises applies to the noisy-oracle conditions {NOISY_CONDITIONS} only")
     stamp = time.strftime("%Y%m%d-%H%M%S") + ("-smoke" if args.smoke else "")
     args.output = (args.output or ROOT / "runs_step0" / stamp).resolve()
     return args
@@ -180,17 +210,19 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     # Seeds outer: with fewer job slots than runs, every condition still progresses
-    scales = args.reward_scales or [None]
-    runs = [(condition, seed, scale) for scale in scales for seed in args.seeds for condition in args.conditions]
+    scales, noises = args.reward_scales or [None], args.battery_noises or [None]
+    runs = [(condition, seed, scale, noise) for scale in scales for noise in noises for seed in args.seeds
+            for condition in args.conditions]
     at_once = min(args.jobs, len(runs))
     described = "" if args.reward_scales is None else f" x reward scales {[f'{scale:g}' for scale in scales]}"
+    described += "" if args.battery_noises is None else f" x battery noises {[f'{noise:g}' for noise in noises]}"
     print(f"{len(runs)} runs ({' '.join(args.conditions)} x seeds {args.seeds}{described}): {at_once} at once x "
           f"{args.threads} threads | {physical_cores()} physical cores, {os.cpu_count()} hardware threads", flush=True)
     if at_once * args.threads > os.cpu_count():
         print(f"Note: {at_once * args.threads} threads exceed the {os.cpu_count()} hardware threads", flush=True)
     if args.dry_run:
-        for condition, seed, scale in runs:
-            print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke, scale, args.study)))
+        for condition, seed, scale, noise in runs:
+            print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke, scale, args.study, noise)))
         return 0
     args.output.mkdir(parents=True, exist_ok=False)
     print(f"Logs: {args.output}", flush=True)
@@ -202,7 +234,7 @@ def main(argv=None) -> int:
 
     previous = signal.signal(signal.SIGTERM, terminate)
     pool = ThreadPoolExecutor(max_workers=at_once)
-    futures = [pool.submit(launcher.run_one, condition, seed, scale) for condition, seed, scale in runs]
+    futures = [pool.submit(launcher.run_one, condition, seed, scale, noise) for condition, seed, scale, noise in runs]
     try:
         results = [future.result() for future in as_completed(futures)]
     except BaseException:
@@ -214,20 +246,40 @@ def main(argv=None) -> int:
         pool.shutdown(wait=True, cancel_futures=True)
         signal.signal(signal.SIGTERM, previous)
 
-    results.sort(key=lambda result: (-(result["reward_scale"] or 0), result["condition"], result["seed"]))
+    results.sort(key=lambda result: (-(result["reward_scale"] or 0), result["battery_noise"] or 0, result["condition"],
+                                     result["seed"]))
     (args.output / "runs.json").write_text(json.dumps(results, indent=2) + "\n")
     done = [result for result in results if result["status"] == "done"]
     failed = len(results) - len(done)
     print(f"{len(done)} of {len(results)} runs finished" + (f", {failed} FAILED" if failed else ""), flush=True)
-    # report_step0.py compares runs with the same settings: one report per reward scale
-    for scale in scales:
-        group = [result for result in done if result["reward_scale"] == scale]
-        if group and not args.smoke:
-            label, suffix = ("", "") if scale is None else (f" (reward scale {scale:g})", f"_rs{scale:g}")
-            report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)
-            print(f"Report{label}: python report_step0.py {report} --output {args.output / f'step0_report{suffix}.json'}",
-                  flush=True)
+    if not args.smoke:
+        for line in report_commands(done, scales, noises, args.output):
+            print(line, flush=True)
     return 1 if failed else 0
+
+
+def report_commands(done: list[dict], scales: list, noises: list, output: Path) -> list[str]:
+    """
+    report_step0.py compares runs with the same settings: one command per reward scale and battery noise, e.g.
+    "Report (battery noise 0.06): python report_step0.py --run 1a ... --output .../step0_report_noise0.06.json".
+    """
+    lines = []
+    for scale in scales:
+        for noise in noises:
+            group = [r for r in done if r["reward_scale"] == scale and r["battery_noise"] == noise]
+            if not group:
+                continue
+            labels, suffix = [], ""
+            if scale is not None:
+                labels.append(f"reward scale {scale:g}")
+                suffix += f"_rs{scale:g}"
+            if noise is not None:
+                labels.append(f"battery noise {noise:g}")
+                suffix += f"_noise{noise:g}"
+            label = f" ({', '.join(labels)})" if labels else ""
+            report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)
+            lines.append(f"Report{label}: python report_step0.py {report} --output {output / f'step0_report{suffix}.json'}")
+    return lines
 
 
 if __name__ == "__main__":
