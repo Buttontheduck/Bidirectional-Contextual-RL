@@ -35,7 +35,7 @@ FINAL_TIMESTEPS = 2_002_944  # ceil(2M / (8 * 512)) complete rollouts
 SHARED_PPO_SETTINGS = (
     "learning_rate", "n_steps", "n_epochs", "gamma", "gae_lambda", "clip_range", "clip_range_vf",
     "normalize_advantage", "ent_coef", "vf_coef", "max_grad_norm", "target_kl", "net_arch",
-    "activation_fn", "ortho_init", "log_std_init",
+    "activation_fn", "ortho_init", "log_std_init", "reward_scale",
 )
 VALIDATION_GRID = {
     "eval_seeds": [1000, 1001, 1002],
@@ -83,6 +83,8 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     if effective_env["vx_obs_noise"] != 5.0:
         raise ValueError("Step 0 requires training speed noise 5")
     settings = OmegaConf.to_container(learner, resolve=True)
+    # Configs from before reward_scale trained on unscaled rewards
+    settings.setdefault("reward_scale", 1.0)
     return {"environment": effective_env, "reset_grid": VALIDATION_GRID,
             "deterministic": True, "frequency": EVAL_FREQUENCY,
             "shared_ppo_settings": {key: settings[key] for key in SHARED_PPO_SETTINGS}}

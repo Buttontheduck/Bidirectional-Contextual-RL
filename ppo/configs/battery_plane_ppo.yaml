@@ -54,6 +54,9 @@ ppo:
   # Same discount as the SAC config, so the two algorithms optimise the same objective.
   # The 700-step horizon is long: if the SAC gamma study (e05/e06) says 0.995 is better, change it here too.
   gamma: 0.99
+  # Rewards the learner trains on (critic targets, GAE) are the env rewards x reward_scale. Episode returns,
+  # evaluation and every logged return stay in environment units. 1.0 = unscaled (p01-p04); step 0 uses 0.01.
+  reward_scale: 1.0
   gae_lambda: 0.95
   clip_range: 0.2
   # null = do not clip the value function update (SB3 default).

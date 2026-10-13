@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
+from gymnasium.wrappers import TransformReward
 import hydra
 import stable_baselines3
 import numpy as np
@@ -67,6 +68,11 @@ CONTEXT_SOURCES = ("encoder", "oracle")
 def context_source_from(cfg: DictConfig) -> str:
     """Saved A–F configs predate context_source and use the learned encoder."""
     return cfg.cppo.get("context_source", "encoder")
+
+
+def reward_scale_from(cfg: DictConfig) -> float:
+    """Saved A–F configs predate reward_scale and trained on unscaled rewards."""
+    return float(cfg.cppo.get("reward_scale", 1.0))
 
 
 class ScheduledEvalResets(gym.Wrapper):
@@ -167,11 +173,13 @@ class TrueSpeedInfo(gym.Wrapper):
 
 def make_train_env(cfg: DictConfig) -> VecEnv:
     """n_envs copies of BatteryPlaneEnv, each with its own random stream; with the velocity head, each copy also
-    reports the true speed (TrueSpeedInfo, inside its Monitor)."""
+    reports the true speed (TrueSpeedInfo, inside its Monitor). With cppo.reward_scale != 1, the learner gets the
+    rewards x reward_scale (TransformReward, outside the Monitor, whose episode returns stay in env units)."""
     kwargs = env_kwargs_from(cfg)
     observation_mode = cfg.env.observation_mode
     base_seed = int(cfg.training.seed)
     speed_labels = bool(cfg.cppo.velocity_head.enabled)
+    reward_scale = reward_scale_from(cfg)
 
     def factory(index: int):
         def _init() -> gym.Env:
@@ -179,6 +187,8 @@ def make_train_env(cfg: DictConfig) -> VecEnv:
             if speed_labels:
                 env = TrueSpeedInfo(env)
             env = Monitor(env)
+            if reward_scale != 1.0:
+                env = TransformReward(env, lambda reward: reward_scale * reward)
             # Only until learning starts: SB3 then re-seeds the VecEnv (env.seed(training.seed)), so copy i
             # starts training from reset seed training.seed + i. validate_config keeps both from the held-out seeds.
             seed = base_seed * 100 + index
@@ -302,6 +312,9 @@ def validate_config(cfg: DictConfig) -> None:
     weight = cppo.encoder_actor_loss_weight
     if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight < 0:
         raise ValueError("cppo.encoder_actor_loss_weight must be a finite number >= 0")
+    scale = cppo.get("reward_scale", 1.0)
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("cppo.reward_scale must be a finite number > 0")
     if cppo.context_activation is not None and cppo.context_activation not in CONTEXT_ACTIVATIONS:
         raise ValueError(f"cppo.context_activation must be null or one of {sorted(CONTEXT_ACTIVATIONS)}")
     if cppo.context_head not in CONTEXT_HEADS:
@@ -557,6 +570,7 @@ def main(cfg: DictConfig) -> None:
         print(
             f"  {n_envs} envs x {n_steps} steps = {n_envs * n_steps} transitions per update, "
             f"{cfg.cppo.n_minibatches} minibatches of {metadata['minibatch_transitions']} x {cfg.cppo.n_epochs} epochs"
+            f" | gamma={cfg.cppo.gamma} reward_scale={reward_scale_from(cfg)}"
             f" | bptt_len={cfg.cppo.bptt_len} reset_envs_each_rollout={cfg.cppo.reset_envs_each_rollout}"
             f" | context_source={context_source_from(cfg)}"
             f" encoder_objective={cfg.cppo.encoder_objective} encoder_actor_loss_weight={cfg.cppo.encoder_actor_loss_weight}"

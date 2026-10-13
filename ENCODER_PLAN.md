@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** planned (2026-10-12), not started.
+**Status:** step 0 done (2026-10-13, results below); steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -23,7 +23,7 @@ A frozen encoder gives PPO a fixed input that no longer shifts while the policy 
 
 Before building better encoders, ask: **can CPPO learn when battery estimation is perfect?** Replace the learned context with the true current battery for both the actor and critic. Bypass the encoder and disable its training; do not give the networks an additional learned estimate alongside the true battery.
 
-Observed-mode plain PPO (p04) already provides encouraging evidence: 212 final return and about 360 at its peak. Repeat it alongside the new conditions under the same scoring rule. Those historical scores are reference points, not guaranteed reproduction targets.
+Observed-mode plain PPO (p04) already provides encouraging evidence: 212 final return and about 360 at its peak. Repeat it alongside the new conditions under the same scoring rule. Those historical scores are reference points, not guaranteed reproduction targets: p04 used unscaled rewards, step 0 scales them (see the critic settings below).
 
 **CPPO and plain PPO train the networks differently.** Both collect 4,096 transitions per rollout (8 environments × 512 steps), and both use each transition 10 times. They split those transitions into minibatches differently:
 
@@ -36,6 +36,8 @@ The learning rate is the same, so CPPO makes a quarter as many weight updates, b
 
 **Primary runs: three conditions × three seeds = nine fresh runs.** All use 8 environments × 512 steps, 10 epochs, 2M requested environment transitions (rounded to complete rollouts), and training seeds 0, 1, 2.
 
+**Critic settings, the same for all three conditions.** The learners train on rewards × `reward_scale` (`cppo.reward_scale` / `ppo.reward_scale`), because the −300 crash penalty made the critic's error explode. A wrapper outside each training env's `Monitor` applies the scale, so episode returns, evaluation and every score stay in environment units. The discount is 0.99. Both were chosen by the screens in the Step 0 results below. A–F and p01–p04 used unscaled rewards and 0.99.
+
 Seeds, the same for all three conditions:
 - Training env `i` starts from reset seed `seed + i`, so 0–9. SB3 re-seeds the envs when learning starts. The same seed in 0a, 0b and 0c starts from the same first flights.
 - Validation uses seeds 1000–1002. The final-test seeds 2000–2002 stay unused.
@@ -44,12 +46,12 @@ Seeds, the same for all three conditions:
 
 | Run | Learner and battery input | Minibatch | Optimizer steps per rollout | Purpose |
 |---|---|---|---:|---|
-| 0a | Plain PPO, true battery (`observed` mode) | 256 shuffled transitions | 160 | Reproduce the original baseline |
+| 0a | Plain PPO, true battery (`observed` mode) | 256 shuffled transitions | 160 | The original baseline's minibatch, with step 0's critic settings |
 | 0b | Plain PPO, true battery (`observed` mode) | 1,024 shuffled transitions | 40 | Match CPPO's batch size and optimizer-step count |
 | 0c | CPPO, true battery replacing the encoder | 1,024 transitions (2 streams × 512 steps) | 40 | Test CPPO without estimation error or encoder drift |
 
 - Every actor and critic receives the same five values: the four hidden-mode observations plus the true current battery, in the same order and scale. Speed remains noisy. There is no predicted mean, variance, or other encoder feature in 0c.
-- Keep the environment, reward, actor/critic architecture, learning rate, discount, GAE settings, and other PPO settings identical. The intended differences are the learner and the minibatch settings shown above.
+- Keep the environment, reward and reward scale, actor/critic architecture, learning rate, discount, GAE settings, and other PPO settings identical. The intended differences are the learner and the minibatch settings shown above.
 - Compare 0b with 0c to investigate differences beyond batch size and optimizer-step count, including shuffled transitions versus complete streams. Compare 0a with 0b to investigate the batch-size/update-count setting within plain PPO; these two effects are not separated by this comparison.
 - The earlier 32-environment × 128-step condition is deferred. It changes trajectory collection and GAE bootstrapping as well as minibatches, so success would not establish that CPPO "only needed more updates."
 
@@ -58,7 +60,7 @@ Seeds, the same for all three conditions:
 - `encoder_objective=rl` with no encoder parameters means there is no episode buffer, no supervised encoder step, and nothing for the routed PPO losses to update. The speed head stays off.
 - CPPO's collector, PPO losses and whole-stream minibatching are unchanged. The default `cppo.context_source=encoder` leaves A–F unchanged; a missing field in an older saved config also means `encoder` during validation and model construction.
 - `validate_config` requires `observed` mode for the oracle. It rejects `full` (exact speed), hidden-battery modes, a supervised objective, the speed head, the Gaussian head or `context_dim` ≠ 1.
-- The inherited W&B prefix is retained: seed 0 is named `cppo_S0c_oracle_s0`, in group `cppo_S0c_oracle`.
+- The inherited W&B prefix is retained, and the name carries the discount: with discount 0.99 and reward scale 0.01, seed 0 is named `cppo_S0c_oracle_gamma0.99_rs0.01_s0`, in group `cppo_S0c_oracle_gamma0.99_rs0.01`.
 
 `python -m unittest checks.step0_checks -v` covers the pre-training checks:
 - The config differs from the base only in the battery input.
@@ -109,6 +111,64 @@ The plain-PPO script used for 0a and 0b now lives in this repo under `ppo/`. It 
 
 Review Step 0 before launching steps 1–5. No pilot dataset or offline encoder training is needed for this screen.
 
+#### Step 0 results (2026-10-12/13)
+
+Scores are the mean validation return from 1.5M to 2M steps, averaged over seeds 0–2. "Completed" is the share of validation flights finished at the final checkpoint. W&B groups in `duck13/cppo` carry the settings, e.g. `S0a_observed_bs256_gamma0.99_rs0.1`. The discount screens ran before this naming: no suffix for 0.999, then `_gamma0995`, `_gamma09` and `_gamma095`.
+
+**CPPO can use the true battery.** In every screen below, 0c scored within the seed spread of plain PPO (0a, 0b). At discount 0.99 with reward scale 0.01 or 0.1, it had the best average of the three.
+
+**Discount (reward scale 0.01).**
+
+| Discount | 0a | 0b | 0c | Completed | 20%-battery flights failed |
+|---|---:|---:|---:|---:|---:|
+| 0.9 | 242 | 230 | 289 | 65–72% | 27 of 27 |
+| 0.95 | 296 | 197 | 299 | 67–76% | 27 of 27 |
+| **0.99** | 226 | 213 | 249 | **80–91%** | **19 of 27** |
+| 0.995 | 160 | 114 | 131 | 67–89% | 20 of 27 |
+| 0.999 | 169 | 148 | 130 | 74–85% | 22 of 27 |
+
+A shorter look-ahead gives bolder, faster flying: more points and more time in the reward band, but more crashes. 0.995 and 0.999 trained worst, and with 0.999 CPPO stopped using the battery. **Chosen: 0.99**, which balances return and failed flights.
+
+**Reward scale (discount 0.99).**
+
+| Reward scale | 0a | 0b | 0c | Runs collapsed (score < 100) | Completed |
+|---|---:|---:|---:|---:|---:|
+| 1 (unscaled) | 265 | 240 | 210 | 2 of 9 | 67–85% |
+| **0.1** | 276 | 275 | 282 | **0 of 9** | **85–89%** |
+| 0.01 | 226 | 213 | 249 | 0 of 9 | 80–91% |
+| 0.005 | 212 | 245 | 208 | 1 of 9 | 67–83% |
+| 0.001 | 232 | 305 | 249 | 0 of 9 | 78–85% |
+
+The critic predicts returns well at every scale (95–100% explained variance). The scale changes the size of the training steps instead: unscaled, every update's gradient was 26–700 times the clipping limit, which likely explains the collapses. 0.1 looked best on three seeds, so a confirmation added seeds 3–7 for 0.1 and 0.01, like `sb3_confirm1` (W&B groups ending in `_confirm1`; `python run_step0.py --reward-scales 0.1 0.01 --seeds 3 4 5 6 7 --study confirm1`).
+
+**Confirmation, eight seeds (0–7).**
+
+| Reward scale | 0a | 0b | 0c | All 24 runs | Completed | 30%-battery flights failed |
+|---|---:|---:|---:|---:|---:|---:|
+| **0.1** | 246 | 258 | 282 | **262** | **87%** | **1 of 72** |
+| 0.01 | 213 | 243 | 265 | 240 | 84% | 14 of 72 |
+
+0.1 scored higher in all three conditions and beat 0.01 on 16 of 24 same-seed pairs, by 22 points on average. The score gain is small and not certain: 16 of 24 would happen by chance about 8% of the time, and on seeds 3–7 alone the lead shrank from about 50 to 6 points. The clearer gain is safety: fewer failed 30%-battery flights and better weakest runs. 20%-battery flights failed equally often (56 of 72), and no run collapsed. **Chosen: reward scale 0.1.**
+
+**Plain PPO with and without the battery (`sb3_screen1`, `sb3_confirm1`, 2026-10-08/09).** Plain SB3 PPO with 0b's settings (batch 1024), run from a script that is not in this repo, in hidden mode (no battery, no memory) and observed mode. Eight seeds (0–7) per row.
+
+| Discount, reward scale | Hidden: return (completed) | Observed: return (completed) |
+|---|---:|---:|
+| 0.99, 0.01 | 36 (15%) | 247 (86%) |
+| 0.99, 1 | 16 (22%) | 276 (81%) |
+| 0.995, 0.01 | 100 (18%) | 108 (72%) |
+| 0.999, 0.01 | 77 (29%) | 161 (89%) |
+
+Blind agents run out of battery in 70–82% of flights and never finish a flight that starts at 20% or 30% battery. The observed runs repeat 0b at the same settings (247 vs 213, 276 vs 240, 108 vs 114, 161 vs 148) with the same patterns: 0.995 is the worst discount, and unscaled rewards occasionally collapse (1 of 8 runs).
+
+**Summary.**
+- **CPPO's training works with a perfect battery.** 0c matches plain PPO with the battery: 249, against 247 for `sb3` observed at 0.99 and 0.01.
+- **Knowing the battery is worth about 200 points.** At 0.99 and 0.01, plain PPO scores 247 with it and 36 without it. That gap is what an encoder can win back.
+- **So the A–F failure lies in the encoder, or in training it together with the policy.** A–F's encoder runs scored around 50, near the blind level. They used unscaled rewards and 1M steps, so rerun one encoder experiment with the new settings before step 1.
+- **Settings from here on:** discount 0.99 and reward scale 0.1 (confirmed on 8 seeds). The blind agent was measured at 0.99 and 0.01 (36); measure it at 0.1 before comparing encoders with it. A blind agent reaches about 100 with discount 0.995.
+- **Low-battery flights fail for every learner and setting**, even with the true battery. This is not a CPPO problem.
+- **Runs are exactly reproducible.** 0c with unscaled rewards repeated its earlier scores (333, 240, 58), so the spread between seeds is the real noise.
+
 ### 1. Bracket the encoder with controls
 
 Run the same PPO in every condition and change only the context `z_t` the policy receives:
@@ -119,7 +179,7 @@ Run the same PPO in every condition and change only the context `z_t` the policy
 | **Noisy oracle** | `b_t` + noise, σ = 0.03 / 0.06 / 0.12 | How good does the estimate need to be? |
 | **Frozen encoder** (one per training mix) | pretrained, frozen | The main experiment |
 | **Clock-only** | average battery at step `t` | Return from an "encoder" that learned only time |
-| **No context** | none | Already measured: PPO hidden, 52.7 |
+| **No context** | none | Measured (`sb3_confirm1`): 36 at discount 0.99 / scale 0.01, 100 at 0.995 |
 
 The σ values bracket what we measured: about 0.06 for the current encoders and 0.12 for the clock-only estimate.
 
@@ -185,7 +245,7 @@ Steps 1–5 currently list 8 conditions × 3 seeds = 24 PPO runs: oracle, three 
 The enc1 setup on the server already covers the offline training step. The new pieces are:
 
 1. **The CPPO oracle bypass.** Done: `cppo.context_source=oracle`, verified by `checks.step0_checks` (see Step 0).
-2. **The step 0 runs.** Run the three conditions, then use the results to choose the next diagnostic.
+2. **The step 0 runs.** Done: CPPO can use the true battery, with discount 0.99 and reward scale 0.1 (Step 0 results). Next: rerun one A–F encoder experiment with these settings.
 3. **The context wrapper.** If Step 0 supports proceeding, implement the frozen-encoder and control inputs for plain PPO.
 4. **The pilot generator.**
 5. **The remaining controls.** Verify whether Step 0's plain-PPO oracle can be reused; add the clock-only and noisy-oracle conditions when the follow-up scope is fixed.

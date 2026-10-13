@@ -52,6 +52,9 @@ cppo:
   n_minibatches: 4                         # minibatches of complete env streams: 2 streams x 512 steps
   n_epochs: 10
   gamma: 0.99
+  # Rewards the learner trains on (critic targets, GAE) are the env rewards x reward_scale. Episode returns,
+  # evaluation and every logged return stay in environment units. 1.0 = unscaled (A-F); step 0 uses 0.01.
+  reward_scale: 1.0
   gae_lambda: 0.95
   clip_range: 0.2
   clip_range_vf: null

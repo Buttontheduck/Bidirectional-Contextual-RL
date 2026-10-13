@@ -11,10 +11,13 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions 0a 0b               # only the plain-PPO runs
     python run_step0.py --dry-run                        # print the commands without starting anything
     python run_step0.py --smoke                          # tiny budget, W&B off, everything under runs_step0/
+    python run_step0.py --reward-scales 1 0.1 0.001      # the nine runs once per reward scale
+    python run_step0.py --seeds 3 4 5 6 7 --study confirm1   # more seeds, W&B names and groups end in _confirm1
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
-report_step0.py command for the finished runs.
+report_step0.py command for the finished runs, one per reward scale. The W&B names carry the discount and the reward
+scale (e.g. S0a_observed_bs256_gamma0.99_rs0.1_s0), taken from the configs.
 """
 from __future__ import annotations
 
@@ -34,11 +37,11 @@ import time
 from run_grid import child_environment
 
 ROOT = Path(__file__).resolve().parent
-# Condition -> training script and its experiment config
+# Condition -> training script, its experiment config and its learner's config section
 CONDITIONS = {
-    "0a": ("ppo/main_battery_plane_ppo.py", "+experiment=S0a_observed_bs256"),
-    "0b": ("ppo/main_battery_plane_ppo.py", "+experiment=S0b_observed_bs1024"),
-    "0c": ("main_battery_plane_contextual_ppo.py", "+step0=cppo_oracle"),
+    "0a": ("ppo/main_battery_plane_ppo.py", "+experiment=S0a_observed_bs256", "ppo"),
+    "0b": ("ppo/main_battery_plane_ppo.py", "+experiment=S0b_observed_bs1024", "ppo"),
+    "0c": ("main_battery_plane_contextual_ppo.py", "+step0=cppo_oracle", "cppo"),
 }
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
@@ -60,14 +63,26 @@ def physical_cores() -> int:
     return len(cores)
 
 
-def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bool = False) -> list[str]:
-    script, experiment = CONDITIONS[condition]
+def launch_name(condition: str, seed: int, reward_scale: float | None = None) -> str:
+    """Name of one run's log: 0a_s0, or 0a_rs0.1_s0 when the launch sets the reward scale."""
+    return f"{condition}_s{seed}" if reward_scale is None else f"{condition}_rs{reward_scale:g}_s{seed}"
+
+
+def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bool = False,
+                reward_scale: float | None = None, study: str | None = None) -> list[str]:
+    script, experiment, learner = CONDITIONS[condition]
     command = [
         sys.executable, str(ROOT / script), experiment, f"training.seed={seed}",
         f"training.num_threads={threads}", "training.num_interop_threads=1",
         # Hydra's job log; the training scripts never change directory
-        f"hydra.run.dir={json.dumps(str(output / 'hydra' / f'{condition}_s{seed}'))}",
+        f"hydra.run.dir={json.dumps(str(output / 'hydra' / launch_name(condition, seed, reward_scale)))}",
     ]
+    if reward_scale is not None:
+        # The configs build the W&B name and group from it
+        command.append(f"{learner}.reward_scale={reward_scale:g}")
+    if study:
+        # Appended to the W&B name and group, e.g. ..._rs0.1_confirm1_s3
+        command.append(f"wandb.study=_{study}")
     if smoke:
         command += [*SMOKE_OVERRIDES, f"paths.output_dir={json.dumps(str(output / 'runs'))}"]
     return command
@@ -98,8 +113,8 @@ class Launcher:
                 except ProcessLookupError:
                     pass
 
-    def run_one(self, condition: str, seed: int) -> dict:
-        name = f"{condition}_s{seed}"
+    def run_one(self, condition: str, seed: int, reward_scale: float | None = None) -> dict:
+        name = launch_name(condition, seed, reward_scale)
         log = self.args.output / f"{name}.log"
         environment = child_environment(self.args.threads)
         if self.args.smoke or self.args.wandb_mode is not None:
@@ -108,9 +123,11 @@ class Launcher:
         with log.open("x") as stream:
             with self.lock:
                 if self.stopping.is_set():
-                    return {"condition": condition, "seed": seed, "status": "not started", "log": str(log)}
+                    return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "status": "not started",
+                            "log": str(log)}
                 process = subprocess.Popen(
-                    command_for(condition, seed, self.args.threads, self.args.output, self.args.smoke),
+                    command_for(condition, seed, self.args.threads, self.args.output, self.args.smoke, reward_scale,
+                                self.args.study),
                     cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
                 )
                 self.children.add(process)
@@ -127,7 +144,7 @@ class Launcher:
         status = "done" if run_dir else "failed"
         print(f"{status.upper()} {name} | {minutes:.1f} min | "
               + (f"run: {run_dir}" if run_dir else f"exit {code}, see {log}"), flush=True)
-        return {"condition": condition, "seed": seed, "status": status, "exit_code": code, "minutes": round(minutes, 2),
+        return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "status": status, "exit_code": code, "minutes": round(minutes, 2),
                 "log": str(log), "run_dir": run_dir}
 
 
@@ -135,8 +152,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--conditions", nargs="+", choices=list(CONDITIONS), default=list(CONDITIONS))
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument("--reward-scales", type=float, nargs="+", default=None,
+                        help="Run every condition and seed once per reward scale (default: the configs' reward scale)")
     parser.add_argument("--jobs", type=int, default=physical_cores(), help="Runs at the same time (default: physical cores)")
     parser.add_argument("--threads", type=int, default=2, help="CPU threads per run (default: 2)")
+    parser.add_argument("--study", default=None,
+                        help="Label appended to the W&B names and groups, e.g. confirm1 for more seeds of a screen")
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
     parser.add_argument("--smoke", action="store_true", help="Tiny budget, W&B disabled, run directories in --output")
     parser.add_argument("--output", type=Path, help="Folder for the logs and runs.json (default: runs_step0/<time>)")
@@ -146,6 +167,11 @@ def parse_args(argv=None):
         parser.error("--jobs and --threads must be positive")
     if min(args.seeds) < 0 or len(set(args.seeds)) != len(args.seeds) or len(set(args.conditions)) != len(args.conditions):
         parser.error("Seeds must be distinct non-negative integers and conditions distinct")
+    if args.study is not None and not re.fullmatch(r"[A-Za-z0-9]+", args.study):
+        parser.error("--study must be letters and digits, e.g. confirm1")
+    scales = args.reward_scales
+    if scales is not None and (min(scales) <= 0 or len({f"{scale:g}" for scale in scales}) != len(scales)):
+        parser.error("Reward scales must be distinct and positive")
     stamp = time.strftime("%Y%m%d-%H%M%S") + ("-smoke" if args.smoke else "")
     args.output = (args.output or ROOT / "runs_step0" / stamp).resolve()
     return args
@@ -154,15 +180,17 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     # Seeds outer: with fewer job slots than runs, every condition still progresses
-    runs = [(condition, seed) for seed in args.seeds for condition in args.conditions]
+    scales = args.reward_scales or [None]
+    runs = [(condition, seed, scale) for scale in scales for seed in args.seeds for condition in args.conditions]
     at_once = min(args.jobs, len(runs))
-    print(f"{len(runs)} runs ({' '.join(args.conditions)} x seeds {args.seeds}): {at_once} at once x {args.threads} "
-          f"threads | {physical_cores()} physical cores, {os.cpu_count()} hardware threads", flush=True)
+    described = "" if args.reward_scales is None else f" x reward scales {[f'{scale:g}' for scale in scales]}"
+    print(f"{len(runs)} runs ({' '.join(args.conditions)} x seeds {args.seeds}{described}): {at_once} at once x "
+          f"{args.threads} threads | {physical_cores()} physical cores, {os.cpu_count()} hardware threads", flush=True)
     if at_once * args.threads > os.cpu_count():
         print(f"Note: {at_once * args.threads} threads exceed the {os.cpu_count()} hardware threads", flush=True)
     if args.dry_run:
-        for condition, seed in runs:
-            print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke)))
+        for condition, seed, scale in runs:
+            print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke, scale, args.study)))
         return 0
     args.output.mkdir(parents=True, exist_ok=False)
     print(f"Logs: {args.output}", flush=True)
@@ -174,7 +202,7 @@ def main(argv=None) -> int:
 
     previous = signal.signal(signal.SIGTERM, terminate)
     pool = ThreadPoolExecutor(max_workers=at_once)
-    futures = [pool.submit(launcher.run_one, condition, seed) for condition, seed in runs]
+    futures = [pool.submit(launcher.run_one, condition, seed, scale) for condition, seed, scale in runs]
     try:
         results = [future.result() for future in as_completed(futures)]
     except BaseException:
@@ -186,14 +214,19 @@ def main(argv=None) -> int:
         pool.shutdown(wait=True, cancel_futures=True)
         signal.signal(signal.SIGTERM, previous)
 
-    results.sort(key=lambda result: (result["condition"], result["seed"]))
+    results.sort(key=lambda result: (-(result["reward_scale"] or 0), result["condition"], result["seed"]))
     (args.output / "runs.json").write_text(json.dumps(results, indent=2) + "\n")
     done = [result for result in results if result["status"] == "done"]
     failed = len(results) - len(done)
     print(f"{len(done)} of {len(results)} runs finished" + (f", {failed} FAILED" if failed else ""), flush=True)
-    if done and not args.smoke:
-        report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in done)
-        print(f"Report: python report_step0.py {report} --output {args.output / 'step0_report.json'}", flush=True)
+    # report_step0.py compares runs with the same settings: one report per reward scale
+    for scale in scales:
+        group = [result for result in done if result["reward_scale"] == scale]
+        if group and not args.smoke:
+            label, suffix = ("", "") if scale is None else (f" (reward scale {scale:g})", f"_rs{scale:g}")
+            report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)
+            print(f"Report{label}: python report_step0.py {report} --output {args.output / f'step0_report{suffix}.json'}",
+                  flush=True)
     return 1 if failed else 0
 
 

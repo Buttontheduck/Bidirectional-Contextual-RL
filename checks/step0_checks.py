@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from gymnasium.wrappers import TransformReward
 from hydra import compose, initialize_config_dir
 import numpy as np
 from omegaconf import OmegaConf
@@ -57,6 +58,9 @@ class Step0Checks(unittest.TestCase):
         learner = OmegaConf.to_container(cfg.cppo, resolve=True)
         baseline = OmegaConf.to_container(base.cppo, resolve=True)
         self.assertEqual((learner.pop("context_source"), learner.pop("encoder_objective")), ("oracle", "rl"))
+        # Step 0's reward scale and discount, shared with 0a and 0b (A-F: unscaled rewards, discount 0.99)
+        self.assertEqual((learner.pop("reward_scale"), baseline.pop("reward_scale")), (0.1, 1.0))
+        self.assertEqual((learner.pop("gamma"), baseline.pop("gamma")), (0.99, 0.99))
         del baseline["context_source"], baseline["encoder_objective"]
         self.assertEqual(learner, baseline)
         for section in ("evaluation", "final_test"):
@@ -76,6 +80,44 @@ class Step0Checks(unittest.TestCase):
                 protocols[condition] = report_step0.evaluation_protocol(cfg, condition)
                 self.assertEqual(protocols[condition], protocols["0c"])
 
+    def test_learners_train_on_scaled_rewards_while_returns_stay_in_env_units(self):
+        script = plain_ppo_script()
+        cases = (
+            ("0c", config(*SMALL), training.make_train_env, training.make_eval_env),
+            ("0a", plain_ppo_config("+experiment=S0a_observed_bs256", "training.n_envs=2", "+env.kwargs.T=4"),
+             script.make_train_env, script.make_eval_env),
+        )
+        actions = np.array([[1.0, 0.5], [-0.3, 1.0]], dtype=np.float32)
+        for condition, cfg, make_train_env, make_eval_env in cases:
+            with self.subTest(condition=condition):
+                env = make_train_env(cfg)
+                eval_env, _, _ = make_eval_env(cfg, list(training.iter_eval_resets(cfg.evaluation.reset_grid)))
+                try:
+                    self.assertTrue(all(env.env_is_wrapped(TransformReward)))
+                    self.assertFalse(any(eval_env.env_is_wrapped(TransformReward)))
+                    # The same flights without any wrapper: env copy i reset with seed 5 + i
+                    references = [training.bp.BatteryPlaneEnv(observation_mode="observed", T=4) for _ in range(2)]
+                    for i, reference in enumerate(references):
+                        reference.reset(seed=5 + i)
+                    env.seed(5)
+                    env.reset()
+                    returns = np.zeros(2)
+                    for _ in range(4):
+                        _, rewards, dones, infos = env.step(actions)
+                        raw = np.array([reference.step(action)[1] for reference, action in zip(references, actions)])
+                        np.testing.assert_allclose(rewards, 0.1 * raw, rtol=1e-5)
+                        returns += raw
+                    # Monitor (inside the scaling) records the episode return in environment units
+                    self.assertTrue(dones.all())
+                    np.testing.assert_allclose([info["episode"]["r"] for info in infos], returns, atol=1e-5)
+                finally:
+                    env.close()
+                    eval_env.close()
+        for check, cfg in ((training.validate_config, config("cppo.reward_scale=0")),
+                           (script.validate_ppo, plain_ppo_config("ppo.reward_scale=-1"))):
+            with self.assertRaisesRegex(ValueError, "reward_scale"):
+                check(cfg)
+
     def test_parallel_launcher_runs_each_condition_and_seed_as_its_own_process(self):
         import run_step0
 
@@ -83,23 +125,37 @@ class Step0Checks(unittest.TestCase):
         self.assertEqual((args.conditions, args.seeds, args.threads), (["0a", "0b", "0c"], [0, 1, 2], 2))
         self.assertGreaterEqual(args.jobs, 1)
         script = plain_ppo_script()
-        for condition in args.conditions:
-            for seed in args.seeds:
-                with self.subTest(condition=condition, seed=seed):
-                    command = run_step0.command_for(condition, seed, 2, args.output)
-                    # A single run per process (no Hydra multirun) with its own thread limit
-                    self.assertNotIn("-m", command)
-                    overrides = [item for item in command[2:] if not item.startswith("hydra.")]
-                    if condition == "0c":
-                        cfg = config(*overrides, step0=False)
-                        training.validate_config(cfg)
-                        self.assertEqual(cfg.cppo.context_source, "oracle")
-                    else:
-                        cfg = plain_ppo_config(*overrides)
-                        script.validate_ppo(cfg)
-                        self.assertEqual(cfg.ppo.batch_size, 256 if condition == "0a" else 1024)
-                    self.assertEqual((cfg.training.seed, cfg.training.num_threads, cfg.env.observation_mode),
-                                     (seed, 2, "observed"))
+        names = {"0a": "S0a_observed_bs256", "0b": "S0b_observed_bs1024", "0c": "S0c_oracle"}
+        cases = [(condition, seed, None) for condition in args.conditions for seed in args.seeds]
+        for condition, seed, scale in cases + [("0a", 1, 0.1), ("0c", 2, 1.0)]:
+            with self.subTest(condition=condition, seed=seed, reward_scale=scale):
+                command = run_step0.command_for(condition, seed, 2, args.output, reward_scale=scale)
+                # A single run per process (no Hydra multirun) with its own thread limit
+                self.assertNotIn("-m", command)
+                overrides = [item for item in command[2:] if not item.startswith("hydra.")]
+                if condition == "0c":
+                    cfg = config(*overrides, step0=False)
+                    training.validate_config(cfg)
+                    self.assertEqual(cfg.cppo.context_source, "oracle")
+                else:
+                    cfg = plain_ppo_config(*overrides)
+                    script.validate_ppo(cfg)
+                    self.assertEqual(cfg.ppo.batch_size, 256 if condition == "0a" else 1024)
+                self.assertEqual((cfg.training.seed, cfg.training.num_threads, cfg.env.observation_mode),
+                                 (seed, 2, "observed"))
+                # The W&B name and group carry the discount and the reward scale actually used
+                learner = cfg.cppo if condition == "0c" else cfg.ppo
+                rs = "0.1" if scale is None else f"{scale:g}"
+                self.assertEqual((learner.gamma, float(learner.reward_scale)), (0.99, 0.1 if scale is None else scale))
+                self.assertEqual((cfg.wandb.run_name, cfg.wandb.group),
+                                 (f"{names[condition]}_gamma0.99_rs{rs}_s{seed}", f"{names[condition]}_gamma0.99_rs{rs}"))
+        self.assertEqual(run_step0.launch_name("0b", 2, 0.005), "0b_rs0.005_s2")
+        # A follow-up study (more seeds) gets its own W&B name and group
+        overrides = [item for item in run_step0.command_for("0b", 4, 2, args.output, reward_scale=0.1, study="confirm1")[2:]
+                     if not item.startswith("hydra.")]
+        cfg = plain_ppo_config(*overrides)
+        self.assertEqual((cfg.wandb.run_name, cfg.wandb.group),
+                         ("S0b_observed_bs1024_gamma0.99_rs0.1_confirm1_s4", "S0b_observed_bs1024_gamma0.99_rs0.1_confirm1"))
         self.assertEqual(run_step0.child_environment(2)["OMP_NUM_THREADS"], "2")
         with self.assertRaises(ValueError):
             script.validate_ppo(plain_ppo_config("training.num_threads=0"))

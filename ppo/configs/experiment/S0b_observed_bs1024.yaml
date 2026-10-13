@@ -9,9 +9,16 @@ training:
   total_timesteps: 2000000
 ppo:
   batch_size: 1024
+  # Shared by 0a, 0b and 0c (see config/step0/cppo_oracle.yaml)
+  reward_scale: 0.1
+  gamma: 0.99
 wandb:
   # Next to 0c (and A-F) in the cppo project
   project: cppo
-  run_name: S0b_observed_bs1024_s${training.seed}
-  group: S0b_observed_bs1024
+  # Name and group carry the discount and reward scale, e.g. S0b_observed_bs1024_gamma0.99_rs0.01_s0. The discount screens
+  # before this naming: S0b_observed_bs1024_s<seed> (0.999), then _gamma0995_, _gamma09_ and _gamma095_ (0.995, 0.9, 0.95).
+  # Label of a follow-up study, e.g. _confirm1 (run_step0.py --study confirm1); empty for the first screen
+  study: ""
+  run_name: S0b_observed_bs1024_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S0b_observed_bs1024_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
   tags: [ppo, step0]

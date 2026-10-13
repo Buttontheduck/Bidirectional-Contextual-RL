@@ -13,12 +13,22 @@ env:
 training:
   total_timesteps: 2000000
 cppo:
+  # Shared by 0a, 0b and 0c: the critic fits rewards x 0.1, so the -300 crash penalty no longer blows up the value
+  # loss (returns and evaluation stay in environment units). Discount 0.99, chosen from screens of 0.9-0.999: it
+  # balances return and failed flights (0.9 and 0.95 scored more but crashed more; 0.995 and 0.999 did worse).
+  # Reward scale 0.1, chosen over 1, 0.01, 0.005 and 0.001 and confirmed against 0.01 on 8 seeds.
+  reward_scale: 0.1
+  gamma: 0.99
   context_source: oracle
   # No episode buffer and no supervised encoder steps. The routed PPO losses reach no parameter either:
   # the oracle encoder has none.
   encoder_objective: rl
 wandb:
-  # The inherited "cppo_" prefix gives the actual name/group cppo_S0c_oracle_s0 / cppo_S0c_oracle.
-  run_name: S0c_oracle_s${training.seed}
-  group: S0c_oracle
+  # Name and group carry the discount and reward scale; with the inherited "cppo_" prefix e.g.
+  # cppo_S0c_oracle_gamma0.99_rs0.01_s0 / cppo_S0c_oracle_gamma0.99_rs0.01. The discount screens before this naming:
+  # cppo_S0c_oracle_s<seed> (0.999), then _gamma0995_, _gamma09_ and _gamma095_ (0.995, 0.9, 0.95).
+  # Label of a follow-up study, e.g. _confirm1 (run_step0.py --study confirm1); empty for the first screen
+  study: ""
+  run_name: S0c_oracle_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S0c_oracle_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
   tags: [cppo, step0, oracle]

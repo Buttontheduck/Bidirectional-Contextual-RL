@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
+from gymnasium.wrappers import TransformReward
 import hydra
 import torch
 import torch.nn as nn
@@ -133,10 +134,13 @@ def env_kwargs_from(cfg: DictConfig) -> dict[str, Any]:
 
 def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | None = None):
     """n_envs copies of BatteryPlaneEnv, each with its own random stream; env_wrapper (if any) wraps each copy
-    inside its Monitor (Contextual_PPO's velocity head adds the true speed to the infos this way)."""
+    inside its Monitor (Contextual_PPO's velocity head adds the true speed to the infos this way). With
+    ppo.reward_scale != 1, PPO gets the rewards x reward_scale (TransformReward, outside the Monitor, whose
+    episode returns stay in env units), exactly as in Contextual_PPO."""
     kwargs = env_kwargs_from(cfg)
     observation_mode = cfg.env.observation_mode
     base_seed = int(cfg.training.seed)
+    reward_scale = float(cfg.ppo.get("reward_scale", 1.0))
 
     def factory(index: int):
         def _init() -> gym.Env:
@@ -144,6 +148,8 @@ def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | 
             if env_wrapper is not None:
                 env = env_wrapper(env)
             env = Monitor(env)
+            if reward_scale != 1.0:
+                env = TransformReward(env, lambda reward: reward_scale * reward)
             # Only until learning starts: SB3 then re-seeds the VecEnv (env.seed(training.seed)), so copy i
             # starts training from reset seed training.seed + i. validate_ppo keeps both from the evaluation seeds.
             seed = base_seed * 100 + index
@@ -234,6 +240,9 @@ def validate_ppo(cfg: DictConfig) -> None:
         value = OmegaConf.select(cfg, key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{key} must be a positive integer, got {value!r}")
+    scale = cfg.ppo.get("reward_scale", 1.0)
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("ppo.reward_scale must be a finite number > 0")
     # Env copy i is first reset with seed * 100 + i (make_train_env), then SB3 re-seeds it with seed + i when
     # learning starts; that stream drives training. Neither may reach an evaluation seed.
     seed = int(cfg.training.seed)
@@ -298,6 +307,7 @@ def main(cfg: DictConfig) -> None:
         f"  {n_envs} train envs x {cfg.ppo.n_steps} steps = {n_envs * int(cfg.ppo.n_steps)} transitions per update"
         f" | {int(cfg.training.total_timesteps) // (n_envs * int(cfg.ppo.n_steps))} updates"
         f" | eval episodes: {len(eval_reset_schedule)}"
+        f" | gamma={cfg.ppo.gamma} reward_scale={cfg.ppo.get('reward_scale', 1.0)}"
     )
     run.config.update({"effective_env": core._kw, "algorithm": "PPO", "torch_threads": torch.get_num_threads(),
                        "torch_interop_threads": torch.get_num_interop_threads()}, allow_val_change=True)
