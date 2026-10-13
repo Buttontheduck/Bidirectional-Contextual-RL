@@ -459,6 +459,41 @@ class Step1Checks(unittest.TestCase):
         self.assertFalse(any(item.startswith("env.battery_noise_flight=") for item in sharp))
         self.assertEqual(plain_ppo_config(*[i for i in linear[2:] if not i.startswith("hydra.")]).env.battery_noise_flight, "linear")
 
+    def test_encoder_error_reads_the_pilots_flight_without_the_battery(self):
+        import battery_plane as bp
+        import step1_encoder_error as measure
+
+        def model(cfg):
+            return training.build_model(cfg, training.make_train_env(cfg))
+
+        a = model(config(*SMALL, step0=False)).policy
+        pilot = model(config(*SMALL)).policy
+        env_kwargs, reset = {"T": 30}, {"seed": 1000, "options": {"b0": 0.3, "vx_obs_noise": 5.0}}
+        for flyer in (None, pilot):
+            flight = measure.fly(a, flyer, env_kwargs, reset)
+            # The same flight, flown by the policy alone through predict(), as in a validation
+            flies = flyer or a
+            env = bp.BatteryPlaneEnv(observation_mode="observed" if flyer else "hidden", **env_kwargs)
+            obs, info = env.reset(seed=1000, options=dict(reset["options"]))
+            state, observations, actions, batteries, total = None, [], [], [info["b0"]], 0.0
+            while True:
+                action, state = flies.predict(obs[None], state, np.array([state is None]), deterministic=True)
+                observations.append(obs[:4] if flyer else obs)
+                actions.append(action[0])
+                obs, reward, done, _, info = env.step(action[0])
+                total += reward
+                if done:
+                    break
+                batteries.append(info["b"])
+            self.assertEqual((flight["length"], flight["batteries"]), (len(actions), batteries))
+            self.assertAlmostEqual(flight["return"], total, places=6)
+            # The encoder read the hidden observations and the executed actions of that flight, the pilot's included
+            previous = np.concatenate([np.zeros((1, 2), np.float32), np.array(actions[:-1])])
+            with torch.no_grad():
+                contexts, _ = a.encoder.unroll(a.encoder.initial_state(1), torch.as_tensor(np.array(observations)[None]),
+                                               torch.as_tensor(previous[None]))
+            np.testing.assert_allclose(flight["estimates"], contexts[0, :, 0].numpy(), atol=1e-5)
+
     def test_launcher_runs_the_noise_screen(self):
         import run_step0
 

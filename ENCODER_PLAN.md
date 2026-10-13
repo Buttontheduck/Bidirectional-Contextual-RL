@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done (2026-10-13, results below); the rest of steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13, results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -300,7 +300,82 @@ nohup python run_step0.py --conditions 1a_sharp 1b_sharp 1c_sharp 1a_linear 1b_l
 - **Noise that stays full until mid-flight (sharp) costs a lot,** even at 0.06 (174–257). Flights starting at 30% fail almost always (25–27 of 27, against 1 of 27 with the true battery), and many at 40%: the battery runs out, mostly before step 350 (median 265–320 steps). With the true battery a policy starting low flies gently to save energy (throttle 0.08 at 20% charge against 0.67 at 70%). With sharp noise it can't tell 30% from 50% from one noisy reading, so it flies normally (throttle 0.70–0.96 at 20%), and the exact reading comes too late.
 - **So what matters is how early in each flight the estimate becomes good.** A plane starting low must decide to save energy in about the first 250 steps. An estimate that starts poor and improves steadily, as a recurrent encoder's should, is fine; one that stays poor until mid-flight is not.
 - Caveats: the noise is fresh at every step and these policies have no memory, so they can't average readings, unlike a real encoder whose error changes smoothly. Linear 0.06 scoring above the true battery (0b: 351) matches early noise, possibly extra exploration, but three seeds can't tell.
-- Next: measure how the A rerun's encoder error changes over a flight, step by step: is it like sharp or linear, and how large is it around step 250?
+- Next: measure how the A rerun's encoder error changes over a flight, step by step: is it like sharp or linear, and how large is it around step 250? (Done, below.)
+
+**The A rerun's encoder error over a flight (2026-10-13).** The in-flight noise runs say an estimate is good enough if it improves steadily during each flight. This checks whether the real encoder does. `step1_encoder_error.py` loads the three A rerun models (seeds 0–2) and records, at every step of the 18 validation flights (seeds 1000–1002, never the final test), the encoder's estimate z_t next to the true battery b_t. It does this for the 500k, 1M and 1.5M checkpoints and the final model, with two kinds of flights:
+
+- **Own flights:** the A policy flies, exactly as in its validation. These are the kind of flights its encoder was trained on.
+- **Pilot flights:** a good policy flies the plane and the A encoder only watches. The pilot is the step 0 CPPO policy with the true battery (0c, same training seed, completes 87% of these flights). The encoder reads the hidden observation and the pilot's actions, never the battery. These are the flights a policy that uses the battery would fly.
+- **Cross pairs:** every final A encoder also watches every other seed's pilot, to tell whether a large error comes from the encoder or from the pilot's flights.
+
+Safety checks: every flight runs a hidden-mode and an observed-mode copy of the env side by side with the same seed and actions. The encoder and the A policy read only the hidden one, only the pilot reads the observed one, and the script checks at every step that the hidden observation is the observed one without the battery. The final models' flights match the returns and lengths of the runs' own final validation exactly. `checks.step1_checks` tests that the encoder reads the pilot's actions on the pilot's exact flight.
+
+```bash
+# A rerun seeds 0-2 and the 0c runs of the same seeds (rs 0.1, discount 0.99); about 30 seconds, results in runs_step0/encoder_error.json
+python step1_encoder_error.py --a-runs runs_cppo/d36o544n runs_cppo/rxguqn34 runs_cppo/ho5et2ek \
+    --pilot-runs runs_cppo/n8ubl3ha runs_cppo/g9awmtpl runs_cppo/wvxnps47 --output runs_step0/encoder_error.json
+```
+
+Typical size of the error (root mean square of estimate − true battery over the flights still flying), final models, 3 seeds × 18 flights, next to the two in-flight noise profiles at 0.12:
+
+| Flight step | 0 | 50 | 100 | 175 | 250 | 350 | 500 | 650 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Own flights** (A flies) | 0.17 | 0.12 | 0.05 | 0.03 | **0.02** | 0.04 | 0.02 | 0.04 |
+| Own flights still flying (of 54) | 54 | 54 | 54 | 48 | 39 | 30 | 18 | 10 |
+| **Pilot flights** (0c flies, A's encoder watches) | 0.17 | 0.16 | 0.13 | 0.14 | **0.16** | 0.15 | 0.14 | 0.14 |
+| Pilot flights still flying (of 54) | 54 | 54 | 54 | 54 | 54 | 52 | 50 | 47 |
+| Linear 0.12 (trained fine: 268–300) | 0.12 | 0.10 | 0.09 | 0.06 | 0.03 | 0 | 0 | 0 |
+| Sharp 0.12 (hurt: 53–224) | 0.12 | 0.12 | 0.12 | 0.12 | 0.12 | 0 | 0 | 0 |
+| Noise all flight 0.12 (failed: 51–64) | 0.12 | 0.12 | 0.12 | 0.12 | 0.12 | 0.12 | 0.12 | 0.12 |
+
+Estimate / true battery, by starting battery (final models, mean over 3 seeds; "–" = no flight still flying):
+
+| Start | Own: step 50 | Own: step 100 | Own: step 250 | Pilot: step 50 | Pilot: step 100 | Pilot: step 250 | Pilot: step 500 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 20% | 0.26 / 0.11 | 0.12 / 0.06 | – | 0.34 / 0.15 | 0.28 / 0.12 | 0.22 / 0.09 | 0.04 / 0.07 |
+| 30% | 0.29 / 0.21 | 0.16 / 0.15 | 0.06 / 0.06 | 0.36 / 0.23 | 0.27 / 0.20 | 0.09 / 0.17 | 0.04 / 0.14 |
+| 40% | 0.32 / 0.31 | 0.24 / 0.24 | 0.09 / 0.08 | 0.34 / 0.31 | 0.31 / 0.26 | 0.11 / 0.21 | 0.04 / 0.18 |
+| 50% | 0.36 / 0.40 | 0.33 / 0.34 | 0.16 / 0.16 | 0.36 / 0.40 | 0.28 / 0.34 | 0.13 / 0.24 | 0.05 / 0.19 |
+| 60% | 0.40 / 0.50 | 0.41 / 0.43 | 0.23 / 0.24 | 0.40 / 0.50 | 0.38 / 0.42 | 0.16 / 0.29 | 0.06 / 0.20 |
+| 70% | 0.44 / 0.60 | 0.47 / 0.52 | 0.30 / 0.32 | 0.43 / 0.59 | 0.46 / 0.51 | 0.22 / 0.35 | 0.08 / 0.22 |
+
+At take-off (step 0) the estimate is 0.44 for every flight in both cases.
+
+Error during training (RMS at steps 50 / 100 / 250 / 500):
+
+| Model | Own flights | Own flights completed | Pilot flights |
+|---|---|---:|---|
+| 500k | 0.15 / 0.09 / 0.04 / 0.04 | 6% | 0.22 / 0.23 / 0.14 / 0.14 |
+| 1M | 0.15 / 0.12 / 0.18 / 0.14 | 9% | 0.19 / 0.20 / 0.13 / 0.12 |
+| 1.5M | 0.13 / 0.07 / 0.11 / 0.08 | 4% | 0.16 / 0.14 / 0.14 / 0.12 |
+| Final (2M) | 0.12 / 0.05 / 0.02 / 0.02 | 17% | 0.16 / 0.13 / 0.16 / 0.14 |
+
+Cross pairs, final encoders (RMS at step 100 / step 250); the diagonal is the same-seed pairing above:
+
+| | Pilot 0c s0 (18/18 completed) | Pilot 0c s1 (15/18) | Pilot 0c s2 (14/18) |
+|---|---:|---:|---:|
+| Encoder A s0 (late score 106) | 0.08 / 0.04 | 0.16 / 0.06 | 0.10 / 0.09 |
+| Encoder A s1 (late score −3) | 0.07 / 0.16 | 0.19 / 0.18 | 0.10 / 0.23 |
+| Encoder A s2 (late score −37) | 0.08 / 0.11 | 0.19 / 0.12 | 0.07 / 0.21 |
+
+What it shows:
+
+- **At take-off the encoder can't know, so it guesses the average.** It says 0.44 for every flight, an error of 0.17, exactly what not knowing the starting battery costs. No estimator can do better at step 0.
+- **On its own flights, the error shrinks like the linear profile, only faster.** It is 0.05 by step 100 and 0.02–0.04 from step 175 on: below linear 0.12 from step 100 to 250, though it never becomes exact as linear does at step 350. The error is smooth, a steady offset rather than step-to-step jitter: the error 25 steps later is strongly correlated with the current one (0.87; 0.96 on pilot flights). The noisy oracle redraws its noise every step.
+- **A still fails, because it flies hard from take-off, like a blind policy.** Its flights end with an empty battery at times set by the starting charge: on average 140–213 steps at 20%, 216–337 at 30%, 612–700 at 70%. Only 17% complete. By step 100, when the estimate becomes right, a plane that started at 20% has 6% left. The environment reveals the battery only while the throttle is at its cap, so this encoder learns the battery by spending it.
+- **On a good pilot's flights the encoder is about as wrong as not knowing, for the whole flight.** The error stays at 0.13–0.17 from start to end and never becomes exact. From mid-flight on it thinks the battery is lower than it is (average offset −0.07 at step 250, −0.12 at step 500). At step 500 it says 4–8% for every flight while the truth is 7–22%. It expects the battery to drain as fast as in A's own hard flights. This resembles noise all flight at 0.12–0.25, where every learner failed, and is worse than sharp, which at least becomes exact at mid-flight.
+- **It doesn't get better with training.** On pilot flights the error is 0.12–0.23 at every checkpoint. On own flights it moves with the policy: it is good at 500k, worse at 1M and 1.5M, and best at the end.
+- **The encoder learned a clock, not the battery.** In A's flights the plane always flies about the same way, so the battery is basically "average guess minus a fixed amount per step". The encoder learned that rule instead of reading the battery from how the plane responds and counting the drain from the actions. When a policy flies differently, for example gently on a low battery, the rule is wrong.
+- **The encoder that saw the widest range of flying generalizes best.** Seed 0's encoder reads every pilot's flights fairly well (0.04–0.09 at step 250), while seeds 1 and 2 are at 0.11–0.23. Seed 0's policy flies more gently and with more variety: its battery drops by 0.10–0.17 over the first 100 steps, against 0.14–0.21 for seeds 1 and 2. The pilots' battery drops by as little as 0.05. Seed 0 also has the best late score (106 against −3 and −37). The pilots' flights matter too: pilot s0's flights are easier to read than s2's. Three seeds only, though.
+- **This is a chicken-and-egg problem.** The policy can only learn to save energy if the estimate is good on gentle flights, and the encoder only becomes good on the flights the current policy already flies.
+
+Caveats:
+
+- Part of the pilot-flight error can't be avoided. A plane flying gently never reaches the throttle cap, so its starting battery doesn't show in what the agent sees. The drift toward too-low estimates is avoidable, though: the drain follows from the actions, which the encoder reads.
+- How much of the error is unavoidable is what enc1's ideal estimator would tell.
+- These are the A rerun's encoders (point estimate, supervised on A's own flights); C–F were not measured.
+
+What this means for the plan: the encoder's problem is less its accuracy on the flights it was trained on than how narrow those flights are. This strongly supports step 3, training the encoder on varied flights (gentle and hard, random throttle, the 0c pilots' flights) so that it reads the battery from the plane's response and counts the drain from the actions instead of learning a clock. Before that, enc1's ideal estimator on the pilots' flights would show the best error possible at each flight step, the target for a pretrained encoder.
 
 ### 2. Run every condition through plain PPO
 
