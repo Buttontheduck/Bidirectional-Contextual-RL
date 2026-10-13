@@ -31,6 +31,9 @@ env:
   # Std of Gaussian noise on the visible battery (observed mode only): step 1's noisy oracle (step1_controls.py).
   # 0 = no noise (A-F and step 0).
   battery_noise: 0.0
+  # Training step from which the battery is exact again (step 1's early-noise runs: noise first, then the true
+  # battery, in training and validation). null = the noise never switches off.
+  battery_noise_until: null
   # null keeps the environment's default crash penalty (300).
   crash_penalty: null
   # Extra BatteryPlaneVec constructor arguments. Empty = environment defaults.

@@ -17,6 +17,7 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12   # step 1: noisy oracle
     python run_step0.py --conditions 1a_switch 1b_switch 1c_switch --battery-noises 0 0.03 0.06 \
         --from-runs runs_step0/<step 0 launch>/runs.json ...      # step 1: late switch from the step 0 models
+    python run_step0.py --conditions 1a_early 1b_early 1c_early --battery-noises 0.03 0.06 0.12   # step 1: early noise
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
@@ -56,11 +57,16 @@ CONDITIONS = {
     "1a_switch": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_late_switch_bs256", "ppo"),
     "1b_switch": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_late_switch_bs1024", "ppo"),
     "1c_switch": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_late_switch", "cppo"),
+    # Step 1, early noise: 0a, 0b and 0c seeing the battery plus noise until step 500k, then the true battery
+    "1a_early": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_early_noise_bs256", "ppo"),
+    "1b_early": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_early_noise_bs1024", "ppo"),
+    "1c_early": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_early_noise", "cppo"),
 }
 STEP0_CONDITIONS = ["0a", "0b", "0c"]
 NOISY_CONDITIONS = ["1a", "1b", "1c"]
 # Late switch -> the step 0 run whose final model it continues (same seed)
 SWITCH_SOURCES = {"1a_switch": "0a", "1b_switch": "0b", "1c_switch": "0c"}
+EARLY_NOISE_CONDITIONS = ["1a_early", "1b_early", "1c_early"]
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -140,6 +146,9 @@ def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bo
         command.append(f"wandb.study=_{study}")
     if smoke:
         command += [*SMOKE_OVERRIDES, f"paths.output_dir={json.dumps(str(output / 'runs'))}"]
+        if condition in EARLY_NOISE_CONDITIONS:
+            # The switch must fall inside the smoke budget: halfway, before the second evaluation
+            command.append("env.battery_noise_until=4096")
     return command
 
 
@@ -246,10 +255,11 @@ def parse_args(argv=None):
     if noises is not None:
         if min(noises) < 0 or len({f"{noise:g}" for noise in noises}) != len(noises):
             parser.error("Battery noises must be distinct and non-negative")
-        if not set(args.conditions) <= set(NOISY_CONDITIONS) | set(SWITCH_SOURCES):
-            parser.error(f"--battery-noises applies to the step 1 conditions {NOISY_CONDITIONS + list(SWITCH_SOURCES)} only")
+        step1 = NOISY_CONDITIONS + list(SWITCH_SOURCES) + EARLY_NOISE_CONDITIONS
+        if not set(args.conditions) <= set(step1):
+            parser.error(f"--battery-noises applies to the step 1 conditions {step1} only")
         if 0 in noises and not set(args.conditions) <= set(SWITCH_SOURCES):
-            parser.error("Battery noise 0 is the late switch's control; a noisy oracle needs noise > 0")
+            parser.error("Battery noise 0 is the late switch's control; the noisy oracle and early noise need noise > 0")
     switching = [condition for condition in args.conditions if condition in SWITCH_SOURCES]
     args.sources = {}
     if switching:

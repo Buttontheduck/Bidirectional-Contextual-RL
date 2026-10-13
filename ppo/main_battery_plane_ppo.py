@@ -56,7 +56,7 @@ from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights,
 )
 # Step 1's noisy oracle: the observed battery plus noise, as in Contextual_PPO
-from step1_controls import NoisyBattery, switch_source_mismatches  # noqa: E402
+from step1_controls import BatteryNoiseSwitch, NoisyBattery, battery_noise_at, switch_source_mismatches  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 
@@ -171,11 +171,12 @@ def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | 
     return DummyVecEnv(factories)
 
 
-def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]]):
-    """One environment that replays the fixed evaluation grid, as in the SAC script."""
+def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]], battery_noise: float | None = None):
+    """One environment that replays the fixed evaluation grid, as in the SAC script. battery_noise: the noise std on the
+    visible battery, env.battery_noise by default (the final validation of an early-noise run passes 0)."""
     raw_env = bp.BatteryPlaneEnv(observation_mode=cfg.env.observation_mode, **env_kwargs_from(cfg))
     # The noisy oracle's noise sits inside the scheduler, which reseeds it with every validation flight's seed
-    battery_noise = float(cfg.env.get("battery_noise", 0.0))
+    battery_noise = float(cfg.env.get("battery_noise", 0.0)) if battery_noise is None else battery_noise
     observed = NoisyBattery(raw_env, battery_noise) if battery_noise > 0 else raw_env
     scheduler = ScheduledEvalResets(observed, reset_schedule)
     env = Monitor(scheduler)
@@ -256,6 +257,13 @@ def validate_ppo(cfg: DictConfig) -> None:
         raise ValueError("env.battery_noise must be a finite number >= 0")
     if noise > 0 and cfg.env.observation_mode != "observed":
         raise ValueError("env.battery_noise adds noise to the visible battery: it needs env.observation_mode=observed")
+    until = cfg.env.get("battery_noise_until")
+    if until is not None:
+        if isinstance(until, bool) or not isinstance(until, int) or not 0 < until < int(cfg.training.total_timesteps):
+            raise ValueError("env.battery_noise_until must be null or a step inside the training budget")
+        if noise <= 0 or str(cfg.training.vec_env).lower() != "dummy":
+            raise ValueError("env.battery_noise_until switches battery noise off: it needs env.battery_noise > 0 and "
+                             "training.vec_env=dummy")
     # Env copy i is first reset with seed * 100 + i (make_train_env), then SB3 re-seeds it with seed + i when
     # learning starts; that stream drives training. Neither may reach an evaluation seed.
     seed = int(cfg.training.seed)
@@ -353,6 +361,7 @@ def main(cfg: DictConfig) -> None:
         f" | {int(cfg.training.total_timesteps) // (n_envs * int(cfg.ppo.n_steps))} updates"
         f" | eval episodes: {len(eval_reset_schedule)}"
         f" | gamma={cfg.ppo.gamma} reward_scale={cfg.ppo.get('reward_scale', 1.0)} battery_noise={cfg.env.get('battery_noise', 0.0)}"
+        f" until={cfg.env.get('battery_noise_until')}"
     )
     run.config.update({"effective_env": core._kw, "algorithm": "PPO", "torch_threads": torch.get_num_threads(),
                        "init_model": None if initial_model_from(cfg) is None else str(initial_model_from(cfg)),
@@ -401,8 +410,11 @@ def main(cfg: DictConfig) -> None:
     save_freq = max(int(cfg.checkpoint.frequency) // n_envs, 1)
     render_target = raw_eval_env if cfg.evaluation.render else None
 
+    # Early-noise runs: the battery noise goes off at env.battery_noise_until, first, before that step's evaluation
+    switch = [] if cfg.env.get("battery_noise_until") is None else [BatteryNoiseSwitch(cfg.env.battery_noise_until, eval_env)]
     callbacks = CallbackList(
         [
+            *switch,
             RenderingEvalCallback(
                 eval_env,
                 best_model_save_path=str(best_model_dir),
@@ -446,7 +458,9 @@ def main(cfg: DictConfig) -> None:
         model.save(final_model_path)
         print(f"Saved final model to {final_model_path}.zip")
         # Final-checkpoint validation on the same grid: final_validation/* and its episode plot, as in Contextual_PPO
-        final_env, final_scheduler, final_raw_env = make_eval_env(cfg, eval_reset_schedule)
+        # The battery the policy sees at its last step: after an early-noise run's switch, the true battery
+        final_env, final_scheduler, final_raw_env = make_eval_env(cfg, eval_reset_schedule,
+                                                                  battery_noise_at(cfg, model.num_timesteps))
         try:
             final_scheduler.rewind()
             _, _, recorder = evaluate_flights(

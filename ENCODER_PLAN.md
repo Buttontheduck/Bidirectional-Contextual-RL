@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise and late-switch tests done (2026-10-13, results below); the rest of steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch and early-noise tests done (2026-10-13, results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -256,6 +256,26 @@ nohup python run_step0.py --conditions 1a_switch 1b_switch 1c_switch --battery-n
 - At noise 0.06, the encoder's error level, the switch does not help: 22–85, 28–48% of flights completed, no better than training with noise from the start.
 - The switched policies keep using the battery (their throttle reacts to it as much as without noise or more, and they do not speed up like blind agents); they fail in low-battery flights.
 - So learning with the true battery first and then switching works for an estimate accurate to about 3%, at least with CPPO, but not at about 6%. Before building pilots and a frozen encoder, find the best possible accuracy for this task (enc1's ideal estimator): if even that is off by more than 3% early in flights, a better encoder alone cannot fix it, and the policy needs help with uncertainty (for example the estimate's variance as an input).
+
+**Early noise (implemented 2026-10-13).** The reverse, closer to a learned encoder that becomes accurate during training: the policy learns from scratch seeing the battery plus noise until step 500k (`env.battery_noise_until`), then the true battery, in training and validation (`step1_controls.BatteryNoiseSwitch`; `train/battery_noise` logs the noise averaged over each rollout). Runs 1a_early, 1b_early and 1c_early (`ppo/configs/experiment/S1a_early_noise_bs256.yaml`, `S1b_early_noise_bs1024.yaml`, `config/step1/cppo_early_noise.yaml`) are 1a, 1b and 1c with that switch: 2M steps, scored on 1.5M–2M like step 0 (0a–0c: no noise ever; 1a–1c: noise throughout); the final validation sees the true battery. W&B names: `…_early_noise…_noise<σ>_until500000_gamma0.99_rs0.1_s<seed>`. It asks whether an encoder has time to become accurate (does a noisy start leave lasting damage?) and whether the policy then learns to use the accurate battery.
+
+```bash
+# 3 noise levels (0.12 is about the A rerun's early encoder error) x 1a, 1b, 1c x seeds 0-2 = 27 runs of 2M steps, about 15 minutes
+nohup python run_step0.py --conditions 1a_early 1b_early 1c_early --battery-noises 0.03 0.06 0.12 --jobs 27 --threads 1 > run_early.log 2>&1 &
+```
+
+**Early noise results (2026-10-13).** Late scores (1.5M–2M), seeds 0–2 (W&B groups `…_early_noise…_noise<σ>_until500000_gamma0.99_rs0.1`).
+
+| | No noise ever (step 0) | 0.03 until 0.5M | 0.06 until 0.5M | 0.12 until 0.5M | Noise throughout (0.03 / 0.06 / 0.12) |
+|---|---:|---:|---:|---:|---:|
+| 0a (plain PPO, batch 256) | 276 | 270 | 289 | 331 | 86 / 73 / 64 |
+| 0b (plain PPO, batch 1024) | 275 | 301 | 286 | 280 | 85 / 71 / 51 |
+| 0c (CPPO) | 282 | 334 | 306 | 282 | 108 / 122 / 53 |
+| Flights completed | 85–89% | 85–94% | 83–89% | 78–91% | 2–31% |
+
+- **No lasting damage.** After 500k noisy steps, even at 0.12 (about the A rerun's early encoder error), every learner ends as good as with the true battery from the start (270–334 against 275–282). Some runs end higher (CPPO at 0.03: 334, seeds 323–347), possibly from extra exploration, but three seeds cannot tell.
+- **Fast recovery.** Right at the switch the policies score 40–137 with the true battery; 250k steps later they are at 202–384, close to step 0 at that point, and they have caught up by 1M. They then use the battery (throttle reacts to it as much as in step 0) and do not fly like blind agents.
+- **The order matters.** Noisy first, then accurate: the policy fully adapts. Accurate first, then noisy (late switch) or noisy throughout: it fails at 0.06. So an encoder may be poor early in training; what matters is how accurate it ends up. Here the switch goes to the exact battery; next, end at 0.03 or 0.06 instead of 0, closer to a real encoder, to find how accurate the late estimate must be.
 
 ### 2. Run every condition through plain PPO
 

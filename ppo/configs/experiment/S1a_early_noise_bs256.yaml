@@ -1,0 +1,13 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, early noise for plain PPO (run 1a_early): the policy sees the battery plus noise until step
+# env.battery_noise_until, then the true battery (step1_controls.BatteryNoiseSwitch). Everything else is 1a
+# (S1a_noisy_bs256): 2M steps from scratch, scored like step 0.
+defaults:
+  - /experiment/S1a_noisy_bs256
+  - _self_
+env:
+  battery_noise_until: 500000
+wandb:
+  run_name: S1a_early_noise_bs256_noise${env.battery_noise}_until${env.battery_noise_until}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1a_early_noise_bs256_noise${env.battery_noise}_until${env.battery_noise_until}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, step1, early_noise]

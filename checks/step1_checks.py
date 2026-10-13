@@ -306,6 +306,80 @@ class Step1Checks(unittest.TestCase):
                 with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                     run_step0.parse_args(argv)
 
+    def test_early_noise_configs_switch_to_the_true_battery_at_500k(self):
+        import report_step0
+        from step1_controls import battery_noise_at
+
+        script = plain_ppo_script()
+        cases = [("1c_early", config("+step1=cppo_early_noise", step0=False), noisy_cppo(), "cppo", training.validate_config,
+                  "S1c_early_noise0.06_until500000"),
+                 ("1a_early", plain_ppo_config("+experiment=S1a_early_noise_bs256"), plain_ppo_config("+experiment=S1a_noisy_bs256"),
+                  "ppo", script.validate_ppo, "S1a_early_noise_bs256_noise0.06_until500000")]
+        for condition, cfg, noisy, learner, validate, name in cases:
+            with self.subTest(condition=condition):
+                validate(cfg)
+                # The noisy oracle from scratch, with the noise switched off at 500k
+                for section in (learner, "training", "evaluation"):
+                    self.assertEqual(cfg[section], noisy[section])
+                env, noisy_env = OmegaConf.to_container(cfg.env), OmegaConf.to_container(noisy.env)
+                self.assertEqual((env.pop("battery_noise_until"), noisy_env.pop("battery_noise_until")), (500_000, None))
+                self.assertEqual(env, noisy_env)
+                self.assertEqual(cfg.wandb.run_name, f"{name}_gamma0.99_rs0.1_s0")
+                self.assertEqual([battery_noise_at(cfg, step) for step in (0, 499_999, 500_000, 2_000_000)], [0.06, 0.06, 0.0, 0.0])
+                protocol = report_step0.evaluation_protocol(cfg, condition)
+                noisy_protocol = report_step0.evaluation_protocol(noisy, condition.replace("_early", ""))
+                self.assertEqual({key for key in protocol if protocol[key] != noisy_protocol[key]}, {"battery_noise_until"})
+                self.assertEqual(protocol["schedule"], "step0")
+        with self.assertRaisesRegex(ValueError, "requires env.battery_noise_until"):
+            report_step0.evaluation_protocol(noisy_cppo(), "1c_early")
+        with self.assertRaisesRegex(ValueError, "must not switch the battery noise off"):
+            report_step0.evaluation_protocol(noisy_cppo("env.battery_noise_until=500000"), "1c")
+
+    def test_noise_switch_turns_the_noise_off_in_training_and_validation(self):
+        from stable_baselines3 import PPO
+        from step1_controls import BatteryNoiseSwitch, noisy_batteries
+
+        script = plain_ppo_script()
+        cases = [("cppo", training, config("+step1=cppo_early_noise", *SMALL, step0=False)),
+                 ("ppo", script, plain_ppo_config("+experiment=S1a_early_noise_bs256", *PLAIN_SMALL))]
+        for learner, module, cfg in cases:
+            with self.subTest(learner=learner):
+                env = module.make_train_env(cfg)
+                eval_env, _, _ = module.make_eval_env(cfg, list(training.iter_eval_resets(cfg.evaluation.reset_grid)))
+                try:
+                    if learner == "cppo":
+                        model = training.build_model(cfg, env)
+                    else:
+                        model = PPO("MlpPolicy", env, n_steps=8, batch_size=8, n_epochs=1, seed=0, device="cpu")
+                    self.assertEqual([w.sigma for w in noisy_batteries(env) + noisy_batteries(eval_env)], [0.06] * 3)
+                    # Two rollouts of 2 envs x 8 steps; the switch falls inside the first
+                    model.learn(total_timesteps=32, callback=[BatteryNoiseSwitch(8, eval_env)])
+                    self.assertEqual([w.sigma for w in noisy_batteries(env) + noisy_batteries(eval_env)], [0.0] * 3)
+                    if learner == "cppo":
+                        # The second rollout, all after the switch: the policy saw exactly the true battery
+                        buffer = model.rollout_buffer
+                        np.testing.assert_array_equal(buffer.observations[..., -1], buffer.contexts[..., 0])
+                finally:
+                    env.close()
+                    eval_env.close()
+
+    def test_final_validation_sees_the_battery_of_the_last_step(self):
+        from unittest.mock import patch
+
+        class FixedPolicy:
+            def __init__(self, steps):
+                self.num_timesteps = steps
+
+            def predict(self, obs, **kwargs):
+                return np.tile([0.5, 0.0], (len(obs), 1)), None
+
+        cfg = config("+step1=cppo_early_noise", *SMALL, "evaluation.reset_grid.eval_seeds=[1000]",
+                     "evaluation.reset_grid.eval_initial_battery=[0.5]", step0=False)
+        for steps, noise in ((100_000, 0.06), (2_002_944, 0.0)):
+            with self.subTest(steps=steps), patch.object(training, "make_eval_env", wraps=training.make_eval_env) as made:
+                training.evaluate_schedule(FixedPolicy(steps), cfg, cfg.evaluation.reset_grid)
+                self.assertEqual(made.call_args.args[2], noise)
+
     def test_launcher_runs_the_noise_screen(self):
         import run_step0
 
@@ -319,6 +393,11 @@ class Step1Checks(unittest.TestCase):
         self.assertEqual(run_step0.launch_name("1b", 0, battery_noise=0.03), "1b_noise0.03_s0")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             run_step0.parse_args(["--conditions", "0c", "--battery-noises", "0.06"])
+        early = run_step0.parse_args(["--conditions", "1a_early", "1b_early", "1c_early", "--battery-noises", "0.03", "0.12",
+                                      "--output", "/tmp/step1_launch"])
+        self.assertEqual(early.battery_noises, [0.03, 0.12])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            run_step0.parse_args(["--conditions", "1c_early", "--battery-noises", "0", "0.06"])
         # One report command per setting, whichever of reward scale and battery noise the launch set
         def done(condition, seed, scale, noise):
             return {"condition": condition, "seed": seed, "reward_scale": scale, "battery_noise": noise, "run_dir": f"/r/{condition}{seed}"}

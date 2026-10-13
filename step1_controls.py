@@ -1,7 +1,8 @@
 """Step 1 of ENCODER_PLAN.md: controls that change only the battery value the policy sees.
 
 NoisyBattery is the noisy oracle (experiment 1 of step 1 flies step 0 policies with it, experiment 2 continues
-training them with it: switch_source_mismatches checks such a continuation).
+training them with it: switch_source_mismatches checks such a continuation). BatteryNoiseSwitch turns the noise off
+during training (early-noise runs: noise first, then the true battery, like an encoder that becomes accurate).
 
 NoisyBattery: in observed mode the observation ends with the true charge b_t; the wrapper replaces it
 with b_t + noise, Gaussian noise of standard deviation `sigma` drawn fresh at every step (reset and step observations,
@@ -19,6 +20,7 @@ Project glue, like the training scripts; both import it from the repository root
 
 import gymnasium as gym
 import numpy as np
+from stable_baselines3.common.callbacks import BaseCallback
 
 # Column of the true charge b_t in observed-mode observations (as in step0_oracle.BATTERY_COLUMN)
 BATTERY_COLUMN = -1
@@ -32,7 +34,8 @@ class NoisyBattery(gym.ObservationWrapper):
 
     :param env: A BatteryPlaneEnv in observed mode (the wrapper must see the seeded resets, so it goes inside any
         reset scheduler)
-    :param sigma: Standard deviation of the noise, in units of a full battery (> 0)
+    :param sigma: Standard deviation of the noise, in units of a full battery (> 0; BatteryNoiseSwitch may set it to 0
+        later, which gives the exact battery)
     """
 
     def __init__(self, env: gym.Env, sigma: float) -> None:
@@ -90,3 +93,68 @@ def switch_source_mismatches(cfg, source_cfg, learner: str) -> list[str]:
         if plain(cfg.evaluation)[key] != plain(source_cfg.evaluation)[key]:
             differences.append(f"evaluation.{key}")
     return differences
+
+
+def battery_noise_at(cfg, step: int) -> float:
+    """
+    Noise std on the visible battery at a training step: env.battery_noise, switched off from step
+    env.battery_noise_until on when that is set (step 1's early-noise runs: noise first, then the true battery).
+    """
+    until = cfg.env.get("battery_noise_until")
+    if until is not None and step >= until:
+        return 0.0
+    return float(cfg.env.get("battery_noise", 0.0))
+
+
+def noisy_batteries(vec_env) -> list[NoisyBattery]:
+    """The NoisyBattery wrappers inside the environments of a DummyVecEnv (one per environment that has one)."""
+    found = []
+    for env in getattr(vec_env, "envs", ()):
+        while isinstance(env, gym.Wrapper):
+            if isinstance(env, NoisyBattery):
+                found.append(env)
+                break
+            env = env.env
+    return found
+
+
+class BatteryNoiseSwitch(BaseCallback):
+    """
+    Step 1's early-noise runs: the policy sees the battery plus noise until `switch_step` (training steps), then the
+    true battery, in every training environment and in the validation environment. The switch happens at the first
+    step at or after `switch_step`, before any evaluation of that step (the callback goes first in the list). Logs
+    train/battery_noise with every rollout: the noise std averaged over the rollout's steps (a rollout that switches
+    partway shows a value between the two).
+
+    :param switch_step: Training step from which the battery is exact
+    :param eval_env: The validation VecEnv (a DummyVecEnv with a NoisyBattery)
+    """
+
+    def __init__(self, switch_step: int, eval_env) -> None:
+        super().__init__()
+        self.switch_step = int(switch_step)
+        self.eval_env = eval_env
+        self.switched = False
+        self.wrappers: list[NoisyBattery] = []
+        self._noise_sum, self._steps = 0.0, 0
+
+    def _on_training_start(self) -> None:
+        self.wrappers = noisy_batteries(self.training_env) + noisy_batteries(self.eval_env)
+        if len(self.wrappers) != self.training_env.num_envs + 1:
+            raise RuntimeError("BatteryNoiseSwitch needs a NoisyBattery in every training environment and the validation "
+                               "environment, inside DummyVecEnvs")
+
+    def _on_step(self) -> bool:
+        # The noise of the observations this step returned, before a switch at this step
+        self._noise_sum += self.wrappers[0].sigma
+        self._steps += 1
+        if not self.switched and self.num_timesteps >= self.switch_step:
+            for wrapper in self.wrappers:
+                wrapper.sigma = 0.0
+            self.switched = True
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if self._steps:
+            self.logger.record("train/battery_noise", self._noise_sum / self._steps)
+        self._noise_sum, self._steps = 0.0, 0

@@ -1,0 +1,18 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, early noise for CPPO (run 1c_early): like an encoder that becomes accurate during training.
+# The policy sees the battery plus noise (env.battery_noise) until step env.battery_noise_until, then the true battery,
+# in training and validation (step1_controls.BatteryNoiseSwitch). Everything else is 1c: 2M steps from scratch, scored
+# on 1.5M-2M like step 0 (0c: no noise ever; 1c: noise throughout).
+#
+#   python run_step0.py --conditions 1a_early 1b_early 1c_early --battery-noises 0.03 0.06 0.12 --jobs 27 --threads 1
+defaults:
+  - /step1/cppo_noisy_oracle
+  - _self_
+experiment_id: S1c_early
+env:
+  battery_noise_until: 500000
+wandb:
+  # With the inherited "cppo_" prefix: cppo_S1c_early_noise0.06_until500000_gamma0.99_rs0.1_s0
+  run_name: S1c_early_noise${env.battery_noise}_until${env.battery_noise_until}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1c_early_noise${env.battery_noise}_until${env.battery_noise_until}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, step1, early_noise]
