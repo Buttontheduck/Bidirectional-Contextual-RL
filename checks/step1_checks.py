@@ -145,6 +145,41 @@ class Step1Checks(unittest.TestCase):
         finally:
             env.close()
 
+    def test_fly_with_noise_evaluates_finished_policies_without_training(self):
+        import json
+        from pathlib import Path
+        import tempfile
+
+        import report_step0
+        import step1_fly_with_noise as fly
+        from checks.step0_reporting_checks import report_config
+
+        cfg = report_config("0c")
+        env = training.make_train_env(cfg)
+        try:
+            model = training.build_model(cfg, env)
+            # Synthetic completion metadata, for testing artifact loading only
+            model.num_timesteps = report_step0.FINAL_TIMESTEPS
+            with tempfile.TemporaryDirectory() as folder:
+                folder = Path(folder)
+                model.save(folder / "final_model")
+                OmegaConf.save(cfg, folder / "config.yaml", resolve=True)
+                (folder / "runs.json").write_text(json.dumps([{"condition": "0c", "status": "done", "run_dir": str(folder)}]))
+                self.assertEqual(fly.selected_runs([folder / "runs.json"], 0.1), [("0c", str(folder))])
+                self.assertEqual(fly.selected_runs([folder / "runs.json"], 0.01), [])
+                result = fly.fly_run("0c", str(folder), [0.0, 0.06])
+                plain = training.evaluate_schedule(training.ContextualPPO.load(folder / "final_model.zip", device="cpu"), cfg,
+                                                   cfg.evaluation.reset_grid)
+                saved = training.ContextualPPO.load(folder / "final_model.zip", device="cpu")
+            self.assertEqual(set(result["flights"]), {"0", "0.06"})
+            self.assertEqual((result["condition"], result["seed"], result["reward_scale"]), ("0c", 0, 0.1))
+            # Noise 0 is the ordinary validation; nothing was trained
+            self.assertEqual(result["flights"]["0"]["mean_reward"], plain["mean_reward"])
+            for name, param in model.policy.state_dict().items():
+                torch.testing.assert_close(param, saved.policy.state_dict()[name])
+        finally:
+            env.close()
+
     def test_launcher_runs_the_noise_screen(self):
         import run_step0
 

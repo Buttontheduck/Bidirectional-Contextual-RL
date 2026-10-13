@@ -30,6 +30,7 @@ nohup python run_step0.py > run_step0.log 2>&1 &     # logs and runs.json in run
 python run_step0.py --smoke                          # tiny budget, W&B disabled, runs under runs_step0/<time>-smoke/
 nohup python run_step0.py --conditions A --threads 4 > run_A.log 2>&1 &   # experiment A rerun (config/rerun/), ~4.5 h
 nohup python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12 --jobs 27 --threads 1 > run_step1.log 2>&1 &   # step 1 noisy oracle, ~15 min
+python step1_fly_with_noise.py --runs runs_step0/<launch>/runs.json --reward-scale 0.1 --output runs_step0/fly_with_noise.json  # step 0 policies flown with noise
 python -m unittest checks.step1_checks -v
 python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0       # one 0c run: CPPO, true battery
 python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0   # one 0a run (S0b_observed_bs1024: 0b)

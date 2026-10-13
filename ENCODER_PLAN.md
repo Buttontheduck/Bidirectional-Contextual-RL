@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle done (2026-10-13, results below); the rest of steps 1–5 planned.
+**Status:** step 0, step 1's noisy oracle and the fly-with-noise test done (2026-10-13, results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -219,6 +219,19 @@ nohup python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12 
 - **Even σ = 0.03 breaks it.** Scores fall by about two thirds, close to agents that cannot see the battery (16–36). The planes fly fast (32–57% of the time in the reward band), run out of battery in 69–98% of flights, never finish a flight that starts at 20% or 30% battery, and react much less to the battery. Plain PPO and CPPO fail alike.
 - **The noise hurts the learning more than the flying.** CPPO policies trained with the true battery and flown with σ = 0.03 still scored 181 on average (248 without noise) and completed 67–83% of flights. Policies trained with σ = 0.03 and flown with the true battery stayed bad (149, 17–33% completed). With a noisy battery during training, PPO does not learn to use it and settles on flying fast.
 - **For the encoder:** its typical error (about 0.066) is twice the noise that already breaks learning, and the real encoder (A rerun, 22) did worse than random noise of the same size (71–122). An estimate must be better than about 0.03 before a policy can learn from it, at least with noise that changes every step; a real encoder's error changes smoothly. Worth testing next: learn with an accurate battery first and switch to the estimate afterwards (or start from an accurate frozen encoder), and give the policy the estimate's uncertainty or memory.
+
+**Fly with noise, no more learning (2026-10-13).** The finished step 0 policies (trained with the true battery, reward scale 0.1, seeds 0–7) fly the validation flights seeing the battery plus noise; nothing is trained (`python step1_fly_with_noise.py --runs runs_step0/<launch>/runs.json ... --output runs_step0/fly_with_noise_rs0.1.json`, about 20 s). Final checkpoints:
+
+| Noise when flying | 0a | 0b | 0c | Completed | Trained with this noise (1a/1b/1c) |
+|---|---:|---:|---:|---:|---:|
+| None | 251 | 236 | 250 | 86–88% | |
+| 0.03 | 107 | 153 | 163 | 60–72% | 64–131, 7–31% completed |
+| 0.06 | −28 | 9 | 23 | 32–41% | 48–124, 2–22% completed |
+| 0.12 | −136 | −113 | −93 | 12–19% | 43–73, 6–17% completed |
+
+- At 0.03 a trained policy keeps about half to two thirds of its score and completes far more flights than one trained with that noise. At 0.06, the encoder's typical error, its score falls to about zero.
+- The policies keep trusting the reading (their throttle reacts to it as strongly as without noise), so a wrong reading leads to wrong actions. The losses are in flights that start with 20–40% battery; at 60–70% a few percent of error barely matters.
+- So plugging an estimate into a policy trained with the true battery keeps at most part of the score at 3% error and almost nothing at 6%. Next: does continued training after the switch let the policy adapt (late switch), instead of falling back to fast blind flying (about 70–120)?
 
 ### 2. Run every condition through plain PPO
 
