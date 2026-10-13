@@ -59,7 +59,7 @@ from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights, terminal_outcome,
 )
 from step0_oracle import TrueBatteryPolicy  # noqa: E402
-from step1_controls import NoisyBattery  # noqa: E402
+from step1_controls import NoisyBattery, switch_source_mismatches  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 # cppo.context_source: the xLSTM encoder, or the true battery of step 0 (step0_oracle.py)
@@ -79,6 +79,21 @@ def reward_scale_from(cfg: DictConfig) -> float:
 def battery_noise_from(cfg: DictConfig) -> float:
     """Std of the noise on the observed battery (step 1's noisy oracle); older saved configs have none."""
     return float(cfg.env.get("battery_noise", 0.0))
+
+
+def initial_model_from(cfg: DictConfig) -> Path | None:
+    """
+    The saved model a run continues instead of starting from scratch (training.init_model, step 1's late switch), None
+    for a fresh run. Older saved configs have no such key.
+    """
+    value = cfg.training.get("init_model")
+    # Late-switch configs say REQUIRED until the launcher names the model (Hydra keeps a default under ???)
+    if OmegaConf.is_missing(cfg.training, "init_model") or value == "REQUIRED":
+        raise ValueError("training.init_model must name the saved final_model.zip this run continues")
+    if value is None:
+        return None
+    path = Path(str(value))
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 class ScheduledEvalResets(gym.Wrapper):
@@ -352,6 +367,7 @@ def validate_config(cfg: DictConfig) -> None:
     if cppo.encoder_objective not in ContextualPPO.ENCODER_OBJECTIVES:
         raise ValueError(f"cppo.encoder_objective must be one of {ContextualPPO.ENCODER_OBJECTIVES}")
     context_source = context_source_from(cfg)
+    initial_model_from(cfg)   # a late switch must name the model it continues
     if context_source not in CONTEXT_SOURCES:
         raise ValueError(f"cppo.context_source must be one of {CONTEXT_SOURCES}")
     if context_source == "oracle":
@@ -456,6 +472,26 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
     )
 
 
+def load_initial_model(cfg: DictConfig, env: VecEnv, path: Path, tensorboard_log: str | None = None) -> ContextualPPO:
+    """
+    Step 1's late switch: the saved model of a finished run (its weights and optimizer state), continued on this run's
+    environments, e.g. with noise on the battery. The saved run (its config.yaml next to the model) must have used this
+    run's settings, apart from the battery noise, step budget, threads and naming; steps and evaluations then count
+    from the switch.
+    """
+    source = path.parent / "config.yaml"
+    if not path.is_file() or not source.is_file():
+        raise FileNotFoundError(f"training.init_model needs a saved model and its run's config.yaml: {path}")
+    differences = switch_source_mismatches(cfg, OmegaConf.load(source), "cppo")
+    if differences:
+        raise ValueError(f"training.init_model {path} was trained with other settings: {', '.join(differences)}")
+    model = ContextualPPO.load(path, env=env, device=cfg.training.device)
+    if model.seed != int(cfg.training.seed):
+        raise ValueError(f"training.init_model {path} was trained with seed {model.seed}, not {cfg.training.seed}")
+    model.tensorboard_log = tensorboard_log
+    return model
+
+
 def configure_cpu_threads(cfg: DictConfig) -> None:
     """Each launcher child has its own PyTorch pools; BLAS limits are set before importing it."""
     torch.set_num_threads(int(cfg.training.num_threads))
@@ -551,7 +587,11 @@ def main(cfg: DictConfig) -> None:
         eval_env, scheduler, raw_eval_env = make_eval_env(cfg, schedule)
         core = raw_eval_env.core
         check_episode_alignment(cfg, core.T)
-        model = build_model(cfg, train_env, str(run_dir / "tensorboard"))
+        initial_model = initial_model_from(cfg)
+        if initial_model is None:
+            model = build_model(cfg, train_env, str(run_dir / "tensorboard"))
+        else:
+            model = load_initial_model(cfg, train_env, initial_model, str(run_dir / "tensorboard"))
 
         # Say which physics and which learner code are running, so a wrong or ignored override is visible.
         n_envs, n_steps = int(cfg.training.n_envs), int(cfg.cppo.n_steps)
@@ -570,6 +610,7 @@ def main(cfg: DictConfig) -> None:
             "policy_parameters": sum(p.numel() for p in model.policy.parameters()),
             "parameters_by_group": {name: sum(p.numel() for p in params) for name, params in groups.items()},
             "minibatch_transitions": n_steps * n_envs // int(cfg.cppo.n_minibatches),
+            "init_model": None if initial_model is None else str(initial_model),
             "run_name": run_name,
             "group": group,
             "tags": tags,
@@ -603,6 +644,8 @@ def main(cfg: DictConfig) -> None:
             if cfg.cppo.velocity_head.enabled:
                 print(f"  velocity head: L_context + {cfg.cppo.velocity_head.weight} x L_velocity (vx / v_ref)")
         print(f"  parameters={metadata['parameters_by_group']} | eval episodes={len(schedule)}\n  artifacts: {run_dir}")
+        if initial_model is not None:
+            print(f"  continuing the saved model {initial_model} (late switch), steps counted from the switch")
 
         callbacks = CallbackList([
             # SB3 evaluate_policy passes both state and episode_start to predict(): every evaluation episode
@@ -640,6 +683,8 @@ def main(cfg: DictConfig) -> None:
             total_timesteps=int(cfg.training.total_timesteps),
             callback=callbacks,
             tb_log_name=cfg.wandb.tensorboard_log_name,
+            # Steps and evaluations count from 0, also when continuing a saved model (late switch)
+            reset_num_timesteps=True,
         )
         model.save(run_dir / "final_model")
         # A fixed final-checkpoint validation score selects C versus D across all training seeds.

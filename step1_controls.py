@@ -1,6 +1,9 @@
 """Step 1 of ENCODER_PLAN.md: controls that change only the battery value the policy sees.
 
-NoisyBattery is the noisy oracle. In observed mode the observation ends with the true charge b_t; the wrapper replaces it
+NoisyBattery is the noisy oracle (experiment 1 of step 1 flies step 0 policies with it, experiment 2 continues
+training them with it: switch_source_mismatches checks such a continuation).
+
+NoisyBattery: in observed mode the observation ends with the true charge b_t; the wrapper replaces it
 with b_t + noise, Gaussian noise of standard deviation `sigma` drawn fresh at every step (reset and step observations,
 including the final observation of an episode). The actor and critic of either learner then read
 [y, vx + speed noise, vy, tau, b_t + noise] and never the true b_t: plain PPO reads the observation, and CPPO's oracle
@@ -50,3 +53,40 @@ class NoisyBattery(gym.ObservationWrapper):
         noisy = np.array(observation, dtype=np.float32, copy=True)
         noisy[BATTERY_COLUMN] += np.float32(self.sigma * self.rng.standard_normal())
         return noisy
+
+
+def switch_source_mismatches(cfg, source_cfg, learner: str) -> list[str]:
+    """
+    Late switch (step 1, experiment 2): the parts of a run's config (cfg) that differ from the step 0 run whose saved
+    model it continues (source_cfg), other than the battery noise, the step budget, the model to start from, threads,
+    how often it evaluates and naming. Empty when the continuation is valid. The source must have trained with the
+    true battery.
+
+    :param learner: The learner's config section, "cppo" or "ppo"
+    """
+    from omegaconf import OmegaConf
+
+    def plain(node):
+        return OmegaConf.to_container(node, resolve=True)
+
+    differences = []
+    if float(source_cfg.env.get("battery_noise", 0.0)) != 0.0:
+        differences.append("the source trained with battery noise")
+    env, source_env = plain(cfg.env), plain(source_cfg.env)
+    for settings in (env, source_env):
+        settings.pop("battery_noise", None)
+    if env != source_env:
+        differences.append("env")
+    if learner not in source_cfg or plain(cfg[learner]) != plain(source_cfg[learner]):
+        differences.append(learner)
+    training, source_training = plain(cfg.training), plain(source_cfg.training)
+    for settings in (training, source_training):
+        for key in ("total_timesteps", "init_model", "num_threads", "num_interop_threads"):
+            settings.pop(key, None)
+    if training != source_training:
+        differences.append("training")
+    # The same validation flights (how often they are flown does not change the training)
+    for key in ("reset_grid", "deterministic"):
+        if plain(cfg.evaluation)[key] != plain(source_cfg.evaluation)[key]:
+            differences.append(f"evaluation.{key}")
+    return differences

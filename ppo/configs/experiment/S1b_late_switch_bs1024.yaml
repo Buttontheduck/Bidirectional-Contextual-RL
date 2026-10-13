@@ -1,0 +1,15 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, experiment 2, late switch for plain PPO (run 1b_switch): a finished 0b policy (trained with
+# the true battery) keeps training for 1M more steps while it sees the battery plus noise (env.battery_noise; 0 is the
+# control). Everything else is 1b (S1b_noisy_bs1024).
+defaults:
+  - /experiment/S1b_noisy_bs1024
+  - _self_
+training:
+  total_timesteps: 1000000
+  # The 0b run's final_model.zip with this seed; required (run_step0.py --from-runs fills it)
+  init_model: REQUIRED
+wandb:
+  run_name: S1b_late_switch_bs1024_noise${env.battery_noise}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1b_late_switch_bs1024_noise${env.battery_noise}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, step1, late_switch]

@@ -4,7 +4,9 @@ Pass each run's actual resolved configuration explicitly. Both training scripts 
 in the run directory as config.yaml (plain PPO: runs_ppo/<run id>/, CPPO: runs_cppo/<run id>/).
 This script never evaluates the reserved final test. Condition A is experiment A (learned encoder, hidden mode)
 rerun with step 0's settings (config/rerun/), and 1a, 1b, 1c are step 1's noisy oracle (0a, 0b, 0c seeing the battery
-plus noise); each is scored the same way, in a report of its own setting (the protocol includes the battery noise).
+plus noise), and 1a_switch, 1b_switch, 1c_switch are step 1's late switch (the finished 0a, 0b, 0c models trained 1M
+more steps with noise; scored on 0.5M-1M after the switch); each is scored the same way, in a report of its own setting
+(the protocol includes the battery noise and the schedule).
 
 Example (repeat --run for every condition and seed):
     python report_step0.py --run 0a runs_ppo/<id>/config.yaml runs_ppo/<id> \
@@ -30,14 +32,21 @@ import main_battery_plane_contextual_ppo as training
 from contextual_ppo.torch_layers import XLSTMRolloutEncoder
 
 
-CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c")
+CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch")
 # Step 1's noisy oracle: the step 0 run each condition repeats with noise on the battery
 NOISY_REPEATS = {"1a": "0a", "1b": "0b", "1c": "0c"}
-LATE_START = 1_500_000
-LATE_END = 2_000_000
+# Step 1's late switch: the step 0 run whose final model each condition keeps training
+SWITCH_SOURCES = {"1a_switch": "0a", "1b_switch": "0b", "1c_switch": "0c"}
 EVAL_FREQUENCY = 50_000
+# Requested steps, scored window and the steps of a finished run (complete rollouts of 8 x 512): runs from scratch
+# (step 0, A, noisy oracle) and the late switch, whose steps count from the switch
+SCHEDULES = {
+    "step0": {"total": 2_000_000, "late": (1_500_000, 2_000_000), "final": 2_002_944},
+    "switch": {"total": 1_000_000, "late": (500_000, 1_000_000), "final": 1_003_520},
+}
+LATE_START, LATE_END = SCHEDULES["step0"]["late"]
 EXPECTED_LATE_STEPS = np.arange(LATE_START, LATE_END + 1, EVAL_FREQUENCY)
-FINAL_TIMESTEPS = 2_002_944  # ceil(2M / (8 * 512)) complete rollouts
+FINAL_TIMESTEPS = SCHEDULES["step0"]["final"]
 SHARED_PPO_SETTINGS = (
     "learning_rate", "n_steps", "n_epochs", "gamma", "gae_lambda", "clip_range", "clip_range_vf",
     "normalize_advantage", "ent_coef", "vf_coef", "max_grad_norm", "target_kl", "net_arch",
@@ -57,10 +66,18 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     if condition not in CONDITIONS:
         raise ValueError(f"condition must be one of {CONDITIONS}")
     # A noisy oracle repeats a step 0 run with noise on the visible battery
-    kind = NOISY_REPEATS.get(condition, condition)
+    kind = NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or condition
     noise = float(cfg.env.get("battery_noise", 0.0))
-    if (noise > 0) != (condition in NOISY_REPEATS):
-        raise ValueError(f"{condition} requires " + ("env.battery_noise > 0" if condition in NOISY_REPEATS else "no battery noise"))
+    if condition in NOISY_REPEATS and noise <= 0:
+        raise ValueError(f"{condition} requires env.battery_noise > 0")
+    if condition not in NOISY_REPEATS and condition not in SWITCH_SOURCES and noise > 0:
+        raise ValueError(f"{condition} requires no battery noise")
+    # A late switch continues a saved step 0 model (noise 0 is its control); every other run starts from scratch
+    schedule = "switch" if condition in SWITCH_SOURCES else "step0"
+    continues = cfg.training.get("init_model") not in (None, "REQUIRED")
+    if continues != (schedule == "switch"):
+        raise ValueError(f"{condition} " + ("must continue a saved step 0 model (training.init_model)" if schedule == "switch"
+                                            else "must start from scratch (no training.init_model)"))
     mode = "hidden" if kind == "A" else "observed"
     if cfg.env.observation_mode != mode:
         raise ValueError(f"Step 0 requires env.observation_mode={mode} for {condition}")
@@ -69,8 +86,8 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     grid = OmegaConf.to_container(cfg.evaluation.reset_grid, resolve=True)
     if {key: grid.get(key) for key in VALIDATION_GRID} != VALIDATION_GRID:
         raise ValueError("Step 0 requires the fixed validation grid (1000–1002, battery 0.2–0.7, noise 5)")
-    if int(cfg.training.total_timesteps) != LATE_END:
-        raise ValueError("Step 0 requires 2,000,000 requested training transitions")
+    if int(cfg.training.total_timesteps) != SCHEDULES[schedule]["total"]:
+        raise ValueError(f"{condition} requires {SCHEDULES[schedule]['total']:,} requested training transitions")
     if int(cfg.training.n_envs) != 8:
         raise ValueError("Step 0 requires eight training environments")
     if kind == "0c":
@@ -103,13 +120,15 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     settings = OmegaConf.to_container(learner, resolve=True)
     # Configs from before reward_scale trained on unscaled rewards
     settings.setdefault("reward_scale", 1.0)
-    return {"environment": effective_env, "battery_noise": noise, "reset_grid": VALIDATION_GRID,
+    return {"environment": effective_env, "battery_noise": noise, "schedule": schedule, "reset_grid": VALIDATION_GRID,
             "deterministic": True, "frequency": EVAL_FREQUENCY,
             "shared_ppo_settings": {key: settings[key] for key in SHARED_PPO_SETTINGS}}
 
 
-def summarize_curve(path: Path, n_episodes: int = 18) -> dict:
-    """Average the 11 scheduled late validation means, including both endpoints."""
+def summarize_curve(path: Path, n_episodes: int = 18, schedule: str = "step0") -> dict:
+    """Average the 11 scheduled late validation means of the schedule's window, including both endpoints."""
+    late_start, late_end = SCHEDULES[schedule]["late"]
+    expected = np.arange(late_start, late_end + 1, EVAL_FREQUENCY)
     with np.load(path, allow_pickle=False) as saved:
         timesteps = np.asarray(saved["timesteps"])
         rewards = np.asarray(saved["results"])
@@ -124,9 +143,9 @@ def summarize_curve(path: Path, n_episodes: int = 18) -> dict:
         raise ValueError(f"Each evaluation must contain {n_episodes} episode rewards and lengths: {path}")
     if not np.isfinite(rewards).all() or not np.isfinite(lengths).all() or np.any(lengths <= 0):
         raise ValueError(f"Non-finite returns or invalid episode lengths: {path}")
-    late = (timesteps >= LATE_START) & (timesteps <= LATE_END)
-    if not np.array_equal(timesteps[late], EXPECTED_LATE_STEPS):
-        raise ValueError(f"Need every 50k evaluation from 1.5M through 2M (11 points): {path}")
+    late = (timesteps >= late_start) & (timesteps <= late_end)
+    if not np.array_equal(timesteps[late], expected):
+        raise ValueError(f"Need every 50k evaluation from {late_start:,} through {late_end:,} ({len(expected)} points): {path}")
     means = rewards.mean(axis=1)
     return {
         "late_mean_reward": float(means[late].mean()),
@@ -183,7 +202,7 @@ def main() -> None:
         checkpoint = directory / "final_model.zip"
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
-        curve = summarize_curve(directory / "eval" / "evaluations.npz")
+        curve = summarize_curve(directory / "eval" / "evaluations.npz", schedule=candidate["schedule"])
         prepared.append((condition, config_path, directory, cfg, curve))
 
     torch.set_num_threads(1)
@@ -191,11 +210,11 @@ def main() -> None:
     for condition, config_path, directory, cfg, curve in prepared:
         algorithm = training.ContextualPPO if "cppo" in cfg else PPO
         model = algorithm.load(directory / "final_model.zip", device="cpu")
-        if model.num_timesteps != FINAL_TIMESTEPS or model.seed != int(cfg.training.seed):
+        if model.num_timesteps != SCHEDULES[protocol["schedule"]]["final"] or model.seed != int(cfg.training.seed):
             raise ValueError(f"Checkpoint training duration or seed does not match the supplied config: {directory}")
         if (model.n_envs, model.n_steps, model.n_epochs) != (8, 512, 10):
             raise ValueError(f"Checkpoint rollout/epoch settings do not match Step 0: {directory}")
-        kind = NOISY_REPEATS.get(condition, condition)
+        kind = NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or condition
         if kind == "0c":
             if model.n_minibatches != 4 or not isinstance(model.policy, training.TrueBatteryPolicy):
                 raise ValueError(f"{condition} checkpoint must use the oracle policy and four minibatches: {directory}")
@@ -211,9 +230,10 @@ def main() -> None:
                      **curve, "final_validation": validation})
         print(f"{condition} seed {cfg.training.seed}: late={curve['late_mean_reward']:.3f}, "
               f"final={validation['mean_reward']:.3f}")
+    late_start, late_end = SCHEDULES[protocol["schedule"]]["late"]
     report = {
-        "scoring": {"start": LATE_START, "end": LATE_END, "endpoints_inclusive": True,
-                    "evaluations_per_seed": len(EXPECTED_LATE_STEPS),
+        "scoring": {"start": late_start, "end": late_end, "endpoints_inclusive": True,
+                    "evaluations_per_seed": len(range(late_start, late_end + 1, EVAL_FREQUENCY)),
                     "criterion": "Mean of scheduled validation episode-return means; equal weight per training seed",
                     "spread": "Population standard deviation across supplied training seeds",
                     "outcomes": "Final-checkpoint validation only; battery-empty takes precedence over simultaneous ground contact"},

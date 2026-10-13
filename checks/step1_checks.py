@@ -180,6 +180,132 @@ class Step1Checks(unittest.TestCase):
         finally:
             env.close()
 
+    def test_late_switch_configs_continue_the_noisy_oracle_from_a_saved_model(self):
+        import report_step0
+        from step1_controls import switch_source_mismatches
+
+        script = plain_ppo_script()
+        cases = [("1c_switch", config("+step1=cppo_late_switch", step0=False), noisy_cppo(), "cppo", training.validate_config,
+                  "S1c_late_switch"),
+                 ("1a_switch", plain_ppo_config("+experiment=S1a_late_switch_bs256"), plain_ppo_config("+experiment=S1a_noisy_bs256"),
+                  "ppo", script.validate_ppo, "S1a_late_switch_bs256")]
+        for condition, cfg, noisy, learner, validate, name in cases:
+            with self.subTest(condition=condition):
+                # The noisy oracle's settings, with 1M more steps from a saved model that must be named
+                self.assertEqual((cfg.training.total_timesteps, cfg.training.init_model), (1_000_000, "REQUIRED"))
+                for section in (learner, "env", "evaluation"):
+                    self.assertEqual(cfg[section], noisy[section])
+                self.assertEqual(cfg.wandb.run_name, f"{name}_noise0.06_gamma0.99_rs0.1_s0")
+                with self.assertRaisesRegex(ValueError, "init_model must name"):
+                    validate(cfg)
+                named = OmegaConf.merge(cfg, {"training": {"init_model": "/runs/0x/final_model.zip"}})
+                validate(named)
+                self.assertEqual(report_step0.evaluation_protocol(named, condition)["schedule"], "switch")
+                with self.assertRaisesRegex(ValueError, "must continue a saved step 0 model"):
+                    report_step0.evaluation_protocol(OmegaConf.merge(cfg, {"training": {"init_model": None}}), condition)
+        with self.assertRaisesRegex(ValueError, "must start from scratch"):
+            report_step0.evaluation_protocol(OmegaConf.merge(noisy_cppo(), {"training": {"init_model": "/m.zip"}}), "1c")
+        # A source differs only where the switch may differ; anything else is reported
+        source = config()
+        switch = OmegaConf.merge(config("+step1=cppo_late_switch", step0=False), {"training": {"init_model": "/m.zip"}})
+        self.assertEqual(switch_source_mismatches(switch, source, "cppo"), [])
+        self.assertEqual(switch_source_mismatches(switch, config("cppo.gamma=0.995"), "cppo"), ["cppo"])
+        self.assertEqual(switch_source_mismatches(switch, config("training.seed=1"), "cppo"), ["training"])
+        self.assertEqual(switch_source_mismatches(switch, config("env.battery_noise=0.03"), "cppo"),
+                         ["the source trained with battery noise"])
+        # How often it evaluates does not matter, the validation flights do
+        def evaluated(*overrides):
+            return OmegaConf.merge(config("+step1=cppo_late_switch", *overrides, step0=False), {"training": {"init_model": "/m.zip"}})
+
+        self.assertEqual(switch_source_mismatches(evaluated("evaluation.frequency=4096", "evaluation.plots.frequency=8192"),
+                                                  source, "cppo"), [])
+        self.assertEqual(switch_source_mismatches(evaluated("evaluation.reset_grid.eval_seeds=[1000,1001]"), source, "cppo"),
+                         ["evaluation.reset_grid"])
+        self.assertEqual(switch_source_mismatches(evaluated("evaluation.deterministic=false"), source, "cppo"),
+                         ["evaluation.deterministic"])
+
+    def test_both_scripts_continue_a_saved_model_with_noise(self):
+        from pathlib import Path
+        import tempfile
+        from stable_baselines3 import PPO
+
+        script = plain_ppo_script()
+        with tempfile.TemporaryDirectory() as folder:
+            cases = [("cppo", training, config(*SMALL), lambda path: config("+step1=cppo_late_switch", *SMALL,
+                      f'training.init_model="{path}"', step0=False)),
+                     ("ppo", script, plain_ppo_config("+experiment=S0a_observed_bs256", *PLAIN_SMALL),
+                      lambda path: plain_ppo_config("+experiment=S1a_late_switch_bs256", *PLAIN_SMALL, f'training.init_model="{path}"'))]
+            for learner, module, source_cfg, switch_cfg in cases:
+                with self.subTest(learner=learner):
+                    run = Path(folder) / learner
+                    run.mkdir()
+                    env = module.make_train_env(source_cfg)
+                    try:
+                        if learner == "cppo":
+                            model = training.build_model(source_cfg, env)
+                        else:
+                            model = PPO("MlpPolicy", env, n_steps=8, batch_size=8, n_epochs=1, seed=0, device="cpu")
+                        model.learn(total_timesteps=32)
+                        model.save(run / "final_model")
+                        saved = {k: v.clone() for k, v in model.policy.state_dict().items()}
+                    finally:
+                        env.close()
+                    OmegaConf.save(source_cfg, run / "config.yaml", resolve=True)
+                    cfg = switch_cfg(run / "final_model.zip")
+                    (training.validate_config if learner == "cppo" else script.validate_ppo)(cfg)
+                    path = module.initial_model_from(cfg)
+                    self.assertEqual(path, run / "final_model.zip")
+                    env = module.make_train_env(cfg)
+                    try:
+                        self.assertTrue(all(env.env_is_wrapped(NoisyBattery)))
+                        continued = module.load_initial_model(cfg, env, path)
+                        # The saved weights and optimizer state, continued from the switch
+                        for name, value in continued.policy.state_dict().items():
+                            torch.testing.assert_close(value, saved[name])
+                        self.assertTrue(continued.policy.optimizer.state_dict()["state"])
+                        continued.learn(total_timesteps=16, reset_num_timesteps=True)
+                        self.assertEqual(continued.num_timesteps, 16)
+                        self.assertTrue(any(not torch.equal(v, saved[k]) for k, v in continued.policy.state_dict().items()))
+                    finally:
+                        env.close()
+                    # A model trained with other settings is refused
+                    mismatched = OmegaConf.merge(cfg, {learner: {"gamma": 0.9}})
+                    with self.assertRaisesRegex(ValueError, "trained with other settings"):
+                        module.load_initial_model(mismatched, None, path)
+
+    def test_launcher_finds_the_step0_models_to_continue(self):
+        import json
+        from pathlib import Path
+        import tempfile
+
+        import run_step0
+
+        with tempfile.TemporaryDirectory() as folder:
+            rows = []
+            for condition, seed, scale in (("0c", 0, 0.1), ("0c", 1, 0.1), ("0c", 0, 0.01), ("0a", 0, 0.1)):
+                run = Path(folder) / f"{condition}_{seed}_{scale}"
+                run.mkdir()
+                cfg = config(f"training.seed={seed}", f"cppo.reward_scale={scale}") if condition == "0c" else \
+                    plain_ppo_config("+experiment=S0a_observed_bs256", f"training.seed={seed}", f"ppo.reward_scale={scale}")
+                OmegaConf.save(cfg, run / "config.yaml", resolve=True)
+                rows.append({"condition": condition, "status": "done", "run_dir": str(run)})
+            runs_file = Path(folder) / "runs.json"
+            runs_file.write_text(json.dumps(rows))
+            sources = run_step0.switch_sources([runs_file], 0.1)
+            self.assertEqual(sorted(sources), [("0a", 0), ("0c", 0), ("0c", 1)])
+            self.assertEqual(sources[("0c", 1)], Path(folder) / "0c_1_0.1" / "final_model.zip")
+            args = run_step0.parse_args(["--conditions", "1c_switch", "--seeds", "0", "1", "--battery-noises", "0", "0.03",
+                                         "--from-runs", str(runs_file), "--output", "/tmp/switch_launch"])
+            command = run_step0.command_for("1c_switch", 1, 1, args.output, battery_noise=0.03,
+                                            init_model=run_step0.Launcher(args).init_model("1c_switch", 1))
+            cfg = config(*[item for item in command[3:] if not item.startswith("hydra.")], "+step1=cppo_late_switch", step0=False)
+            self.assertEqual((cfg.training.init_model, cfg.env.battery_noise, cfg.training.seed),
+                             (str(Path(folder) / "0c_1_0.1" / "final_model.zip"), 0.03, 1))
+            for argv in (["--conditions", "1c_switch", "--seeds", "2", "--from-runs", str(runs_file)],   # no seed 2 source
+                         ["--conditions", "1c_switch"]):                                                 # no --from-runs
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                    run_step0.parse_args(argv)
+
     def test_launcher_runs_the_noise_screen(self):
         import run_step0
 

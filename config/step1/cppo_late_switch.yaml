@@ -1,0 +1,20 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, experiment 2, late switch for CPPO (run 1c_switch): a finished 0c policy (trained with the
+# true battery, config/step0/cppo_oracle.yaml) keeps training for 1M more steps while it sees the battery plus noise
+# (env.battery_noise; 0 is the control: the same extra training without noise). Everything else is 1c.
+#
+#   python run_step0.py --conditions 1a_switch 1b_switch 1c_switch --battery-noises 0 0.03 0.06 \
+#       --from-runs runs_step0/<step 0 launch>/runs.json ...      # fills training.init_model per condition and seed
+defaults:
+  - /step1/cppo_noisy_oracle
+  - _self_
+experiment_id: S1c_switch
+training:
+  total_timesteps: 1000000
+  # The 0c run's final_model.zip with this seed; required (run_step0.py --from-runs fills it)
+  init_model: REQUIRED
+wandb:
+  # With the inherited "cppo_" prefix: cppo_S1c_late_switch_noise0.03_gamma0.99_rs0.1_s0
+  run_name: S1c_late_switch_noise${env.battery_noise}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1c_late_switch_noise${env.battery_noise}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, step1, late_switch]

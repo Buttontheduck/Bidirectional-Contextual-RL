@@ -43,6 +43,9 @@ training:
   # more threads barely help (1 -> 4: ~15% faster on the 9950X); run_step0.py runs many runs side by side instead.
   num_threads: 4
   num_interop_threads: 1
+  # A saved final_model.zip to continue instead of starting from scratch (step 1's late switch: weights and optimizer
+  # state; steps and evaluations then count from the switch). null = a fresh run.
+  init_model: null
 
 ppo:
   policy: MlpPolicy

@@ -46,6 +46,9 @@ training:
   device: cpu
   num_threads: 4                         # per training process; launcher also limits BLAS pools
   num_interop_threads: 1
+  # A saved final_model.zip to continue instead of starting from scratch (step 1's late switch: weights and optimizer
+  # state; steps and evaluations then count from the switch). null = a fresh run.
+  init_model: null
 
 cppo:
   policy: MlpPolicy

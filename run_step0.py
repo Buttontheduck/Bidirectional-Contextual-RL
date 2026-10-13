@@ -15,6 +15,8 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --seeds 3 4 5 6 7 --study confirm1   # more seeds, W&B names and groups end in _confirm1
     python run_step0.py --conditions A --threads 4       # experiment A (learned encoder) rerun with step 0's settings
     python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12   # step 1: noisy oracle
+    python run_step0.py --conditions 1a_switch 1b_switch 1c_switch --battery-noises 0 0.03 0.06 \
+        --from-runs runs_step0/<step 0 launch>/runs.json ...      # step 1: late switch from the step 0 models
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
@@ -50,9 +52,15 @@ CONDITIONS = {
     "1a": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_noisy_bs256", "ppo"),
     "1b": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_noisy_bs1024", "ppo"),
     "1c": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_noisy_oracle", "cppo"),
+    # Step 1, late switch: the finished 0a, 0b and 0c models keep training with noise on the battery (0 = control)
+    "1a_switch": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_late_switch_bs256", "ppo"),
+    "1b_switch": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_late_switch_bs1024", "ppo"),
+    "1c_switch": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_late_switch", "cppo"),
 }
 STEP0_CONDITIONS = ["0a", "0b", "0c"]
 NOISY_CONDITIONS = ["1a", "1b", "1c"]
+# Late switch -> the step 0 run whose final model it continues (same seed)
+SWITCH_SOURCES = {"1a_switch": "0a", "1b_switch": "0b", "1c_switch": "0c"}
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -83,9 +91,34 @@ def launch_name(condition: str, seed: int, reward_scale: float | None = None, ba
     return "_".join([*parts, f"s{seed}"])
 
 
+def switch_sources(runs_files: list[Path], reward_scale: float) -> dict[tuple[str, int], Path]:
+    """
+    Final models a late switch can continue: (step 0 condition, seed) -> final_model.zip of the finished runs in the
+    launchers' runs.json files that trained with this reward scale and without battery noise. A condition and seed found
+    twice is an error.
+    """
+    from omegaconf import OmegaConf
+
+    sources: dict[tuple[str, int], Path] = {}
+    for path in runs_files:
+        for row in json.loads(Path(path).read_text()):
+            if row["condition"] not in STEP0_CONDITIONS or row["status"] != "done":
+                continue
+            run_dir = Path(row["run_dir"])
+            cfg = OmegaConf.load(run_dir / "config.yaml")
+            learner = cfg.cppo if "cppo" in cfg else cfg.ppo
+            if float(learner.get("reward_scale", 1.0)) != reward_scale or float(cfg.env.get("battery_noise", 0.0)) != 0.0:
+                continue
+            key = (row["condition"], int(cfg.training.seed))
+            if key in sources:
+                raise ValueError(f"Two step 0 runs for {key}: {sources[key].parent} and {run_dir}")
+            sources[key] = run_dir / "final_model.zip"
+    return sources
+
+
 def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bool = False,
                 reward_scale: float | None = None, study: str | None = None,
-                battery_noise: float | None = None) -> list[str]:
+                battery_noise: float | None = None, init_model: Path | None = None) -> list[str]:
     script, experiment, learner = CONDITIONS[condition]
     command = [
         sys.executable, str(ROOT / script), experiment, f"training.seed={seed}",
@@ -99,6 +132,9 @@ def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bo
     if battery_noise is not None:
         # The step 1 configs build the W&B name and group from it
         command.append(f"env.battery_noise={battery_noise:g}")
+    if init_model is not None:
+        # Late switch: the step 0 model this run continues
+        command.append(f"training.init_model={json.dumps(str(init_model))}")
     if study:
         # Appended to the W&B name and group, e.g. ..._rs0.1_confirm1_s3
         command.append(f"wandb.study=_{study}")
@@ -113,6 +149,11 @@ class Launcher:
         self.stopping = threading.Event()
         self.lock = threading.Lock()
         self.children: set[subprocess.Popen] = set()
+        # (step 0 condition, seed) -> the final model a late switch continues
+        self.sources = getattr(args, "sources", {})
+
+    def init_model(self, condition: str, seed: int) -> Path | None:
+        return self.sources[(SWITCH_SOURCES[condition], seed)] if condition in SWITCH_SOURCES else None
 
     def stop(self) -> None:
         self.stopping.set()
@@ -147,7 +188,7 @@ class Launcher:
                             "battery_noise": battery_noise, "status": "not started", "log": str(log)}
                 process = subprocess.Popen(
                     command_for(condition, seed, self.args.threads, self.args.output, self.args.smoke, reward_scale,
-                                self.args.study, battery_noise),
+                                self.args.study, battery_noise, self.init_model(condition, seed)),
                     cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
                 )
                 self.children.add(process)
@@ -165,6 +206,7 @@ class Launcher:
         print(f"{status.upper()} {name} | {minutes:.1f} min | "
               + (f"run: {run_dir}" if run_dir else f"exit {code}, see {log}"), flush=True)
         return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "battery_noise": battery_noise,
+                "init_model": None if self.init_model(condition, seed) is None else str(self.init_model(condition, seed)),
                 "status": status, "exit_code": code, "minutes": round(minutes, 2),
                 "log": str(log), "run_dir": run_dir}
 
@@ -176,8 +218,12 @@ def parse_args(argv=None):
     parser.add_argument("--reward-scales", type=float, nargs="+", default=None,
                         help="Run every condition and seed once per reward scale (default: the configs' reward scale)")
     parser.add_argument("--battery-noises", type=float, nargs="+", default=None,
-                        help="Step 1 conditions (1a 1b 1c) only: run every condition and seed once per noise std "
-                             "(default: the configs' 0.06)")
+                        help="Step 1 conditions only: run every condition and seed once per noise std (default: the "
+                             "configs' 0.06); 0, the control without noise, only for the late switch")
+    parser.add_argument("--from-runs", type=Path, nargs="+", default=None,
+                        help="Late switch: runs.json files of the step 0 launches whose final models it continues")
+    parser.add_argument("--source-reward-scale", type=float, default=0.1,
+                        help="Late switch: the reward scale of the step 0 models to continue (default 0.1)")
     parser.add_argument("--jobs", type=int, default=physical_cores(), help="Runs at the same time (default: physical cores)")
     parser.add_argument("--threads", type=int, default=2, help="CPU threads per run (default: 2)")
     parser.add_argument("--study", default=None,
@@ -198,10 +244,24 @@ def parse_args(argv=None):
         parser.error("Reward scales must be distinct and positive")
     noises = args.battery_noises
     if noises is not None:
-        if min(noises) <= 0 or len({f"{noise:g}" for noise in noises}) != len(noises):
-            parser.error("Battery noises must be distinct and positive")
-        if not set(args.conditions) <= set(NOISY_CONDITIONS):
-            parser.error(f"--battery-noises applies to the noisy-oracle conditions {NOISY_CONDITIONS} only")
+        if min(noises) < 0 or len({f"{noise:g}" for noise in noises}) != len(noises):
+            parser.error("Battery noises must be distinct and non-negative")
+        if not set(args.conditions) <= set(NOISY_CONDITIONS) | set(SWITCH_SOURCES):
+            parser.error(f"--battery-noises applies to the step 1 conditions {NOISY_CONDITIONS + list(SWITCH_SOURCES)} only")
+        if 0 in noises and not set(args.conditions) <= set(SWITCH_SOURCES):
+            parser.error("Battery noise 0 is the late switch's control; a noisy oracle needs noise > 0")
+    switching = [condition for condition in args.conditions if condition in SWITCH_SOURCES]
+    args.sources = {}
+    if switching:
+        if not args.from_runs:
+            parser.error("The late switch needs --from-runs: the step 0 launches whose final models it continues")
+        try:
+            args.sources = switch_sources(args.from_runs, args.source_reward_scale)
+        except (OSError, ValueError, KeyError) as error:
+            parser.error(f"--from-runs: {error}")
+        missing = [(SWITCH_SOURCES[c], seed) for c in switching for seed in args.seeds if (SWITCH_SOURCES[c], seed) not in args.sources]
+        if missing:
+            parser.error(f"--from-runs has no finished step 0 run (reward scale {args.source_reward_scale:g}, no noise) for {missing}")
     stamp = time.strftime("%Y%m%d-%H%M%S") + ("-smoke" if args.smoke else "")
     args.output = (args.output or ROOT / "runs_step0" / stamp).resolve()
     return args
@@ -221,8 +281,10 @@ def main(argv=None) -> int:
     if at_once * args.threads > os.cpu_count():
         print(f"Note: {at_once * args.threads} threads exceed the {os.cpu_count()} hardware threads", flush=True)
     if args.dry_run:
+        launcher = Launcher(args)
         for condition, seed, scale, noise in runs:
-            print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke, scale, args.study, noise)))
+            print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke, scale, args.study, noise,
+                                         launcher.init_model(condition, seed))))
         return 0
     args.output.mkdir(parents=True, exist_ok=False)
     print(f"Logs: {args.output}", flush=True)

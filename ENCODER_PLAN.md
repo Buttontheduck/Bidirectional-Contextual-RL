@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0, step 1's noisy oracle and the fly-with-noise test done (2026-10-13, results below); the rest of steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise and late-switch tests done (2026-10-13, results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -232,6 +232,30 @@ nohup python run_step0.py --conditions 1a 1b 1c --battery-noises 0.03 0.06 0.12 
 - At 0.03 a trained policy keeps about half to two thirds of its score and completes far more flights than one trained with that noise. At 0.06, the encoder's typical error, its score falls to about zero.
 - The policies keep trusting the reading (their throttle reacts to it as strongly as without noise), so a wrong reading leads to wrong actions. The losses are in flights that start with 20–40% battery; at 60–70% a few percent of error barely matters.
 - So plugging an estimate into a policy trained with the true battery keeps at most part of the score at 3% error and almost nothing at 6%. Next: does continued training after the switch let the policy adapt (late switch), instead of falling back to fast blind flying (about 70–120)?
+
+**Late switch (implemented 2026-10-13).** The finished step 0 policies keep training for 1M more steps while they see the battery plus noise (0.03 or 0.06; noise 0 is the control: the same extra training without noise). `training.init_model` continues a saved model, its weights and optimizer state, on the run's own environments; the scripts refuse a model whose run used other settings, apart from the noise, step budget, threads, evaluation frequency and naming (`step1_controls.switch_source_mismatches`). Steps and evaluations count from the switch. Runs 1a_switch, 1b_switch and 1c_switch (`ppo/configs/experiment/S1a_late_switch_bs256.yaml`, `S1b_late_switch_bs1024.yaml`, `config/step1/cppo_late_switch.yaml`) continue 0a, 0b and 0c with the same seed; `--from-runs` finds those models (reward scale 0.1, no noise). W&B names: `…_late_switch_…_noise<σ>_gamma0.99_rs0.1_s<seed>`. `report_step0.py` scores 0.5M–1M after the switch.
+
+```bash
+# 3 noise levels x 1a, 1b, 1c x seeds 0-2 = 27 runs of 1M steps, all at once, about 8 minutes
+nohup python run_step0.py --conditions 1a_switch 1b_switch 1c_switch --battery-noises 0 0.03 0.06 --jobs 27 --threads 1 \
+    --from-runs runs_step0/20261013-002244/runs.json runs_step0/20261013-042940/runs.json > run_switch.log 2>&1 &
+```
+
+**Late switch results (2026-10-13).** Mean validation return over 0.5M–1M steps after the switch, seeds 0–2 (W&B groups `…_late_switch_…_noise<σ>_gamma0.99_rs0.1`).
+
+| | Control: no noise | Noise 0.03 | Noise 0.06 |
+|---|---:|---:|---:|
+| 0a (plain PPO, batch 256) | 274 | 125 | 22 |
+| 0b (plain PPO, batch 1024) | 225 | 148 | 50 |
+| 0c (CPPO) | 233 | **235** | 85 |
+| *Flown with noise, no more training (0a / 0b / 0c)* | | *171 / 143 / 181* | *42 / 28 / 58* |
+| *Trained with noise from the start (1a / 1b / 1c)* | | *86 / 85 / 108* | *73 / 71 / 122* |
+
+- Extra training alone changes little: the control stays near its starting level (10–30 points lower).
+- At noise 0.03, CPPO adapts completely: 235, as high as its control, all three seeds 209–267, 81% of flights completed. Plain PPO does not really adapt (125–148, one seed each broke down), but still beats training with noise from the start.
+- At noise 0.06, the encoder's error level, the switch does not help: 22–85, 28–48% of flights completed, no better than training with noise from the start.
+- The switched policies keep using the battery (their throttle reacts to it as much as without noise or more, and they do not speed up like blind agents); they fail in low-battery flights.
+- So learning with the true battery first and then switching works for an estimate accurate to about 3%, at least with CPPO, but not at about 6%. Before building pilots and a frozen encoder, find the best possible accuracy for this task (enc1's ideal estimator): if even that is off by more than 3% early in flights, a better encoder alone cannot fix it, and the policy needs help with uncertainty (for example the estimate's variance as an input).
 
 ### 2. Run every condition through plain PPO
 

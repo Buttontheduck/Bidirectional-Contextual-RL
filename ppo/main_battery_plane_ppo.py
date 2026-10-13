@@ -56,7 +56,7 @@ from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights,
 )
 # Step 1's noisy oracle: the observed battery plus noise, as in Contextual_PPO
-from step1_controls import NoisyBattery  # noqa: E402
+from step1_controls import NoisyBattery, switch_source_mismatches  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 
@@ -262,6 +262,38 @@ def validate_ppo(cfg: DictConfig) -> None:
     training_seeds = {seed * 100 + i for i in range(n_envs)} | {seed + i for i in range(n_envs)}
     if set(cfg.evaluation.reset_grid.eval_seeds) & training_seeds:
         raise ValueError("Training and evaluation seeds must be disjoint")
+    initial_model_from(cfg)   # a late switch must name the model it continues
+
+
+def initial_model_from(cfg: DictConfig) -> Path | None:
+    """The saved model a run continues (training.init_model, step 1's late switch), None for a fresh run."""
+    value = cfg.training.get("init_model")
+    # Late-switch configs say REQUIRED until the launcher names the model (Hydra keeps a default under ???)
+    if OmegaConf.is_missing(cfg.training, "init_model") or value == "REQUIRED":
+        raise ValueError("training.init_model must name the saved final_model.zip this run continues")
+    if value is None:
+        return None
+    path = Path(str(value))
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def load_initial_model(cfg: DictConfig, env, path: Path, tensorboard_log: str | None = None) -> PPO:
+    """
+    Step 1's late switch: the saved model of a finished run (weights and optimizer state), continued on this run's
+    environments, e.g. with noise on the battery. The saved run (its config.yaml next to the model) must have used this
+    run's settings, apart from the battery noise, step budget, threads and naming, as in Contextual_PPO.
+    """
+    source = path.parent / "config.yaml"
+    if not path.is_file() or not source.is_file():
+        raise FileNotFoundError(f"training.init_model needs a saved model and its run's config.yaml: {path}")
+    differences = switch_source_mismatches(cfg, OmegaConf.load(source), "ppo")
+    if differences:
+        raise ValueError(f"training.init_model {path} was trained with other settings: {', '.join(differences)}")
+    model = PPO.load(path, env=env, device=cfg.training.device)
+    if model.seed != int(cfg.training.seed):
+        raise ValueError(f"training.init_model {path} was trained with seed {model.seed}, not {cfg.training.seed}")
+    model.tensorboard_log = tensorboard_log
+    return model
 
 
 def configure_cpu_threads(cfg: DictConfig) -> None:
@@ -323,6 +355,7 @@ def main(cfg: DictConfig) -> None:
         f" | gamma={cfg.ppo.gamma} reward_scale={cfg.ppo.get('reward_scale', 1.0)} battery_noise={cfg.env.get('battery_noise', 0.0)}"
     )
     run.config.update({"effective_env": core._kw, "algorithm": "PPO", "torch_threads": torch.get_num_threads(),
+                       "init_model": None if initial_model_from(cfg) is None else str(initial_model_from(cfg)),
                        "torch_interop_threads": torch.get_num_interop_threads()}, allow_val_change=True)
 
     net_arch = list(cfg.ppo.net_arch)
@@ -333,28 +366,33 @@ def main(cfg: DictConfig) -> None:
         "log_std_init": float(cfg.ppo.log_std_init),
     }
 
-    model = PPO(
-        policy=cfg.ppo.policy,
-        env=train_env,
-        learning_rate=cfg.ppo.learning_rate,
-        n_steps=int(cfg.ppo.n_steps),
-        batch_size=int(cfg.ppo.batch_size),
-        n_epochs=int(cfg.ppo.n_epochs),
-        gamma=cfg.ppo.gamma,
-        gae_lambda=cfg.ppo.gae_lambda,
-        clip_range=cfg.ppo.clip_range,
-        clip_range_vf=cfg.ppo.clip_range_vf,
-        normalize_advantage=bool(cfg.ppo.normalize_advantage),
-        ent_coef=cfg.ppo.ent_coef,
-        vf_coef=cfg.ppo.vf_coef,
-        max_grad_norm=cfg.ppo.max_grad_norm,
-        target_kl=cfg.ppo.target_kl,
-        tensorboard_log=str(run_dir / "tensorboard"),
-        policy_kwargs=policy_kwargs,
-        seed=int(cfg.training.seed),
-        device=cfg.training.device,
-        verbose=int(cfg.ppo.verbose),
-    )
+    initial_model = initial_model_from(cfg)
+    if initial_model is None:
+        model = PPO(
+            policy=cfg.ppo.policy,
+            env=train_env,
+            learning_rate=cfg.ppo.learning_rate,
+            n_steps=int(cfg.ppo.n_steps),
+            batch_size=int(cfg.ppo.batch_size),
+            n_epochs=int(cfg.ppo.n_epochs),
+            gamma=cfg.ppo.gamma,
+            gae_lambda=cfg.ppo.gae_lambda,
+            clip_range=cfg.ppo.clip_range,
+            clip_range_vf=cfg.ppo.clip_range_vf,
+            normalize_advantage=bool(cfg.ppo.normalize_advantage),
+            ent_coef=cfg.ppo.ent_coef,
+            vf_coef=cfg.ppo.vf_coef,
+            max_grad_norm=cfg.ppo.max_grad_norm,
+            target_kl=cfg.ppo.target_kl,
+            tensorboard_log=str(run_dir / "tensorboard"),
+            policy_kwargs=policy_kwargs,
+            seed=int(cfg.training.seed),
+            device=cfg.training.device,
+            verbose=int(cfg.ppo.verbose),
+        )
+    else:
+        model = load_initial_model(cfg, train_env, initial_model, str(run_dir / "tensorboard"))
+        print(f"  continuing the saved model {initial_model} (late switch), steps counted from the switch")
 
     # SB3 counts callback frequencies in CALLS, and one call covers n_envs environment
     # steps. Dividing keeps evaluation.frequency / checkpoint.frequency in env steps,
@@ -401,6 +439,8 @@ def main(cfg: DictConfig) -> None:
             total_timesteps=int(cfg.training.total_timesteps),
             callback=callbacks,
             tb_log_name=cfg.wandb.tensorboard_log_name,
+            # Steps and evaluations count from 0, also when continuing a saved model (late switch)
+            reset_num_timesteps=True,
         )
         final_model_path = run_dir / "final_model"
         model.save(final_model_path)
