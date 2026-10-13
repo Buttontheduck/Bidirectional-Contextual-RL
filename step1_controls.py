@@ -3,6 +3,8 @@
 NoisyBattery is the noisy oracle (experiment 1 of step 1 flies step 0 policies with it, experiment 2 continues
 training them with it: switch_source_mismatches checks such a continuation). BatteryNoiseSwitch turns the noise off
 during training (early-noise runs: noise first, then the true battery, like an encoder that becomes accurate).
+Within-flight profiles make the noise of every flight go away at a flight step (sharp or linear), like an encoder that
+identifies the battery during each flight.
 
 NoisyBattery: in observed mode the observation ends with the true charge b_t; the wrapper replaces it
 with b_t + noise, Gaussian noise of standard deviation `sigma` drawn fresh at every step (reset and step observations,
@@ -26,36 +28,69 @@ from stable_baselines3.common.callbacks import BaseCallback
 BATTERY_COLUMN = -1
 # Keeps the noise stream apart from the environment's stream for the same seed
 NOISE_STREAM = 0x5EEDB477
+# Within-flight noise profiles (env.battery_noise_flight): None = the same noise all flight
+FLIGHT_PROFILES = (None, "sharp", "linear")
 
 
 class NoisyBattery(gym.ObservationWrapper):
     """
-    The observed battery plus Gaussian noise: ``b_t + sigma * N(0, 1)``, fresh at every step and not clipped.
+    The observed battery plus Gaussian noise: ``b_t + sigma * scale(k) * N(0, 1)``, fresh at every step and not clipped,
+    where k is the flight step of the observation (0 at the reset). Within-flight profiles, like an encoder that
+    identifies the battery during the flight: ``profile=None`` keeps scale 1; ``"sharp"`` gives 1 before flight step
+    ``profile_step`` and 0 from then on (the exact battery); ``"linear"`` shrinks evenly from 1 at the start to 0 at
+    ``profile_step``. Every profile draws one random number per step, so they share the same noise stream.
 
     :param env: A BatteryPlaneEnv in observed mode (the wrapper must see the seeded resets, so it goes inside any
         reset scheduler)
     :param sigma: Standard deviation of the noise, in units of a full battery (> 0; BatteryNoiseSwitch may set it to 0
         later, which gives the exact battery)
+    :param profile: Within-flight profile: None, "sharp" or "linear"
+    :param profile_step: Flight step from which the battery is exact under a profile (> 0)
     """
 
-    def __init__(self, env: gym.Env, sigma: float) -> None:
+    def __init__(self, env: gym.Env, sigma: float, profile: str | None = None, profile_step: int = 350) -> None:
         super().__init__(env)
         if not (np.isfinite(sigma) and sigma > 0):
             raise ValueError(f"sigma must be finite and positive, got {sigma!r}")
+        if profile not in FLIGHT_PROFILES or (profile is not None and not (isinstance(profile_step, int) and profile_step > 0)):
+            raise ValueError(f"profile must be one of {FLIGHT_PROFILES} with a positive profile_step, got {profile!r}, {profile_step!r}")
         if getattr(env.unwrapped, "observation_mode", None) != "observed":
             raise ValueError("NoisyBattery needs an observed-mode BatteryPlaneEnv, whose observation ends with the battery")
         self.sigma = float(sigma)
+        self.profile, self.profile_step = profile, profile_step
         self.rng = np.random.default_rng()
+        # Flight step of the next observation
+        self.flight_step = 0
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         if seed is not None:
             self.rng = np.random.default_rng([seed, NOISE_STREAM])
+        self.flight_step = 0
         return super().reset(seed=seed, options=options)
+
+    def step(self, action):
+        self.flight_step += 1
+        return super().step(action)
+
+    def scale(self, flight_step: int) -> float:
+        """The share of sigma at a flight step."""
+        if self.profile is None:
+            return 1.0
+        if self.profile == "sharp":
+            return 1.0 if flight_step < self.profile_step else 0.0
+        return max(0.0, 1.0 - flight_step / self.profile_step)
 
     def observation(self, observation: np.ndarray) -> np.ndarray:
         noisy = np.array(observation, dtype=np.float32, copy=True)
-        noisy[BATTERY_COLUMN] += np.float32(self.sigma * self.rng.standard_normal())
+        # One draw per step whatever the scale, so every profile uses the same stream
+        draw = self.rng.standard_normal()
+        noisy[BATTERY_COLUMN] += np.float32(self.sigma * self.scale(self.flight_step) * draw)
         return noisy
+
+
+def make_noisy_battery(env: gym.Env, cfg, sigma: float) -> NoisyBattery:
+    """NoisyBattery with the run's within-flight profile (env.battery_noise_flight, env.battery_noise_flight_step)."""
+    return NoisyBattery(env, sigma, cfg.env.get("battery_noise_flight"), cfg.env.get("battery_noise_flight_step", 350))
 
 
 def switch_source_mismatches(cfg, source_cfg, learner: str) -> list[str]:

@@ -1,0 +1,14 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, in-flight noise for plain PPO (runs 1a_sharp, 1a_linear): in every flight the policy sees
+# the battery plus noise early on and the exact battery from flight step env.battery_noise_flight_step (sharp or linear,
+# see config/step1/cppo_inflight_noise.yaml). Everything else is 1a (S1a_noisy_bs256).
+defaults:
+  - /experiment/S1a_noisy_bs256
+  - _self_
+env:
+  battery_noise_flight: sharp
+  battery_noise_flight_step: 350
+wandb:
+  run_name: S1a_inflight_bs256_${env.battery_noise_flight}${env.battery_noise_flight_step}_noise${env.battery_noise}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1a_inflight_bs256_${env.battery_noise_flight}${env.battery_noise_flight_step}_noise${env.battery_noise}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, step1, inflight_noise]

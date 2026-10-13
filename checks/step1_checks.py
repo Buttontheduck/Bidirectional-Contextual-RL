@@ -2,6 +2,7 @@
 import contextlib
 import io
 import unittest
+from pathlib import Path
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -380,6 +381,84 @@ class Step1Checks(unittest.TestCase):
                 training.evaluate_schedule(FixedPolicy(steps), cfg, cfg.evaluation.reset_grid)
                 self.assertEqual(made.call_args.args[2], noise)
 
+    def test_inflight_profiles_remove_the_noise_by_flight_step_350(self):
+        def flight_errors(profile):
+            env = NoisyBattery(training.bp.BatteryPlaneEnv(observation_mode="observed"), 0.12, profile, 350)
+            obs, info = env.reset(seed=3)
+            errors = [obs[-1] - info["b0"]]
+            # A gentle pilot that completes the 700-step flight
+            for _ in range(699):
+                obs, _, done, _, info = env.step(np.array([0.3, 0.2], np.float32))
+                errors.append(obs[-1] - info["b"])
+                if done:
+                    break
+            return np.array(errors)
+
+        constant, sharp, linear = (flight_errors(profile) for profile in (None, "sharp", "linear"))
+        self.assertEqual(len(constant), 700)
+        # Sharp: the same noise as constant noise until step 350, then the exact battery
+        np.testing.assert_allclose(sharp[:350], constant[:350], atol=1e-6)
+        self.assertEqual(np.abs(sharp[350:]).max(), 0.0)
+        # Linear: the same draws, scaled by 1 - k / 350, then the exact battery
+        steps = np.arange(350)
+        np.testing.assert_allclose(linear[:350], constant[:350] * (1 - steps / 350), atol=1e-6)
+        self.assertEqual(np.abs(linear[350:]).max(), 0.0)
+        self.assertGreater(np.abs(constant[350:]).max(), 0.1)
+        for profile, step in (("ramp", 350), ("sharp", 0)):
+            with self.assertRaisesRegex(ValueError, "profile must be one of"):
+                NoisyBattery(training.bp.BatteryPlaneEnv(observation_mode="observed"), 0.12, profile, step)
+
+    def test_inflight_configs_scripts_and_report_use_the_profile(self):
+        import report_step0
+        import run_step0
+        from step1_controls import noisy_batteries
+
+        script = plain_ppo_script()
+        for profile in ("sharp", "linear"):
+            cases = [(f"1c_{profile}", config("+step1=cppo_inflight_noise", f"env.battery_noise_flight={profile}", step0=False),
+                      noisy_cppo(), "cppo", training, f"S1c_inflight_{profile}350"),
+                     (f"1a_{profile}", plain_ppo_config("+experiment=S1a_inflight_noise_bs256", f"env.battery_noise_flight={profile}"),
+                      plain_ppo_config("+experiment=S1a_noisy_bs256"), "ppo", script, f"S1a_inflight_bs256_{profile}350")]
+            for condition, cfg, noisy, learner, module, name in cases:
+                with self.subTest(condition=condition):
+                    (training.validate_config if learner == "cppo" else script.validate_ppo)(cfg)
+                    # The noisy oracle with a within-flight profile
+                    for section in (learner, "training", "evaluation"):
+                        self.assertEqual(cfg[section], noisy[section])
+                    env, noisy_env = OmegaConf.to_container(cfg.env), OmegaConf.to_container(noisy.env)
+                    self.assertEqual((env.pop("battery_noise_flight"), noisy_env.pop("battery_noise_flight")), (profile, None))
+                    self.assertEqual(env, noisy_env)
+                    self.assertEqual(cfg.wandb.run_name, f"{name}_noise0.06_gamma0.99_rs0.1_s0")
+                    protocol = report_step0.evaluation_protocol(cfg, condition)
+                    noisy_protocol = report_step0.evaluation_protocol(noisy, condition.split("_")[0])
+                    self.assertEqual({key for key in protocol if protocol[key] != noisy_protocol[key]},
+                                     {"battery_noise_flight", "battery_noise_flight_step"})
+                    # Training and validation both fly the profile
+                    small = OmegaConf.merge(cfg, OmegaConf.create({"training": {"n_envs": 2}}))
+                    train_env = module.make_train_env(small)
+                    eval_env, _, _ = module.make_eval_env(small, list(training.iter_eval_resets(small.evaluation.reset_grid)))
+                    try:
+                        self.assertEqual({(w.profile, w.profile_step) for w in noisy_batteries(train_env) + noisy_batteries(eval_env)},
+                                         {(profile, 350)})
+                    finally:
+                        train_env.close()
+                        eval_env.close()
+        with self.assertRaisesRegex(ValueError, "requires env.battery_noise_flight=None"):
+            report_step0.evaluation_protocol(noisy_cppo("env.battery_noise_flight=sharp"), "1c")
+        with self.assertRaisesRegex(ValueError, "requires env.battery_noise_flight=linear"):
+            report_step0.evaluation_protocol(config("+step1=cppo_inflight_noise", step0=False), "1c_linear")
+        for check, cfg in ((training.validate_config, config("env.battery_noise_flight=sharp")),
+                           (training.validate_config, noisy_cppo("env.battery_noise_flight=ramp")),
+                           (script.validate_ppo, plain_ppo_config("+experiment=S1a_inflight_noise_bs256", "env.battery_noise_flight_step=0"))):
+            with self.assertRaisesRegex(ValueError, "battery_noise_flight"):
+                check(cfg)
+        # The launcher's linear runs switch the profile, the sharp runs keep the config's
+        linear = run_step0.command_for("1b_linear", 0, 1, Path("/tmp/launch"), battery_noise=0.12)
+        sharp = run_step0.command_for("1b_sharp", 0, 1, Path("/tmp/launch"), battery_noise=0.12)
+        self.assertIn("env.battery_noise_flight=linear", linear)
+        self.assertFalse(any(item.startswith("env.battery_noise_flight=") for item in sharp))
+        self.assertEqual(plain_ppo_config(*[i for i in linear[2:] if not i.startswith("hydra.")]).env.battery_noise_flight, "linear")
+
     def test_launcher_runs_the_noise_screen(self):
         import run_step0
 
@@ -411,6 +490,17 @@ class Step1Checks(unittest.TestCase):
             for line, label in zip(lines, expected):
                 self.assertIn(label, line)
                 self.assertEqual(line.count("--run "), 4)
+        # In-flight runs: report_step0.py refuses to mix profiles, so one report per noise level and profile
+        runs = [done(f"1{x}_{profile}", s, None, noise) for noise in (0.06, 0.12) for profile in ("linear", "sharp")
+                for x in "ac" for s in (0, 1)]
+        lines = run_step0.report_commands(runs, [None], [0.06, 0.12], args.output)
+        self.assertEqual([line.split(":")[0] for line in lines],
+                         [f"Report (battery noise {noise}, {profile} in-flight noise)" for noise in ("0.06", "0.12")
+                          for profile in ("sharp", "linear")])
+        for line, (noise, profile) in zip(lines, [(n, p) for n in ("0.06", "0.12") for p in ("sharp", "linear")]):
+            self.assertEqual(line.count("--run "), 4)
+            self.assertEqual(line.count(f"_{profile} "), 4)
+            self.assertTrue(line.endswith(f"step0_report_noise{noise}_{profile}.json"))
 
 
 if __name__ == "__main__":

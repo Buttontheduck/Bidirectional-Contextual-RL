@@ -17,6 +17,11 @@ env:
   # Training step from which the battery is exact again (step 1's early-noise runs: noise first, then the true
   # battery, in training and validation). null = the noise never switches off.
   battery_noise_until: null
+  # Within-flight noise profile (step 1's in-flight runs, like an encoder that identifies the battery during each
+  # flight): null = the same noise all flight; sharp = noise until flight step battery_noise_flight_step, then the
+  # exact battery; linear = noise shrinking evenly to 0 at that step.
+  battery_noise_flight: null
+  battery_noise_flight_step: 350
   # Use null to keep the environment's default crash penalty (300).
   crash_penalty: null
   # Extra BatteryPlaneVec constructor arguments, identical keys to the SAC config, so both

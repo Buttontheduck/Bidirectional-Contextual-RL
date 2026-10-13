@@ -8,6 +8,7 @@ plus noise), and 1a_switch, 1b_switch, 1c_switch are step 1's late switch (the f
 more steps with noise; scored on 0.5M-1M after the switch); each is scored the same way, in a report of its own setting
 (the protocol includes the battery noise and the schedule). 1a_early, 1b_early, 1c_early see the noise only until
 env.battery_noise_until (500k), then the true battery; scored like step 0, the final validation with the true battery.
+1a_sharp ... 1c_linear see the noise early in every flight and the exact battery from flight step 350 (in-flight noise).
 
 Example (repeat --run for every condition and seed):
     python report_step0.py --run 0a runs_ppo/<id>/config.yaml runs_ppo/<id> \
@@ -33,13 +34,16 @@ import main_battery_plane_contextual_ppo as training
 from contextual_ppo.torch_layers import XLSTMRolloutEncoder
 
 
-CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch", "1a_early", "1b_early", "1c_early")
+CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch", "1a_early", "1b_early", "1c_early",
+              "1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear")
 # Step 1's noisy oracle: the step 0 run each condition repeats with noise on the battery
 NOISY_REPEATS = {"1a": "0a", "1b": "0b", "1c": "0c"}
 # Step 1's late switch: the step 0 run whose final model each condition keeps training
 SWITCH_SOURCES = {"1a_switch": "0a", "1b_switch": "0b", "1c_switch": "0c"}
 # Step 1's early noise: the step 0 run each condition repeats with noise on the battery until a step, then the true one
 EARLY_NOISE = {"1a_early": "0a", "1b_early": "0b", "1c_early": "0c"}
+# Step 1's in-flight noise: the step 0 run each condition repeats with noise early in every flight (profile: sharp, linear)
+INFLIGHT_NOISE = {f"1{x}_{profile}": (f"0{x}", profile) for x in "abc" for profile in ("sharp", "linear")}
 EVAL_FREQUENCY = 50_000
 # Requested steps, scored window and the steps of a finished run (complete rollouts of 8 x 512): runs from scratch
 # (step 0, A, noisy oracle) and the late switch, whose steps count from the switch
@@ -64,18 +68,30 @@ VALIDATION_GRID = {
 }
 
 
+def run_kind(condition: str) -> str:
+    """The step 0 run (0a, 0b, 0c) a step 1 condition repeats with some battery noise; A and step 0 runs themselves."""
+    if condition in INFLIGHT_NOISE:
+        return INFLIGHT_NOISE[condition][0]
+    return NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition) or condition
+
+
 def evaluation_protocol(cfg, condition: str) -> dict:
     """Reject mislabeled controls or a different Step 0 validation protocol."""
     if condition not in CONDITIONS:
         raise ValueError(f"condition must be one of {CONDITIONS}")
     # A noisy oracle repeats a step 0 run with noise on the visible battery
-    kind = NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition) or condition
+    kind = run_kind(condition)
     noise = float(cfg.env.get("battery_noise", 0.0))
     until = cfg.env.get("battery_noise_until")
-    if (condition in NOISY_REPEATS or condition in EARLY_NOISE) and noise <= 0:
+    flight = cfg.env.get("battery_noise_flight")
+    noisy_conditions = {*NOISY_REPEATS, *EARLY_NOISE, *INFLIGHT_NOISE}
+    if condition in noisy_conditions and noise <= 0:
         raise ValueError(f"{condition} requires env.battery_noise > 0")
-    if condition not in NOISY_REPEATS and condition not in SWITCH_SOURCES and condition not in EARLY_NOISE and noise > 0:
+    if condition not in noisy_conditions and condition not in SWITCH_SOURCES and noise > 0:
         raise ValueError(f"{condition} requires no battery noise")
+    expected_flight = INFLIGHT_NOISE[condition][1] if condition in INFLIGHT_NOISE else None
+    if flight != expected_flight:
+        raise ValueError(f"{condition} requires env.battery_noise_flight={expected_flight}, got {flight}")
     if (until is not None) != (condition in EARLY_NOISE):
         raise ValueError(f"{condition} " + ("requires env.battery_noise_until (noise first, then the true battery)"
                                             if condition in EARLY_NOISE else "must not switch the battery noise off"))
@@ -127,7 +143,8 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     settings = OmegaConf.to_container(learner, resolve=True)
     # Configs from before reward_scale trained on unscaled rewards
     settings.setdefault("reward_scale", 1.0)
-    return {"environment": effective_env, "battery_noise": noise, "battery_noise_until": until, "schedule": schedule,
+    return {"environment": effective_env, "battery_noise": noise, "battery_noise_until": until, "battery_noise_flight": flight,
+            "battery_noise_flight_step": cfg.env.get("battery_noise_flight_step") if flight else None, "schedule": schedule,
             "reset_grid": VALIDATION_GRID,
             "deterministic": True, "frequency": EVAL_FREQUENCY,
             "shared_ppo_settings": {key: settings[key] for key in SHARED_PPO_SETTINGS}}
@@ -222,7 +239,7 @@ def main() -> None:
             raise ValueError(f"Checkpoint training duration or seed does not match the supplied config: {directory}")
         if (model.n_envs, model.n_steps, model.n_epochs) != (8, 512, 10):
             raise ValueError(f"Checkpoint rollout/epoch settings do not match Step 0: {directory}")
-        kind = NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition) or condition
+        kind = run_kind(condition)
         if kind == "0c":
             if model.n_minibatches != 4 or not isinstance(model.policy, training.TrueBatteryPolicy):
                 raise ValueError(f"{condition} checkpoint must use the oracle policy and four minibatches: {directory}")

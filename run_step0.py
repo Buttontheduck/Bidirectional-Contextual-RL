@@ -18,6 +18,8 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions 1a_switch 1b_switch 1c_switch --battery-noises 0 0.03 0.06 \
         --from-runs runs_step0/<step 0 launch>/runs.json ...      # step 1: late switch from the step 0 models
     python run_step0.py --conditions 1a_early 1b_early 1c_early --battery-noises 0.03 0.06 0.12   # step 1: early noise
+    python run_step0.py --conditions 1a_sharp 1b_sharp 1c_sharp 1a_linear 1b_linear 1c_linear \
+        --battery-noises 0.06 0.12 0.25                     # step 1: in-flight noise (gone by flight step 350)
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
@@ -61,12 +63,22 @@ CONDITIONS = {
     "1a_early": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_early_noise_bs256", "ppo"),
     "1b_early": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_early_noise_bs1024", "ppo"),
     "1c_early": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_early_noise", "cppo"),
+    # Step 1, in-flight noise: noise early in every flight, the exact battery from flight step 350 (sharp or linear)
+    "1a_sharp": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_inflight_noise_bs256", "ppo"),
+    "1b_sharp": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_inflight_noise_bs1024", "ppo"),
+    "1c_sharp": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_inflight_noise", "cppo"),
+    "1a_linear": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_inflight_noise_bs256", "ppo"),
+    "1b_linear": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_inflight_noise_bs1024", "ppo"),
+    "1c_linear": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_inflight_noise", "cppo"),
 }
+# Extra overrides of a condition (the in-flight configs default to the sharp profile)
+CONDITION_OVERRIDES = {name: ["env.battery_noise_flight=linear"] for name in ("1a_linear", "1b_linear", "1c_linear")}
 STEP0_CONDITIONS = ["0a", "0b", "0c"]
 NOISY_CONDITIONS = ["1a", "1b", "1c"]
 # Late switch -> the step 0 run whose final model it continues (same seed)
 SWITCH_SOURCES = {"1a_switch": "0a", "1b_switch": "0b", "1c_switch": "0c"}
 EARLY_NOISE_CONDITIONS = ["1a_early", "1b_early", "1c_early"]
+INFLIGHT_CONDITIONS = ["1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear"]
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -128,7 +140,7 @@ def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bo
     script, experiment, learner = CONDITIONS[condition]
     command = [
         sys.executable, str(ROOT / script), experiment, f"training.seed={seed}",
-        f"training.num_threads={threads}", "training.num_interop_threads=1",
+        *CONDITION_OVERRIDES.get(condition, []), f"training.num_threads={threads}", "training.num_interop_threads=1",
         # Hydra's job log; the training scripts never change directory
         f"hydra.run.dir={json.dumps(str(output / 'hydra' / launch_name(condition, seed, reward_scale, battery_noise)))}",
     ]
@@ -255,7 +267,7 @@ def parse_args(argv=None):
     if noises is not None:
         if min(noises) < 0 or len({f"{noise:g}" for noise in noises}) != len(noises):
             parser.error("Battery noises must be distinct and non-negative")
-        step1 = NOISY_CONDITIONS + list(SWITCH_SOURCES) + EARLY_NOISE_CONDITIONS
+        step1 = NOISY_CONDITIONS + list(SWITCH_SOURCES) + EARLY_NOISE_CONDITIONS + INFLIGHT_CONDITIONS
         if not set(args.conditions) <= set(step1):
             parser.error(f"--battery-noises applies to the step 1 conditions {step1} only")
         if 0 in noises and not set(args.conditions) <= set(SWITCH_SOURCES):
@@ -332,26 +344,37 @@ def main(argv=None) -> int:
 
 def report_commands(done: list[dict], scales: list, noises: list, output: Path) -> list[str]:
     """
-    report_step0.py compares runs with the same settings: one command per reward scale and battery noise, e.g.
-    "Report (battery noise 0.06): python report_step0.py --run 1a ... --output .../step0_report_noise0.06.json".
+    report_step0.py compares runs with the same settings: one command per reward scale, battery noise and in-flight
+    profile, e.g. "Report (battery noise 0.06): python report_step0.py --run 1a ... --output .../step0_report_noise0.06.json".
     """
+    def profile(condition):
+        return condition.split("_")[1] if condition in INFLIGHT_CONDITIONS else None
+
     lines = []
     for scale in scales:
         for noise in noises:
-            group = [r for r in done if r["reward_scale"] == scale and r["battery_noise"] == noise]
-            if not group:
-                continue
-            labels, suffix = [], ""
-            if scale is not None:
-                labels.append(f"reward scale {scale:g}")
-                suffix += f"_rs{scale:g}"
-            if noise is not None:
-                labels.append(f"battery noise {noise:g}")
-                suffix += f"_noise{noise:g}"
-            label = f" ({', '.join(labels)})" if labels else ""
-            report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)
-            lines.append(f"Report{label}: python report_step0.py {report} --output {output / f'step0_report{suffix}.json'}")
+            for flight in (None, "sharp", "linear"):
+                group = [r for r in done if r["reward_scale"] == scale and r["battery_noise"] == noise
+                         and profile(r["condition"]) == flight]
+                if group:
+                    lines.append(report_command(group, scale, noise, flight, output))
     return lines
+
+
+def report_command(group: list[dict], scale, noise, flight, output: Path) -> str:
+    labels, suffix = [], ""
+    if scale is not None:
+        labels.append(f"reward scale {scale:g}")
+        suffix += f"_rs{scale:g}"
+    if noise is not None:
+        labels.append(f"battery noise {noise:g}")
+        suffix += f"_noise{noise:g}"
+    if flight is not None:
+        labels.append(f"{flight} in-flight noise")
+        suffix += f"_{flight}"
+    label = f" ({', '.join(labels)})" if labels else ""
+    report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)
+    return f"Report{label}: python report_step0.py {report} --output {output / f'step0_report{suffix}.json'}"
 
 
 if __name__ == "__main__":

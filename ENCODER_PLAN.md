@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch and early-noise tests done (2026-10-13, results below); the rest of steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done (2026-10-13, results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -276,6 +276,31 @@ nohup python run_step0.py --conditions 1a_early 1b_early 1c_early --battery-nois
 - **No lasting damage.** After 500k noisy steps, even at 0.12 (about the A rerun's early encoder error), every learner ends as good as with the true battery from the start (270–334 against 275–282). Some runs end higher (CPPO at 0.03: 334, seeds 323–347), possibly from extra exploration, but three seeds cannot tell.
 - **Fast recovery.** Right at the switch the policies score 40–137 with the true battery; 250k steps later they are at 202–384, close to step 0 at that point, and they have caught up by 1M. They then use the battery (throttle reacts to it as much as in step 0) and do not fly like blind agents.
 - **The order matters.** Noisy first, then accurate: the policy fully adapts. Accurate first, then noisy (late switch) or noisy throughout: it fails at 0.06. So an encoder may be poor early in training; what matters is how accurate it ends up. Here the switch goes to the exact battery; next, end at 0.03 or 0.06 instead of 0, closer to a real encoder, to find how accurate the late estimate must be.
+
+**In-flight noise (2026-10-13).** Closer to how an encoder behaves inside each flight: it can't know the battery at take-off and works it out as the flight goes on. In every flight, in training and validation, the battery is noisy early in the flight and exact from flight step 350 (the middle of a 700-step flight). There are two versions (`env.battery_noise_flight`): **sharp**, full noise until step 350 and then the exact battery, and **linear**, noise that shrinks evenly to 0 at step 350. Both use the same random draws as constant noise (`step1_controls.NoisyBattery`), so the only difference is how much of the noise is left at each step. Runs 1a/1b/1c_sharp and 1a/1b/1c_linear (`ppo/configs/experiment/S1a_inflight_noise_bs256.yaml`, `S1b_inflight_noise_bs1024.yaml`, `config/step1/cppo_inflight_noise.yaml`) are 1a, 1b and 1c with that profile: 2M steps, scored on 1.5M–2M like step 0. W&B names: `…_inflight…_<sharp|linear>350_noise<σ>_gamma0.99_rs0.1_s<seed>`. The question: if the battery is noisy only early in each flight, does the policy still learn, and does it fly safely until the battery becomes clear? Compare with noise throughout (1a–1c, which fail) and none (step 0).
+
+```bash
+# 2 profiles x 3 noise levels (0.06, 0.12, 0.25) x 1a, 1b, 1c x seeds 0-2 = 54 runs of 2M steps, 27 at a time, about 30-35 minutes
+nohup python run_step0.py --conditions 1a_sharp 1b_sharp 1c_sharp 1a_linear 1b_linear 1c_linear --battery-noises 0.06 0.12 0.25 --jobs 27 --threads 1 > run_inflight.log 2>&1 &
+```
+
+**In-flight noise results (2026-10-13).** Late scores (1.5M–2M), seeds 0–2 (W&B groups `…_inflight…_<sharp|linear>350_noise<σ>_gamma0.99_rs0.1`). One report per noise level and profile (`step0_report_noise<σ>_<profile>.json`).
+
+| | No noise (step 0) | Noise throughout (0.06 / 0.12) | Sharp 0.06 | Linear 0.06 | Sharp 0.12 | Linear 0.12 | Sharp 0.25 | Linear 0.25 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0a (plain PPO, batch 256) | 276 | 73 / 64 | 257 | 284 | 53* | 300 | 129 | 244 |
+| 0b (plain PPO, batch 1024) | 275 | 71 / 51 | 242 | 351 | 224 | 292 | 173 | 213 |
+| 0c (CPPO) | 282 | 122 / 53 | 174 | 309 | 188 | 268 | 154 | 183 |
+| Flights completed | 85–89% | 2–31% | 41–67% | 78–85% | 43–69% | 70–83% | 54–61% | 39–67% |
+
+\* One seed broke down by 200k steps (full throttle, battery empty after about 100 steps); the other two score 228 and 229.
+
+- **Noise only early in the flight hurts far less than noise all flight.** Every in-flight run beats noise throughout (51–122).
+- **Fading noise (linear) is as good as the true battery** at 0.06 and 0.12 (268–351 against 275–282), even starting at 0.12, about the A rerun's early encoder error. At 0.25 it keeps 183–244.
+- **Noise that stays full until mid-flight (sharp) costs a lot,** even at 0.06 (174–257). Flights starting at 30% fail almost always (25–27 of 27, against 1 of 27 with the true battery), and many at 40%: the battery runs out, mostly before step 350 (median 265–320 steps). With the true battery a policy starting low flies gently to save energy (throttle 0.08 at 20% charge against 0.67 at 70%). With sharp noise it can't tell 30% from 50% from one noisy reading, so it flies normally (throttle 0.70–0.96 at 20%), and the exact reading comes too late.
+- **So what matters is how early in each flight the estimate becomes good.** A plane starting low must decide to save energy in about the first 250 steps. An estimate that starts poor and improves steadily, as a recurrent encoder's should, is fine; one that stays poor until mid-flight is not.
+- Caveats: the noise is fresh at every step and these policies have no memory, so they can't average readings, unlike a real encoder whose error changes smoothly. Linear 0.06 scoring above the true battery (0b: 351) matches early noise, possibly extra exploration, but three seeds can't tell.
+- Next: measure how the A rerun's encoder error changes over a flight, step by step: is it like sharp or linear, and how large is it around step 250?
 
 ### 2. Run every condition through plain PPO
 

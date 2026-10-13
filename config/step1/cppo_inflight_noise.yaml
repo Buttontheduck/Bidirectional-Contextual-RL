@@ -1,0 +1,20 @@
+# @package _global_
+# Step 1 of ENCODER_PLAN.md, in-flight noise for CPPO (runs 1c_sharp, 1c_linear): like an encoder that identifies the
+# battery during each flight. In every flight, in training and validation, the policy sees the battery plus noise
+# (env.battery_noise) early on and the exact battery from flight step env.battery_noise_flight_step (350, the middle of a
+# 700-step flight): sharp = full noise until then; linear = noise shrinking evenly to 0 at that step. Everything else is
+# 1c: 2M steps from scratch, scored on 1.5M-2M like step 0 (0c: no noise; 1c: noise all flight).
+#
+#   python run_step0.py --conditions 1a_sharp 1b_sharp 1c_sharp 1a_linear 1b_linear 1c_linear --battery-noises 0.06 0.12
+defaults:
+  - /step1/cppo_noisy_oracle
+  - _self_
+experiment_id: S1c_inflight
+env:
+  battery_noise_flight: sharp
+  battery_noise_flight_step: 350
+wandb:
+  # With the inherited "cppo_" prefix: cppo_S1c_inflight_sharp350_noise0.12_gamma0.99_rs0.1_s0
+  run_name: S1c_inflight_${env.battery_noise_flight}${env.battery_noise_flight_step}_noise${env.battery_noise}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S1c_inflight_${env.battery_noise_flight}${env.battery_noise_flight_step}_noise${env.battery_noise}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, step1, inflight_noise]
