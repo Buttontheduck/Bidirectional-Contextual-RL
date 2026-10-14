@@ -70,9 +70,72 @@ class IdealBatteryEstimator:
         self.sim = bp.BatteryPlaneVec(n_envs=len(self.b0), observation_mode="hidden", seed=0, auto_reset=False,
                                       **env_kwargs)
         self.sim.sigma = 0.0
+        # Steps at which the plane flew on although every candidate's battery was empty (grid rounding right before a
+        # battery-empty ending): the constraint is skipped there instead of ruling out everything
+        self.constraint_skips = 0
+
+    def _check(self, observation) -> np.ndarray:
+        obs = np.asarray(observation, dtype=float)
+        if obs.shape != (4,):
+            raise ValueError("The ideal estimator reads hidden-mode observations [y, vx + noise, vy, tau], never the battery")
+        return obs
+
+    def _posterior(self) -> tuple[float, float]:
+        w = np.exp(self.log_w - self.log_w.max())
+        w /= w.sum()
+        mean = float(w @ self.sim.b)
+        return mean, float(np.sqrt(max(w @ (self.sim.b - mean) ** 2, 0.0)))
+
+    def start(self, observation) -> tuple[float, float]:
+        """
+        A new flight: weigh every candidate by the first speed reading.
+
+        :param observation: o_0, the hidden-mode observation at the reset
+        :return: The posterior mean and std of b_0
+        """
+        obs = self._check(observation)
+        sim = self.sim
+        sim.b0[:], sim.b[:], sim.vx[:] = self.b0, self.b0, self.vx0
+        self.log_w = -0.5 * ((obs[1] * self.v_ref - sim.vx) / self.sigma) ** 2
+        self.last, self.t, self.vy_mismatch = obs, 0, None
+        return self._posterior()
+
+    def update(self, action, observation, alive: bool = True) -> tuple[float, float]:
+        """
+        One step: replay every candidate with the executed action from the last observed altitude and climb rate,
+        and weigh it by the new observation.
+
+        :param action: a_t, the executed action after the last observation
+        :param observation: o_{t+1}
+        :param alive: False for the final observation of a flight (the plane may have just run out of battery),
+            True while it flies on, which rules out every candidate with an empty battery
+        :return: The posterior mean and std of b_{t+1}
+        """
+        obs = self._check(observation)
+        sim, n = self.sim, len(self.b0)
+        y, vy = self.last[0] * self.y_ref, self.last[2] * self.v_ref
+        sim.y[:], sim.vy[:], sim.t[:] = y, vy, self.t
+        sim.step(np.broadcast_to(np.asarray(action, dtype=float), (n, 2)))
+        vy_error = obs[2] * self.v_ref - sim.vy
+        self.vy_mismatch = float(np.abs(vy_error).min())
+        self.log_w = (self.log_w - 0.5 * ((obs[1] * self.v_ref - sim.vx) / self.sigma) ** 2
+                      - 0.5 * (vy_error / self.vy_tolerance) ** 2)
+        if alive:
+            # The plane flies on: an empty battery is impossible
+            empty = sim.b <= 0.0
+            if empty.all():
+                self.constraint_skips += 1
+            else:
+                self.log_w[empty] = -np.inf
+        if not np.isfinite(self.log_w.max()):
+            raise RuntimeError(f"No candidate explains the flight at step {self.t + 1}")
+        self.last, self.t = obs, self.t + 1
+        return self._posterior()
 
     def estimate(self, observations, actions) -> dict:
         """
+        A whole flight at once (start, then one update per action).
+
         :param observations: [K, 4] hidden-mode observations o_0..o_{K-1} of one flight (the plane alive at each)
         :param actions: [K-1, 2] (or [K, 2]) executed actions, a_t taken after o_t
         :return: estimates [K] (posterior mean of b_t), stds [K] (posterior std), vy_mismatch [K-1] (the smallest
@@ -84,32 +147,14 @@ class IdealBatteryEstimator:
             raise ValueError("The ideal estimator reads hidden-mode observations [y, vx + noise, vy, tau], never the battery")
         if acts.ndim != 2 or acts.shape[1] != 2 or len(acts) < len(obs) - 1:
             raise ValueError("Need one executed action after every observation but the last")
-        y, vx_reading, vy = obs[:, 0] * self.y_ref, obs[:, 1] * self.v_ref, obs[:, 2] * self.v_ref
-        sim, n = self.sim, len(self.b0)
-        sim.b0[:], sim.b[:], sim.vx[:] = self.b0, self.b0, self.vx0
-        log_w = -0.5 * ((vx_reading[0] - sim.vx) / self.sigma) ** 2
-        estimates, stds, mismatch = [], [], []
-        for t in range(len(obs)):
-            w = np.exp(log_w - log_w.max())
-            w /= w.sum()
-            mean = float(w @ sim.b)
+        mean, std = self.start(obs[0])
+        estimates, stds, mismatch = [mean], [std], []
+        for t in range(1, len(obs)):
+            mean, std = self.update(acts[t - 1], obs[t])
             estimates.append(mean)
-            stds.append(float(np.sqrt(max(w @ (sim.b - mean) ** 2, 0.0))))
-            if t == len(obs) - 1:
-                break
-            # Replay one step of every candidate from the observed altitude and climb rate
-            sim.y[:], sim.vy[:], sim.t[:] = y[t], vy[t], t
-            sim.step(np.broadcast_to(acts[t], (n, 2)))
-            vy_error = vy[t + 1] - sim.vy
-            mismatch.append(float(np.abs(vy_error).min()))
-            log_w = (log_w - 0.5 * ((vx_reading[t + 1] - sim.vx) / self.sigma) ** 2
-                     - 0.5 * (vy_error / self.vy_tolerance) ** 2)
-            # The plane flies on: an empty battery is impossible
-            log_w[sim.b <= 0.0] = -np.inf
-            if not np.isfinite(log_w.max()):
-                raise RuntimeError(f"No candidate explains the flight at step {t + 1}")
+            stds.append(std)
+            mismatch.append(self.vy_mismatch)
         return {"estimates": estimates, "stds": stds, "vy_mismatch": mismatch}
-
 
 def estimate_flight(env_kwargs: dict, observations: list, actions: list, grid: dict) -> dict:
     return IdealBatteryEstimator(env_kwargs, **grid).estimate(observations, actions)

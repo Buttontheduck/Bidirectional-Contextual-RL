@@ -56,6 +56,7 @@ from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights,
 )
 # Step 1's noisy oracle: the observed battery plus noise, as in Contextual_PPO
+from context_wrapper import context_source_from, validate_context, wrap_context  # noqa: E402
 from step1_controls import (  # noqa: E402
     FLIGHT_PROFILES, BatteryNoiseSwitch, battery_noise_at, make_noisy_battery, switch_source_mismatches,
 )
@@ -169,8 +170,9 @@ def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | 
     n_envs = int(cfg.training.n_envs)
     factories = [factory(index) for index in range(n_envs)]
     if str(cfg.training.vec_env).lower() == "subproc" and n_envs > 1:
-        return SubprocVecEnv(factories, start_method="spawn")
-    return DummyVecEnv(factories)
+        return wrap_context(cfg, SubprocVecEnv(factories, start_method="spawn"), kwargs)
+    # cfg.context: a frozen battery estimate appended to the observations (context_wrapper.py), none by default
+    return wrap_context(cfg, DummyVecEnv(factories), kwargs)
 
 
 def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]], battery_noise: float | None = None):
@@ -185,7 +187,8 @@ def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]], 
     env.action_space.seed(int(cfg.training.seed) + 1)
     env.reset()
     scheduler.rewind()   # the line above consumed the first entry; every evaluation rewinds anyway
-    return DummyVecEnv([lambda: env]), scheduler, raw_env
+    # The same frozen context as in training (context_wrapper.py)
+    return wrap_context(cfg, DummyVecEnv([lambda: env]), env_kwargs_from(cfg)), scheduler, raw_env
 
 
 def validate_eval_reset_grid(reset_grid: DictConfig) -> None:
@@ -280,6 +283,7 @@ def validate_ppo(cfg: DictConfig) -> None:
     if set(cfg.evaluation.reset_grid.eval_seeds) & training_seeds:
         raise ValueError("Training and evaluation seeds must be disjoint")
     initial_model_from(cfg)   # a late switch must name the model it continues
+    validate_context(cfg, env_kwargs_from(cfg))
 
 
 def initial_model_from(cfg: DictConfig) -> Path | None:
@@ -371,6 +375,7 @@ def main(cfg: DictConfig) -> None:
         f" | eval episodes: {len(eval_reset_schedule)}"
         f" | gamma={cfg.ppo.gamma} reward_scale={cfg.ppo.get('reward_scale', 1.0)} battery_noise={cfg.env.get('battery_noise', 0.0)}"
         f" until={cfg.env.get('battery_noise_until')} flight={cfg.env.get('battery_noise_flight')}"
+        f" | context={context_source_from(cfg)} (observation width {train_env.observation_space.shape[0]})"
     )
     run.config.update({"effective_env": core._kw, "algorithm": "PPO", "torch_threads": torch.get_num_threads(),
                        "init_model": None if initial_model_from(cfg) is None else str(initial_model_from(cfg)),

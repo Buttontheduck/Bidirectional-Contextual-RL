@@ -33,6 +33,7 @@ from omegaconf import OmegaConf
 from stable_baselines3 import PPO
 import torch
 
+from context_wrapper import context_protocol
 import main_battery_plane_contextual_ppo as training
 from contextual_ppo.torch_layers import XLSTMRolloutEncoder
 
@@ -98,6 +99,10 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     expected_flight = INFLIGHT_NOISE[condition][1] if condition in INFLIGHT_NOISE else None
     if flight != expected_flight:
         raise ValueError(f"{condition} requires env.battery_noise_flight={expected_flight}, got {flight}")
+    # A frozen context appended to the observation (context_wrapper.py): none in every condition so far
+    context = context_protocol(cfg)
+    if context is not None:
+        raise ValueError(f"{condition} requires no frozen context (context.source=none)")
     if (until is not None) != (condition in EARLY_NOISE):
         raise ValueError(f"{condition} " + ("requires env.battery_noise_until (noise first, then the true battery)"
                                             if condition in EARLY_NOISE else "must not switch the battery noise off"))
@@ -151,7 +156,8 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     settings = OmegaConf.to_container(learner, resolve=True)
     # Configs from before reward_scale trained on unscaled rewards
     settings.setdefault("reward_scale", 1.0)
-    return {"environment": effective_env, "battery_noise": noise, "battery_noise_until": until, "battery_noise_flight": flight,
+    return {"environment": effective_env, "context": context, "battery_noise": noise, "battery_noise_until": until,
+            "battery_noise_flight": flight,
             "battery_noise_flight_step": cfg.env.get("battery_noise_flight_step") if flight else None, "schedule": schedule,
             "reset_grid": VALIDATION_GRID,
             "deterministic": True, "frequency": EVAL_FREQUENCY,

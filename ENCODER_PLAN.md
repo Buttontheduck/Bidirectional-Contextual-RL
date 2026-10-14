@@ -504,6 +504,31 @@ A frozen encoder is a fixed function of the history. So it can sit in a VecEnv w
 
 Then every condition runs on the same SB3 PPO setup as the p01–p04 baselines. This removes the CPPO-specific differences, including the 4× fewer gradient steps and the recurrent minibatching. The oracle condition then reduces to the observed baseline, which gives a built-in check: it should reproduce about 212 final and about 360 at peak. Keep one CPPO frozen-encoder run as a bridge back to the A–F results.
 
+**The context wrapper (implemented 2026-10-14).** `context_wrapper.py` holds `ContextVecEnv`, a VecEnv wrapper for plain PPO.
+
+- **What it does:**
+  - It keeps one memory of a frozen context source per environment.
+  - At every step it feeds the source the new hidden-mode observation and the action just executed, clipped as the environment executes it.
+  - Where an episode starts, the memory is reset and the previous action is zero, as in CPPO's collector.
+  - It appends the context to every observation, including each episode's final observation (`terminal_observation`), which continues the old memory before the next episode starts fresh.
+- **Settings:** the plain-PPO config's `context:` section (`ppo/configs/battery_plane_ppo.yaml`). The source is chosen with `context.source`:
+  - `none`: the default, plain PPO unchanged.
+  - `ideal`: the ideal estimator, made step-by-step (`IdealBatteryEstimator.start` / `update`, bit-identical to the whole-flight version). It appends the estimate, and its std with `context.include_std`. Training uses a coarser grid (101 × 301 candidates, climb-rate tolerance 0.01 m/s).
+  - `encoder`: the frozen encoder of a saved Contextual_PPO model (`context.encoder_model`), giving z_t as that model's actor and critic read it. For example A's encoder, for the "freeze A's encoder, train a fresh policy" test.
+  - `true_battery`: the true battery from the env infos, a check only.
+- **Where it applies:**
+  - Both scripts' validation environments wrap with the same source, so `report_step0.py` validates such runs correctly.
+  - The report's protocol now includes the context, and every existing condition requires none.
+  - `validate_ppo` requires hidden mode and rejects the noisy battery alongside a context. Contextual_PPO refuses a `context` section, since it has its own encoder.
+- **Checks (`checks.step2_checks`):**
+  - With the true battery, hidden mode plus the wrapper reproduces observed mode exactly: observations, rewards, episode ends and terminal observations, across automatic resets.
+  - The ideal and encoder contexts equal the offline estimator and the encoder run over each episode.
+  - The encoder stays frozen while PPO trains on top.
+  - PPO saves, reloads and is validated through the wrapper.
+  - Wrong settings are refused.
+- **Speed:** a full-size run with the ideal context trains at about 1,000 steps per second, and a validation of 18 flights takes about 11 s. That is about 40 minutes per 2M-step run alone, and about 0.6 GB of memory per run.
+
+
 ### 3. Pilots
 
 The physics sets the requirements for the data. The battery shows up in speed only while the cruise motor is at its cap. The environment's own report says one capped speed reading pins `b` to ±0.37, and about 14 capped steps get it to ±0.1. The encoder also has to carry its estimate through stretches where the motor is below the cap.

@@ -94,6 +94,23 @@ ppo:
   log_std_init: 0.0
   verbose: 1
 
+context:
+  # A frozen battery estimate appended to the observation, so plain PPO trains on [o_t, z_t] (context_wrapper.py,
+  # ENCODER_PLAN.md step 2). Hidden mode only. none: plain PPO (p01-p04, step 0, step 1).
+  #   ideal         the ideal estimator (step1_ideal_estimator.py): the best estimate any encoder could make
+  #   encoder       the frozen encoder of a saved Contextual_PPO model (encoder_model)
+  #   true_battery  the true battery from the env infos: reproduces observed mode, a check only
+  source: none
+  # ideal: also append the estimate's std (the policy then knows how sure the estimate is)
+  include_std: false
+  # ideal: candidate grid of starting batteries x starting speeds, coarser than the analysis default (201 x 601) so
+  # that training stays fast; the climb-rate tolerance (m/s) matches the coarser speed spacing (0.1 m/s)
+  b_points: 101
+  vx_points: 301
+  vy_tolerance: 0.01
+  # encoder: a Contextual_PPO final_model.zip whose encoder is frozen and read by this run
+  encoder_model: null
+
 evaluation:
   # In ENVIRONMENT steps, exactly like the SAC config (the script converts it to SB3's
   # per-call frequency internally). Each evaluation is 18 episodes x 700 steps = 12,600 steps

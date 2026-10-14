@@ -58,6 +58,7 @@ from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS  # no
 from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights, terminal_outcome,
 )
+from context_wrapper import context_source_from as frozen_context_source, wrap_context  # noqa: E402
 from step0_oracle import NoContextPolicy, TrueBatteryPolicy  # noqa: E402
 from step1_controls import (  # noqa: E402
     FLIGHT_PROFILES, BatteryNoiseSwitch, battery_noise_at, make_noisy_battery, switch_source_mismatches,
@@ -245,7 +246,8 @@ def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]], 
     env.action_space.seed(int(cfg.training.seed) + 1)
     env.reset()
     scheduler.rewind()   # the line above consumed the first entry; every evaluation rewinds anyway
-    return DummyVecEnv([lambda: env]), scheduler, raw_env
+    # A plain-PPO run with a frozen context (context_wrapper.py, validated here by report_step0.py) reads it too
+    return wrap_context(cfg, DummyVecEnv([lambda: env]), env_kwargs_from(cfg)), scheduler, raw_env
 
 
 def validate_eval_reset_grid(reset_grid: DictConfig) -> None:
@@ -388,6 +390,9 @@ def validate_config(cfg: DictConfig) -> None:
         raise ValueError(f"cppo.encoder_objective must be one of {ContextualPPO.ENCODER_OBJECTIVES}")
     context_source = context_source_from(cfg)
     initial_model_from(cfg)   # a late switch must name the model it continues
+    if frozen_context_source(cfg) != "none":
+        raise ValueError("context.source (context_wrapper.py) is for plain PPO; Contextual_PPO has its own encoder "
+                         "(cppo.context_source)")
     if context_source not in CONTEXT_SOURCES:
         raise ValueError(f"cppo.context_source must be one of {CONTEXT_SOURCES}")
     if context_source == "oracle" and cfg.env.observation_mode != "observed":
