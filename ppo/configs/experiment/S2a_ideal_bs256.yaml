@@ -1,0 +1,17 @@
+# @package _global_
+# Step 2 of ENCODER_PLAN.md, run 2a_ideal: the memoryless control 0a_blind (plain PPO in hidden mode, batch 256) with the
+# ideal estimator's battery estimate appended to every observation (context_wrapper.py): the best estimate any encoder
+# could make from the hidden observations and actions, frozen. It gives the best score an agent that can't see the
+# battery can reach with this learner: the target for a learned encoder.
+#
+#   python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7
+defaults:
+  - /experiment/S0a_blind_bs256
+  - _self_
+context:
+  source: ideal
+  include_std: false
+wandb:
+  run_name: S2a_ideal_bs256_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S2a_ideal_bs256_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, step2, ideal_context]

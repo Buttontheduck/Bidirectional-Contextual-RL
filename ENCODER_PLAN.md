@@ -526,8 +526,37 @@ Then every condition runs on the same SB3 PPO setup as the p01–p04 baselines. 
   - The encoder stays frozen while PPO trains on top.
   - PPO saves, reloads and is validated through the wrapper.
   - Wrong settings are refused.
-- **Speed:** a full-size run with the ideal context trains at about 1,000 steps per second, and a validation of 18 flights takes about 11 s. That is about 40 minutes per 2M-step run alone, and about 0.6 GB of memory per run.
+- **Speed:** a run alone trains at about 1,000 steps per second, but 32 side by side at first managed only about 40 each. With 8 × 30,000 candidates per run, every run's data went to main memory instead of the processor's cache.
+  - The fix is pruning (`context.prune_below: 30`): candidates whose weight falls below 10⁻¹³ of the best one are dropped, and the rest move to a smaller set.
+  - The estimates stay the same to about 10⁻¹², 6–14 times faster (`checks.step2_checks` compares pruned and exact).
+  - With 32 runs side by side each now trains at about 420 steps per second: about 1.5 hours per 2M-step launch, at about 0.6 GB of memory per run.
 
+
+**Plain PPO with the ideal estimate (2026-10-14).** What is the best score an agent that can't see the battery can reach in the hard environment? Plain PPO in hidden mode reads the ideal estimator's battery estimate through the context wrapper. This is the best possible frozen encoder: it reads the battery from the physics on every kind of flight and never changes.
+
+| Run | Learner | What PPO reads | Compared with |
+|---|---|---|---|
+| 2a_ideal | Plain PPO, batch 256 | Hidden observation + ideal estimate | 0a (true battery, 246) and 0a_blind (no battery, 23) |
+| 2b_ideal | Plain PPO, batch 1024 | Hidden observation + ideal estimate | 0b (258) and 0b_blind (77) |
+| 2a_ideal_std | Plain PPO, batch 256 | + the estimate's std | 2a_ideal: does knowing how sure the estimate is help? |
+| 2b_ideal_std | Plain PPO, batch 1024 | + the estimate's std | 2b_ideal |
+
+- **Settings:** as step 0 and the memoryless controls (discount 0.99, reward scale 0.1, 2M steps, seeds 0–7, validation seeds 1000–1002, scored on 1.5M–2M). The configs (`ppo/configs/experiment/S2*_ideal*`) are the memoryless configs plus `context.source=ideal`.
+- **Training grid:** 101 × 301 candidates, climb-rate tolerance 0.01 m/s.
+- **Report:** `report_step0.py` accepts the four conditions. The estimate-only and the estimate-plus-std runs go in separate reports, because their inputs differ.
+- **Checks (`checks.step2_checks`):** the four configs differ from the memoryless ones only in the context, the launcher builds the same runs, and mislabeled runs are rejected.
+- **W&B:** `S2a_ideal_bs256_gamma0.99_rs0.1_s<seed>`, `S2b_ideal_bs1024_…`, `S2a_ideal_std_bs256_…`, `S2b_ideal_std_bs1024_…`, tag `ideal_context`.
+
+**Decision rules, fixed before running.** Gap closed = (ideal − memoryless) / (true battery − memoryless), per learner, on the same seeds.
+- **Close to the true battery** (within the seed spread, or most of the gap closed): in practice the battery can be inferred well enough. The encoder is the bottleneck, so build the pilots and a frozen learned encoder (steps 3–4), with this score as their target.
+- **Close to the memoryless agent:** even a perfect encoder doesn't help, because the remaining uncertainty and the need to probe dominate. Don't build pilots yet; rethink first (the easy environment of `EASY_ENV_WARMUP.md`, the std input, exploration).
+- **In between:** report the gap closed, and look at where the ideal agent fails (by starting battery, early-flight behaviour, whether it probes).
+- **std:** if the `_std` runs score clearly higher (beyond the seed spread), give the learned encoder an uncertainty output too (the Gaussian head of C–F).
+
+```bash
+# 4 conditions x seeds 0-7 = 32 runs of 2M steps, all at once with 1 thread each, about 1.5 hours
+nohup python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1 > run_ideal_ppo.log 2>&1 &
+```
 
 ### 3. Pilots
 

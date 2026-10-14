@@ -78,11 +78,12 @@ class IdealContext(ContextSource):
     """
 
     def __init__(self, n_envs: int, env_kwargs: dict, include_std: bool = False, b_points: int = 101,
-                 vx_points: int = 301, vy_tolerance: float = 0.01) -> None:
+                 vx_points: int = 301, vy_tolerance: float = 0.01, prune_below: float | None = 30.0) -> None:
         from step1_ideal_estimator import IdealBatteryEstimator
 
         self.estimators = [IdealBatteryEstimator(env_kwargs, b_points=b_points, vx_points=vx_points,
-                                                 vy_tolerance=vy_tolerance) for _ in range(n_envs)]
+                                                 vy_tolerance=vy_tolerance, prune_below=prune_below)
+                           for _ in range(n_envs)]
         self.include_std = include_std
         self.dim = 2 if include_std else 1
 
@@ -216,7 +217,7 @@ def context_protocol(cfg) -> dict | None:
         return None
     settings = OmegaConf.to_container(cfg.context, resolve=True)
     source = settings["source"]
-    keep = {"ideal": ("source", "include_std", "b_points", "vx_points", "vy_tolerance"),
+    keep = {"ideal": ("source", "include_std", "b_points", "vx_points", "vy_tolerance", "prune_below"),
             "encoder": ("source", "encoder_model"), "true_battery": ("source",)}[source]
     return {key: settings.get(key) for key in keep}
 
@@ -250,6 +251,9 @@ def validate_context(cfg, env_kwargs: dict) -> None:
             raise ValueError("context.vy_tolerance must be positive")
         if not isinstance(context.get("include_std"), bool):
             raise ValueError("context.include_std must be true or false")
+        prune = context.get("prune_below")
+        if prune is not None and (isinstance(prune, bool) or not isinstance(prune, (int, float)) or not prune > 0):
+            raise ValueError("context.prune_below must be positive or null")
         # The estimator assumes the environment's speed noise: the validation flights must use the same
         import battery_plane as bp
 
@@ -268,8 +272,10 @@ def make_context_source(cfg, n_envs: int, env_kwargs: dict) -> ContextSource | N
         return None
     context = cfg.context
     if source == "ideal":
+        prune = context.get("prune_below")
         return IdealContext(n_envs, env_kwargs, include_std=bool(context.include_std), b_points=int(context.b_points),
-                            vx_points=int(context.vx_points), vy_tolerance=float(context.vy_tolerance))
+                            vx_points=int(context.vx_points), vy_tolerance=float(context.vy_tolerance),
+                            prune_below=None if prune is None else float(prune))
     if source == "encoder":
         return FrozenEncoderContext(n_envs, encoder_model_path(cfg))
     return TrueBatteryContext()

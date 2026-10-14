@@ -20,6 +20,8 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions 1a_early 1b_early 1c_early --battery-noises 0.03 0.06 0.12   # step 1: early noise
     python run_step0.py --conditions 1a_sharp 1b_sharp 1c_sharp 1a_linear 1b_linear 1c_linear \
         --battery-noises 0.06 0.12 0.25                     # step 1: in-flight noise (gone by flight step 350)
+    python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7 \
+        --jobs 32 --threads 1                               # step 2: plain PPO with the ideal battery estimate
     python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7   # memoryless controls
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
@@ -76,6 +78,11 @@ CONDITIONS = {
     "0a_blind": ("ppo/main_battery_plane_ppo.py", "+experiment=S0a_blind_bs256", "ppo"),
     "0b_blind": ("ppo/main_battery_plane_ppo.py", "+experiment=S0b_blind_bs1024", "ppo"),
     "0c_blind": ("main_battery_plane_contextual_ppo.py", "+step0=cppo_blind", "cppo"),
+    # Step 2, ideal context: 0a_blind and 0b_blind with the ideal estimator's battery estimate appended (and its std)
+    "2a_ideal": ("ppo/main_battery_plane_ppo.py", "+experiment=S2a_ideal_bs256", "ppo"),
+    "2b_ideal": ("ppo/main_battery_plane_ppo.py", "+experiment=S2b_ideal_bs1024", "ppo"),
+    "2a_ideal_std": ("ppo/main_battery_plane_ppo.py", "+experiment=S2a_ideal_std_bs256", "ppo"),
+    "2b_ideal_std": ("ppo/main_battery_plane_ppo.py", "+experiment=S2b_ideal_std_bs1024", "ppo"),
 }
 # Extra overrides of a condition (the in-flight configs default to the sharp profile)
 CONDITION_OVERRIDES = {name: ["env.battery_noise_flight=linear"] for name in ("1a_linear", "1b_linear", "1c_linear")}
@@ -86,6 +93,8 @@ SWITCH_SOURCES = {"1a_switch": "0a", "1b_switch": "0b", "1c_switch": "0c"}
 EARLY_NOISE_CONDITIONS = ["1a_early", "1b_early", "1c_early"]
 INFLIGHT_CONDITIONS = ["1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear"]
 BLIND_CONDITIONS = ["0a_blind", "0b_blind", "0c_blind"]
+# Ideal context -> its report group: the estimate alone, or with its std (report_step0.py never mixes the two)
+IDEAL_CONDITIONS = {"2a_ideal": "ideal", "2b_ideal": "ideal", "2a_ideal_std": "ideal_std", "2b_ideal_std": "ideal_std"}
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -351,18 +360,21 @@ def main(argv=None) -> int:
 
 def report_commands(done: list[dict], scales: list, noises: list, output: Path) -> list[str]:
     """
-    report_step0.py compares runs with the same settings: one command per reward scale, battery noise and in-flight
-    profile, e.g. "Report (battery noise 0.06): python report_step0.py --run 1a ... --output .../step0_report_noise0.06.json".
+    report_step0.py compares runs with the same settings: one command per reward scale, battery noise, in-flight
+    profile and context, e.g. "Report (battery noise 0.06): python report_step0.py --run 1a ... --output
+    .../step0_report_noise0.06.json".
     """
-    def profile(condition):
-        return condition.split("_")[1] if condition in INFLIGHT_CONDITIONS else None
+    def variant(condition):
+        if condition in INFLIGHT_CONDITIONS:
+            return condition.split("_")[1]
+        return IDEAL_CONDITIONS.get(condition)
 
     lines = []
     for scale in scales:
         for noise in noises:
-            for flight in (None, "sharp", "linear"):
+            for flight in (None, "sharp", "linear", "ideal", "ideal_std"):
                 group = [r for r in done if r["reward_scale"] == scale and r["battery_noise"] == noise
-                         and profile(r["condition"]) == flight]
+                         and variant(r["condition"]) == flight]
                 if group:
                     lines.append(report_command(group, scale, noise, flight, output))
     return lines
@@ -377,7 +389,7 @@ def report_command(group: list[dict], scale, noise, flight, output: Path) -> str
         labels.append(f"battery noise {noise:g}")
         suffix += f"_noise{noise:g}"
     if flight is not None:
-        labels.append(f"{flight} in-flight noise")
+        labels.append({"ideal": "ideal context", "ideal_std": "ideal context with its std"}.get(flight, f"{flight} in-flight noise"))
         suffix += f"_{flight}"
     label = f" ({', '.join(labels)})" if labels else ""
     report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)

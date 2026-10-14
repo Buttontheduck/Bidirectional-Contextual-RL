@@ -69,7 +69,7 @@ class Step2Checks(unittest.TestCase):
     def test_ideal_context_matches_the_offline_estimator(self):
         from step1_ideal_estimator import IdealBatteryEstimator
 
-        grid = {"b_points": 41, "vx_points": 61, "vy_tolerance": 0.01}
+        grid = {"b_points": 41, "vx_points": 61, "vy_tolerance": 0.01, "prune_below": 30.0}
         env = ContextVecEnv(vec_env("hidden", T=40), IdealContext(2, {"T": 40}, include_std=True, **grid))
         self.assertEqual(env.observation_space.shape, (6,))
         finished = episodes(env, 130)
@@ -129,6 +129,31 @@ class Step2Checks(unittest.TestCase):
         self.assertGreater(estimator.constraint_skips, 0)
         self.assertEqual(mean, 0.0)
 
+    def test_pruning_keeps_the_ideal_estimates(self):
+        from step1_ideal_estimator import IdealBatteryEstimator
+
+        # A probe-then-hold flight: pruned and exact estimates agree, and few candidates are left to replay
+        env = bp.BatteryPlaneEnv(observation_mode="hidden")
+        obs, _ = env.reset(seed=6001)
+        observations, actions = [obs], []
+        for k in range(500):
+            action = np.array([1.0, 0.1] if (k // 60) % 3 == 0 else [0.45, 0.0], np.float32)
+            obs, _, terminated, truncated, _ = env.step(action)
+            actions.append(action)
+            if terminated or truncated:
+                break
+            observations.append(obs)
+        grid = {"b_points": 51, "vx_points": 121, "vy_tolerance": 0.01}
+        exact = IdealBatteryEstimator(**grid).estimate(observations, actions)
+        estimator = IdealBatteryEstimator(prune_below=30.0, **grid)
+        pruned = estimator.estimate(observations, actions)
+        np.testing.assert_allclose(pruned["estimates"], exact["estimates"], atol=1e-9)
+        np.testing.assert_allclose(pruned["stds"], exact["stds"], atol=1e-9)
+        self.assertLess(estimator.sim.n, 51 * 121 // 2)
+        # A new flight starts from the whole grid again
+        estimator.start(observations[0])
+        self.assertEqual(estimator.sim.n, 51 * 121)
+
     def test_plain_ppo_trains_with_a_frozen_context_and_is_validated_with_it(self):
         import report_step0
 
@@ -155,6 +180,51 @@ class Step2Checks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires no frozen context"):
             report_step0.evaluation_protocol(cfg, "0a_blind")
 
+    def test_ideal_context_runs_differ_from_the_memoryless_runs_only_in_the_context(self):
+        from omegaconf import OmegaConf
+
+        import report_step0
+        import run_step0
+
+        script = plain_ppo_script()
+        cases = [("2a_ideal", "S2a_ideal_bs256", "S0a_blind_bs256", False), ("2b_ideal", "S2b_ideal_bs1024", "S0b_blind_bs1024", False),
+                 ("2a_ideal_std", "S2a_ideal_std_bs256", "S0a_blind_bs256", True),
+                 ("2b_ideal_std", "S2b_ideal_std_bs1024", "S0b_blind_bs1024", True)]
+        for condition, name, blind_name, include_std in cases:
+            with self.subTest(condition=condition):
+                cfg, blind = plain_ppo_config(f"+experiment={name}"), plain_ppo_config(f"+experiment={blind_name}")
+                script.validate_ppo(cfg)
+                for section in ("env", "ppo", "training", "evaluation"):
+                    self.assertEqual(cfg[section], blind[section])
+                self.assertEqual((cfg.context.source, cfg.context.include_std, blind.context.source), ("ideal", include_std, "none"))
+                self.assertEqual((cfg.wandb.project, cfg.wandb.run_name), ("cppo", f"{name}_gamma0.99_rs0.1_s0"))
+                # Scored like step 0: the protocol of the memoryless run plus the context
+                protocol, blind_protocol = (report_step0.evaluation_protocol(cfg, condition),
+                                            report_step0.evaluation_protocol(blind, blind_name.replace("S0", "0").split("_bs")[0]))
+                self.assertEqual({key for key in protocol if protocol[key] != blind_protocol[key]}, {"context"})
+                self.assertEqual(protocol["context"], {"source": "ideal", "include_std": include_std, "b_points": 101,
+                                                       "vx_points": 301, "vy_tolerance": 0.01, "prune_below": 30.0})
+                # The launcher builds the same run
+                command = run_step0.command_for(condition, 5, 1, Path("/tmp/ideal_launch"))
+                launched = plain_ppo_config(*[item for item in command[2:] if not item.startswith("hydra.")])
+                self.assertEqual(OmegaConf.to_container(launched.context), OmegaConf.to_container(cfg.context))
+                self.assertEqual((launched.training.seed, launched.wandb.run_name), (5, f"{name}_gamma0.99_rs0.1_s5"))
+        # Mislabeled runs are rejected
+        with self.assertRaisesRegex(ValueError, "include_std=False"):
+            report_step0.evaluation_protocol(plain_ppo_config("+experiment=S2a_ideal_std_bs256"), "2a_ideal")
+        with self.assertRaisesRegex(ValueError, "context.source=ideal"):
+            report_step0.evaluation_protocol(plain_ppo_config("+experiment=S0a_blind_bs256"), "2a_ideal")
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            report_step0.evaluation_protocol(plain_ppo_config("+experiment=S2b_ideal_bs1024"), "2a_ideal")
+        # One report per variant: the estimate alone, and with its std
+        runs = [{"condition": c, "seed": s, "reward_scale": None, "battery_noise": None, "run_dir": f"/r/{c}{s}"}
+                for c in ("2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std") for s in (0, 1)]
+        lines = run_step0.report_commands(runs, [None], [None], Path("/out"))
+        self.assertEqual([line.split(":")[0] for line in lines],
+                         ["Report (ideal context)", "Report (ideal context with its std)"])
+        self.assertTrue(lines[0].endswith("step0_report_ideal.json") and lines[1].endswith("step0_report_ideal_std.json"))
+        self.assertEqual([line.count("_std ") for line in lines], [0, 4])
+
     def test_context_settings_are_validated(self):
         script = plain_ppo_script()
         for overrides, message in (
@@ -162,6 +232,7 @@ class Step2Checks(unittest.TestCase):
                 (["+experiment=S0a_blind_bs256", "context.source=unknown"], "context.source must be"),
                 (["+experiment=S0a_blind_bs256", "context.source=encoder"], "context.encoder_model"),
                 (["+experiment=S0a_blind_bs256", "context.source=ideal", "context.b_points=1"], "context.b_points"),
+                (["+experiment=S0a_blind_bs256", "context.source=ideal", "context.prune_below=0"], "context.prune_below"),
                 (["+experiment=S1a_noisy_bs256", "env.observation_mode=hidden", "context.source=ideal"], "battery_noise")):
             with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, message):
                 script.validate_ppo(plain_ppo_config(*overrides))

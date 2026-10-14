@@ -38,6 +38,7 @@ python step1_encoder_error.py --a-runs <A rerun dirs> --pilot-runs <0c dirs, sam
 nohup python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7 --jobs 24 --threads 1 > run_blind.log 2>&1 &   # memoryless controls at step 0's settings, ~15-20 min
 python step1_ideal_estimator.py --a-runs <A rerun dirs> --pilot-runs <0c dirs, same seeds> --output runs_step0/ideal_estimator.json  # best possible battery estimate on the same flights, ~3 min
 python warmup_information.py                         # EASY_ENV_WARMUP.md: what a forced full-throttle take-off reveals, ~2 min
+nohup python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1 > run_ideal_ppo.log 2>&1 &   # step 2: plain PPO with the ideal estimate, ~1.5 h
 python -m unittest checks.step1_checks -v
 python -m unittest checks.step2_checks -v          # context_wrapper.py: frozen battery estimate appended for plain PPO
 python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0       # one 0c run: CPPO, true battery

@@ -50,10 +50,12 @@ class IdealBatteryEstimator:
     :param b_values: Starting batteries to try (default: b_points evenly over b0_range)
     :param vx_values: Starting speeds to try (default: vx_points evenly over vx0_range)
     :param vy_tolerance: Std of the climb-rate match, m/s
+    :param prune_below: Drop the candidates whose log weight falls this far below the best one (e.g. 30: weights under
+        1e-13 of the best), so that only the plausible ones are replayed; None keeps every candidate (exact, slower)
     """
 
     def __init__(self, env_kwargs: dict | None = None, b_values=None, vx_values=None, b_points: int = 201,
-                 vx_points: int = 601, vy_tolerance: float = 0.005) -> None:
+                 vx_points: int = 601, vy_tolerance: float = 0.005, prune_below: float | None = None) -> None:
         env_kwargs = dict(env_kwargs or {})
         core = bp.BatteryPlaneVec(n_envs=1, observation_mode="hidden", seed=0, **env_kwargs)
         if core.soc_choices is not None:
@@ -66,13 +68,29 @@ class IdealBatteryEstimator:
         self.b0, self.vx0 = b0.ravel(), vx0.ravel()
         self.sigma, self.vy_tolerance = core.sigma, float(vy_tolerance)
         self.y_ref, self.v_ref = core.y_ref, core.v_ref
-        # One plane per candidate, without speed noise (only the candidates' true states are used)
-        self.sim = bp.BatteryPlaneVec(n_envs=len(self.b0), observation_mode="hidden", seed=0, auto_reset=False,
-                                      **env_kwargs)
-        self.sim.sigma = 0.0
+        if prune_below is not None and not prune_below > 0:
+            raise ValueError("prune_below must be positive or None")
+        self.prune_below, self.env_kwargs = prune_below, env_kwargs
+        # One plane per candidate, without speed noise (only the candidates' true states are used); a pruned flight
+        # replays a smaller copy holding the remaining candidates
+        self.full_sim = self.sim = self._planes(len(self.b0))
         # Steps at which the plane flew on although every candidate's battery was empty (grid rounding right before a
         # battery-empty ending): the constraint is skipped there instead of ruling out everything
         self.constraint_skips = 0
+
+    def _planes(self, n: int):
+        sim = bp.BatteryPlaneVec(n_envs=n, observation_mode="hidden", seed=0, auto_reset=False, **self.env_kwargs)
+        sim.sigma = 0.0
+        return sim
+
+    def _prune(self) -> None:
+        """Keep the candidates within prune_below of the best; move them to a smaller copy once half are gone."""
+        keep = self.log_w >= self.log_w.max() - self.prune_below
+        if keep.sum() > len(keep) // 2:
+            return
+        sim = self._planes(int(keep.sum()))
+        sim.b0[:], sim.b[:], sim.vx[:] = self.sim.b0[keep], self.sim.b[keep], self.sim.vx[keep]
+        self.sim, self.log_w = sim, self.log_w[keep]
 
     def _check(self, observation) -> np.ndarray:
         obs = np.asarray(observation, dtype=float)
@@ -94,7 +112,7 @@ class IdealBatteryEstimator:
         :return: The posterior mean and std of b_0
         """
         obs = self._check(observation)
-        sim = self.sim
+        sim = self.sim = self.full_sim
         sim.b0[:], sim.b[:], sim.vx[:] = self.b0, self.b0, self.vx0
         self.log_w = -0.5 * ((obs[1] * self.v_ref - sim.vx) / self.sigma) ** 2
         self.last, self.t, self.vy_mismatch = obs, 0, None
@@ -112,7 +130,8 @@ class IdealBatteryEstimator:
         :return: The posterior mean and std of b_{t+1}
         """
         obs = self._check(observation)
-        sim, n = self.sim, len(self.b0)
+        sim = self.sim
+        n = sim.n
         y, vy = self.last[0] * self.y_ref, self.last[2] * self.v_ref
         sim.y[:], sim.vy[:], sim.t[:] = y, vy, self.t
         sim.step(np.broadcast_to(np.asarray(action, dtype=float), (n, 2)))
@@ -130,7 +149,10 @@ class IdealBatteryEstimator:
         if not np.isfinite(self.log_w.max()):
             raise RuntimeError(f"No candidate explains the flight at step {self.t + 1}")
         self.last, self.t = obs, self.t + 1
-        return self._posterior()
+        mean_std = self._posterior()
+        if self.prune_below is not None:
+            self._prune()
+        return mean_std
 
     def estimate(self, observations, actions) -> dict:
         """
