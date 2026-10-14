@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), and the memoryless controls at step 0's settings (2026-10-14; results below); the rest of steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, and the ideal estimator on the validation flights (2026-10-14; results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -431,10 +431,67 @@ What it shows:
 Caveats:
 
 - Part of the pilot-flight error can't be avoided. A plane flying gently never reaches the throttle cap, so its starting battery doesn't show in what the agent sees. The drift toward too-low estimates is avoidable, though: the drain follows from the actions, which the encoder reads.
-- How much of the error is unavoidable is what enc1's ideal estimator would tell.
+- How much of the error is unavoidable is what enc1's ideal estimator would tell (measured below: about half on the pilot's flights).
 - These are the A rerun's encoders (point estimate, supervised on A's own flights); C–F were not measured.
 
 What this means for the plan: the encoder's problem is less its accuracy on the flights it was trained on than how narrow those flights are. This strongly supports step 3, training the encoder on varied flights (gentle and hard, random throttle, the 0c pilots' flights) so that it reads the battery from the plane's response and counts the drain from the actions instead of learning a clock. Before that, enc1's ideal estimator on the pilots' flights would show the best error possible at each flight step, the target for a pretrained encoder.
+
+**The ideal estimator ("perfect calculator", 2026-10-14).** How much of the encoder's error is unavoidable? `step1_ideal_estimator.py` computes the best estimate any encoder could make from the same information.
+
+**How it works:**
+- `IdealBatteryEstimator` reads what the encoder reads: the hidden-mode observations and the executed actions, never the battery.
+- It knows the exact physics and the training distribution of starting states.
+- The unknowns are the starting battery (uniform 0.2–0.7) and the starting speed (uniform 0–30 m/s, read with noise of 5 m/s); altitude and climb rate are observed exactly.
+- It tries a grid of 201 × 601 candidate starting states. Each is replayed through the environment's own `BatteryPlaneVec.step` with the executed actions, from the observed altitude and climb rate.
+- Each candidate is weighed by how well it predicts the next speed reading and the exact climb rate. A candidate whose battery would be empty while the plane flies on is dropped.
+- The estimate is the weighted mean battery, i.e. the posterior mean: the smallest possible expected squared error.
+
+**Checks (`checks.step1_checks`):**
+- With the true starting state as its only candidate, the replay equals the environment's battery to about 5×10⁻¹⁴.
+- At take-off it gives the prior (0.45 ± 0.144).
+- On scripted flights, full throttle reveals the battery within about 100 steps, while flying below the throttle limit reveals nothing for the whole flight.
+- It refuses observations that contain the battery.
+- On the validation flights its own uncertainty matches its errors (calibration 0.92 and 0.83, 1 = perfect), and the grid always held a candidate matching the climb rate.
+
+It ran on the same 108 validation flights as the encoder-error measurement: A's own flights and the 0c pilots' flights, final models, seeds 0–2. Results are in `runs_step0/ideal_estimator.json`.
+
+```bash
+# About 2.5 minutes for the 108 flights with 24 processes
+python step1_ideal_estimator.py --a-runs runs_cppo/d36o544n runs_cppo/rxguqn34 runs_cppo/ho5et2ek \
+    --pilot-runs runs_cppo/n8ubl3ha runs_cppo/g9awmtpl runs_cppo/wvxnps47 --output runs_step0/ideal_estimator.json
+```
+
+Typical error at each flight step. The clock only knows how far into the flight it is (the mean battery of these flights at that step), so it is slightly flattering.
+
+| Flight step | 0 | 25 | 50 | 100 | 175 | 250 | 350 | 500 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **A flies:** clock | 0.17 | 0.17 | 0.17 | 0.16 | 0.13 | 0.10 | 0.08 | 0.05 |
+| **A flies:** A's encoder | 0.17 | 0.16 | 0.12 | 0.05 | 0.03 | 0.02 | 0.04 | 0.02 |
+| **A flies:** ideal estimator | 0.17 | 0.15 | 0.09 | 0.04 | 0.02 | 0.01 | 0.02 | 0.01 |
+| **Good pilot flies:** clock | 0.17 | 0.16 | 0.15 | 0.13 | 0.11 | 0.09 | 0.07 | 0.06 |
+| **Good pilot flies:** A's encoder | 0.17 | 0.18 | 0.16 | 0.13 | 0.14 | 0.16 | 0.15 | 0.14 |
+| **Good pilot flies:** ideal estimator | 0.17 | 0.16 | 0.11 | 0.09 | 0.08 | 0.08 | 0.07 | 0.06 |
+
+Good pilot's flights at step 250, by starting battery:
+
+| Starting battery | 20% | 30% | 40% | 50% | 60% | 70% |
+|---|---:|---:|---:|---:|---:|---:|
+| Ideal estimator | 0.17 | 0.09 | 0.03 | 0.02 | 0.01 | 0.02 |
+| A's encoder | 0.25 | 0.10 | 0.12 | 0.14 | 0.16 | 0.17 |
+
+- **On its own flights, A's encoder is close to ideal.** From step 100 on it is within about 0.01 of the ideal and closes about 90% of the clock-to-ideal gap (62% at step 50). Reading the battery on familiar flights is not A's problem.
+- **Part of the time it takes is physics.** Even the ideal estimator, on A's full-throttle flights, is 0.15 off at step 25 and 0.09 at step 50, and reaches 0.04 only at step 100. The battery shows slowly, through a noisy speed reading; nothing can know it in the first 1–2 seconds.
+- **On the good pilot's flights, about half of the encoder's error is unavoidable** (0.08 against 0.16 at step 250).
+  - **Unavoidable:** the low-battery flights (20%: 0.17, 30%: 0.09), where the pilot flies gently. Flying below the throttle limit hides the battery completely.
+  - **The encoder's own:** from 40% up the ideal is within 0.01–0.03 by step 250, while the encoder is 0.12–0.17 off, worse than the clock. That is the clock it learned from A's flying.
+- **The autogenic trap, measured.**
+  - The flights where knowing the battery matters most (low battery, so save energy) are the ones where saving energy, i.e. flying gently, hides the battery.
+  - An agent that can't see the battery therefore can't copy the oracle's behaviour: it must spend battery at full throttle to find out its charge, then save.
+  - So the oracle's 282 is a ceiling a hidden-mode agent can't fully reach.
+- **For the plan:**
+  - An encoder trained on varied flights (step 3) can remove the encoder's own half of the error (on the pilot's flights from about 0.16 to 0.08 at step 250, and to 0.01–0.03 from 40% up).
+  - On low-battery flights no encoder can help unless the policy learns to probe first, and the policy should get the estimate's uncertainty (the Gaussian head of C–F).
+  - A further control: use the ideal estimator itself as the encoder and train PPO on top. That would give the best score any hidden-mode agent can reach, the honest target for an encoder. At full grid size it is too slow for 2M steps; a coarser grid would take roughly 2 hours per run.
 
 ### 2. Run every condition through plain PPO
 

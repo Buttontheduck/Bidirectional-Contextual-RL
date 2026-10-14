@@ -250,6 +250,7 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0
   - On A's own flights its error falls from 0.17 at take-off to 0.02–0.03 by step 175.
   - On flights flown by a policy that sees the battery, the error stays at 0.13–0.17 for the whole flight.
   - A always flies about the same way, so in its data the battery is roughly "starting guess minus a fixed amount per step". The encoder learned that rule instead of reading the battery from how the plane responds.
+- **Part of it can't be avoided.** An ideal estimator (exact physics, the same inputs as the encoder) shows that flying gently below the throttle limit hides the battery completely. On a good pilot's flights it stays 0.17 off on 20%-battery flights, while from 40% up it is within 0.01–0.03 by mid-flight, where A's encoder is 0.12–0.17 off. Even at full throttle nothing can know the battery in the first 1–2 seconds.
 
 This is the autogenic difficulty from section 1 showing up in practice. The agent's behaviour decides what its encoder can learn about the battery, and the encoder's estimate decides whether the agent learns to behave differently.
 

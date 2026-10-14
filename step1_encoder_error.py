@@ -39,12 +39,13 @@ WINDOWS = ((0, 50), (50, 150), (150, 250), (250, 350), (350, 500), (500, 700))
 BATTERIES = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
 
 
-def fly(encoder_policy, pilot_policy, env_kwargs: dict, reset: dict) -> dict:
+def fly(encoder_policy, pilot_policy, env_kwargs: dict, reset: dict, record: bool = False) -> dict:
     """
     One validation flight: the encoder's estimate and the true battery at every flight step.
 
     :param encoder_policy: The A policy, whose encoder is measured (and which flies when there is no pilot)
     :param pilot_policy: The policy that flies, reading the observed-mode observation, or None
+    :param record: Also return the hidden-mode observations and the executed actions (step1_ideal_estimator.py)
     """
     import torch as th
 
@@ -58,6 +59,7 @@ def fly(encoder_policy, pilot_policy, env_kwargs: dict, reset: dict) -> dict:
     state = encoder_policy.initial_state(1)
     pilot_state = pilot_policy.initial_state(1) if pilot_policy is not None else None
     battery, estimates, batteries, total = info["b0"], [], [], 0.0
+    observations, actions = [], []
     while True:
         if not np.array_equal(hidden_obs, observed_obs[:-1]):
             raise RuntimeError("The hidden observation must be the observed one without the battery")
@@ -70,6 +72,8 @@ def fly(encoder_policy, pilot_policy, env_kwargs: dict, reset: dict) -> dict:
         estimates.append(float(latents[0, 0]))
         batteries.append(float(battery))
         action = state.prev_actions[0].numpy()
+        observations.append(hidden_obs.tolist())
+        actions.append(action.tolist())
         hidden_obs, reward, terminated, truncated, info = hidden.step(action)
         observed_obs, observed_reward, *_ = observed.step(action)
         if observed_reward != reward:
@@ -80,11 +84,14 @@ def fly(encoder_policy, pilot_policy, env_kwargs: dict, reset: dict) -> dict:
             break
     from flight_logging import terminal_outcome
 
-    return {"seed": reset["seed"], "b0": reset["options"]["b0"], "return": total, "length": len(estimates),
-            "outcome": terminal_outcome(info), "estimates": estimates, "batteries": batteries}
+    flight = {"seed": reset["seed"], "b0": reset["options"]["b0"], "return": total, "length": len(estimates),
+              "outcome": terminal_outcome(info), "estimates": estimates, "batteries": batteries}
+    if record:
+        flight.update(observations=observations, actions=actions)
+    return flight
 
 
-def measure(a_dir: str, pilot_dir: str, checkpoint: str, view: str) -> dict:
+def measure(a_dir: str, pilot_dir: str, checkpoint: str, view: str, record: bool = False) -> dict:
     """The flights of one A checkpoint, flown by itself (own) or by the 0c pilot of the same seed (pilot)."""
     import torch as th
     from omegaconf import OmegaConf
@@ -107,7 +114,8 @@ def measure(a_dir: str, pilot_dir: str, checkpoint: str, view: str) -> dict:
         if training.env_kwargs_from(pilot_cfg) != training.env_kwargs_from(cfg):
             raise ValueError("The pilot was trained on other physics")
     schedule = list(training.iter_eval_resets(cfg.evaluation.reset_grid))
-    flights = [fly(model.policy, pilot.policy if pilot else None, training.env_kwargs_from(cfg), reset) for reset in schedule]
+    flights = [fly(model.policy, pilot.policy if pilot else None, training.env_kwargs_from(cfg), reset, record)
+               for reset in schedule]
     # The flights of a final model are those of its own final validation (this check needs the same flights)
     reference_dir = a_dir if view == "own" else pilot_dir
     if checkpoint == "final_model.zip":

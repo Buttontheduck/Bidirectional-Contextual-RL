@@ -493,6 +493,57 @@ class Step1Checks(unittest.TestCase):
                 contexts, _ = a.encoder.unroll(a.encoder.initial_state(1), torch.as_tensor(np.array(observations)[None]),
                                                torch.as_tensor(previous[None]))
             np.testing.assert_allclose(flight["estimates"], contexts[0, :, 0].numpy(), atol=1e-5)
+            # The recorded flight (for the ideal estimator) is that flight's hidden observations and executed actions
+            recorded = measure.fly(a, flyer, env_kwargs, reset, record=True)
+            np.testing.assert_array_equal(np.array(recorded["observations"], np.float32), np.array(observations))
+            np.testing.assert_array_equal(np.array(recorded["actions"], np.float32), np.array(actions))
+            self.assertEqual(recorded["batteries"], flight["batteries"])
+
+    def test_ideal_estimator_replays_the_physics_and_learns_only_at_the_throttle_cap(self):
+        import battery_plane as bp
+        from step1_ideal_estimator import IdealBatteryEstimator
+
+        def flight(b0, policy, steps=700):
+            env = bp.BatteryPlaneEnv(observation_mode="hidden")
+            obs, info = env.reset(seed=1001, options={"b0": b0, "vx_obs_noise": 5.0})
+            vx0, observations, actions, batteries = float(env.core.vx[0]), [obs], [], [info["b0"]]
+            rng = np.random.default_rng(0)
+            for k in range(steps):
+                action = policy(rng)
+                obs, _, terminated, truncated, info = env.step(action)
+                actions.append(action)
+                if terminated or truncated:
+                    break
+                observations.append(obs)
+                batteries.append(info["b"])
+            return observations, actions, np.array(batteries), vx0
+
+        # With the true starting state as its only candidate, the replay is the environment's flight
+        observations, actions, batteries, vx0 = flight(0.37, lambda rng: rng.uniform(-1, 1, 2).astype(np.float32), 400)
+        out = IdealBatteryEstimator(b_values=[0.37], vx_values=[vx0]).estimate(observations, actions)
+        np.testing.assert_allclose(out["estimates"], batteries, atol=1e-9)
+        self.assertLess(max(out["vy_mismatch"]), 1e-5)
+        self.assertGreater(len(batteries), 100)
+        # Full throttle reveals the battery; flying below the cap reveals nothing
+        estimator = IdealBatteryEstimator(b_points=101, vx_points=151)
+        for b0 in (0.3, 0.6):
+            observations, actions, batteries, _ = flight(b0, lambda rng: np.array([1.0, 0.2], np.float32))
+            out = estimator.estimate(observations, actions)
+            errors, stds = np.abs(np.array(out["estimates"]) - batteries), np.array(out["stds"])
+            # Take-off: the prior's mean (0.45) and spread (0.5 / sqrt(12))
+            self.assertAlmostEqual(out["estimates"][0], 0.45, places=3)
+            self.assertAlmostEqual(stds[0], 0.5 / np.sqrt(12), delta=0.002)
+            self.assertLess(errors[100], 0.05)
+            self.assertLess(stds[100], 0.06)
+            observations, actions, batteries, _ = flight(b0, lambda rng: np.array([0.3, 0.0], np.float32))
+            stds = np.array(estimator.estimate(observations, actions)["stds"])
+            self.assertEqual(len(batteries), 700)
+            self.assertGreater(stds.min(), 0.14)
+        # It reads hidden-mode observations only
+        env = bp.BatteryPlaneEnv(observation_mode="observed")
+        obs, _ = env.reset(seed=1000)
+        with self.assertRaisesRegex(ValueError, "never the battery"):
+            estimator.estimate([obs], [])
 
     def test_launcher_runs_the_noise_screen(self):
         import run_step0
