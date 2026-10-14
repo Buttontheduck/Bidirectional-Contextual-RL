@@ -305,6 +305,115 @@ class Step0Checks(unittest.TestCase):
         finally:
             env.close()
 
+    def test_blind_controls_change_only_the_battery_input(self):
+        import report_step0
+        import run_step0
+
+        script = plain_ppo_script()
+        blind_cppo = config("+step0=cppo_blind", step0=False)
+        cases = [("0a_blind", plain_ppo_config("+experiment=S0a_blind_bs256"), plain_ppo_config("+experiment=S0a_observed_bs256"),
+                  "ppo", "S0a_blind_bs256"),
+                 ("0b_blind", plain_ppo_config("+experiment=S0b_blind_bs1024"), plain_ppo_config("+experiment=S0b_observed_bs1024"),
+                  "ppo", "S0b_blind_bs1024"),
+                 ("0c_blind", blind_cppo, config(), "cppo", "S0c_blind")]
+        protocols = {}
+        for condition, cfg, observed, learner, name in cases:
+            with self.subTest(condition=condition):
+                (training.validate_config if learner == "cppo" else script.validate_ppo)(cfg)
+                # The step 0 run with the battery hidden: hidden mode, and for CPPO no context in place of the oracle
+                env, observed_env = OmegaConf.to_container(cfg.env), OmegaConf.to_container(observed.env)
+                self.assertEqual((env.pop("observation_mode"), observed_env.pop("observation_mode")), ("hidden", "observed"))
+                self.assertEqual(env, observed_env)
+                settings, observed_settings = (OmegaConf.to_container(c[learner], resolve=True) for c in (cfg, observed))
+                if learner == "cppo":
+                    self.assertEqual((settings.pop("context_source"), observed_settings.pop("context_source")), ("none", "oracle"))
+                self.assertEqual(settings, observed_settings)
+                for section in ("training", "evaluation"):
+                    self.assertEqual(cfg[section], observed[section])
+                self.assertEqual((cfg.wandb.project, cfg.wandb.run_name, cfg.wandb.group),
+                                 ("cppo", f"{name}_gamma0.99_rs0.1_s0", f"{name}_gamma0.99_rs0.1"))
+                protocols[condition] = report_step0.evaluation_protocol(cfg, condition)
+                # The launcher builds the same config
+                command = run_step0.command_for(condition, 5, 1, Path("/tmp/blind_launch"))
+                overrides = [item for item in command[2:] if not item.startswith("hydra.")]
+                launched = config(*overrides, step0=False) if learner == "cppo" else plain_ppo_config(*overrides)
+                self.assertEqual((launched.training.seed, launched.env.observation_mode, launched.wandb.run_name),
+                                 (5, "hidden", f"{name}_gamma0.99_rs0.1_s5"))
+        # 0c_blind is the A rerun without its encoder: the same environment, training and PPO settings
+        rerun = config("+rerun=A_point_baseline", step0=False)
+        for section in ("env", "training", "evaluation"):
+            self.assertEqual(blind_cppo[section], rerun[section])
+        blind_settings, rerun_settings = (OmegaConf.to_container(c.cppo, resolve=True) for c in (blind_cppo, rerun))
+        self.assertEqual({key for key in blind_settings if blind_settings[key] != rerun_settings[key]},
+                         {"context_source", "encoder_objective"})
+        # One protocol for the three controls and A, so one report can hold all of them
+        protocols["A"] = report_step0.evaluation_protocol(rerun, "A")
+        self.assertTrue(all(protocol == protocols["A"] for protocol in protocols.values()))
+        # Mislabeled runs are rejected
+        for cfg, condition, message in ((config(), "0c_blind", "observation_mode=hidden"),
+                                        (blind_cppo, "0c", "observation_mode=observed"),
+                                        (config("+step0=cppo_blind", "cppo.context_source=encoder", "cppo.encoder_objective=supervised",
+                                                step0=False), "0c_blind", "context_source=none"),
+                                        (plain_ppo_config("+experiment=S0a_observed_bs256"), "0a_blind", "observation_mode=hidden"),
+                                        (plain_ppo_config("+experiment=S0b_blind_bs1024"), "0a_blind", "batch size")):
+            with self.subTest(condition=condition, message=message), self.assertRaisesRegex(ValueError, message):
+                report_step0.evaluation_protocol(cfg, condition)
+
+    def test_memoryless_cppo_reads_exactly_plain_ppo_hidden_inputs(self):
+        from step0_oracle import NoContextEncoder, NoContextPolicy
+
+        cfg = config("+step0=cppo_blind", *SMALL, step0=False)
+        env = training.make_train_env(cfg)
+        try:
+            model = training.build_model(cfg, env)
+            policy, plain = model.policy, plain_ppo(cfg, env).policy
+            self.assertIsInstance(policy, NoContextPolicy)
+            self.assertNotIsInstance(policy, TrueBatteryPolicy)
+            self.assertIsInstance(policy.encoder, NoContextEncoder)
+            self.assertEqual(policy.parameter_groups()["encoder"], [])
+            self.assertIsNone(model.episode_buffer)
+            plain.load_state_dict(policy.state_dict())
+
+            obs = torch.as_tensor(env.reset())
+            # The four hidden-mode values: no battery
+            self.assertEqual(obs.shape[-1], 4)
+            state = policy.initial_state(obs.shape[0])
+            contexts, encoder_state = policy.encode(obs, state)
+            torch.testing.assert_close(contexts, torch.zeros(obs.shape[0], 1))
+            self.assertIsNone(encoder_state)
+            for branch in policy._branch_inputs(obs, contexts):
+                torch.testing.assert_close(branch, plain.extract_features(obs))
+            actions, values, _, _, _ = policy(obs, state, deterministic=True)
+            torch.testing.assert_close(values, plain.predict_values(obs))
+            torch.testing.assert_close(actions, plain.get_distribution(obs).get_actions(deterministic=True))
+            # No memory: another previous action changes nothing
+            other = state._replace(prev_actions=torch.ones_like(state.prev_actions))
+            torch.testing.assert_close(policy(obs, other, deterministic=True)[:2], (actions, values))
+
+            # Training changes the actor and critic only, and a saved model reloads as the memoryless policy
+            before = {name: param.detach().clone() for name, param in policy.named_parameters()}
+            model.learn(total_timesteps=32)
+            groups = policy.parameter_groups()
+            self.assertEqual({id(p) for p in groups["actor"] + groups["value"]}, {id(p) for p in policy.parameters()})
+            self.assertTrue(any(not torch.equal(param, before[name]) for name, param in policy.named_parameters()))
+            with tempfile.TemporaryDirectory() as folder:
+                model.save(Path(folder) / "model")
+                loaded = training.ContextualPPO.load(Path(folder) / "model.zip", device="cpu")
+            self.assertIsInstance(loaded.policy, NoContextPolicy)
+            obs = env.reset()
+            np.testing.assert_array_equal(model.predict(obs, deterministic=True)[0], loaded.predict(obs, deterministic=True)[0])
+        finally:
+            env.close()
+
+    def test_memoryless_cppo_rejects_the_battery_and_encoder_settings(self):
+        training.validate_config(config("+step0=cppo_blind", step0=False))
+        for mode in ("observed", "full", "clean"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "context_source=none requires env.observation_mode=hidden"):
+                training.validate_config(config("+step0=cppo_blind", f"env.observation_mode={mode}", step0=False))
+        for override in ("cppo.encoder_objective=supervised", "cppo.velocity_head.enabled=true", "cppo.context_head=gaussian"):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, "context_source=none has no encoder"):
+                training.validate_config(config("+step0=cppo_blind", override, step0=False))
+
 
 if __name__ == "__main__":
     unittest.main()

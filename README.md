@@ -218,7 +218,7 @@ Stable-Baselines3 PPO with a recurrent context encoder. It doesn't depend on Bat
 - **Context head and inputs:** `cppo.context_head` is `point` or `gaussian`. With `gaussian`, `cppo.context_variance_input` sets what the actor and critic read: `[μ_t, log σ²_t]` (default), `[μ_t, σ²_t]`, or the mean only. `cppo.velocity_head.enabled` adds the speed head; the actor and critic never read it.
 - **Encoder objective:** `supervised` (above) trains the encoder only on the true battery. The alternative, `rl`, sends the PPO losses into the encoder instead: critic loss plus `encoder_actor_loss_weight` × actor loss.
 - **Backpropagation through time:** `cppo.bptt_len` cuts the PPO re-encoding into segments; the default is the whole 512-step stream.
-- **Controls:** `cppo.context_source=oracle` replaces the encoder with the true battery, `z_t = b_t`, read from an observed-mode observation (`step0_oracle.py`). `step1_controls.py` adds noise of a chosen size or schedule to that battery. These separate "can the policy use a battery estimate?" from "can the encoder produce one?".
+- **Controls:** `cppo.context_source=oracle` replaces the encoder with the true battery, `z_t = b_t`, read from an observed-mode observation (`step0_oracle.py`). `cppo.context_source=none` removes it altogether (`z_t = 0`, hidden mode): Contextual PPO without memory, the matched memoryless control for experiment A. `step1_controls.py` adds noise of a chosen size or schedule to that battery. These separate "can the policy use a battery estimate?" from "can the encoder produce one?".
 - **Experiment grid A–F** (`GRID_PLAN.md`): point vs. Gaussian estimate, beta-NLL, whether the variance is an input, and the speed head. Three seeds each.
 
 ## 6. Where things stand (2026-10-14)
@@ -227,19 +227,19 @@ Details, tables and W&B groups are in `ENCODER_PLAN.md`. Scores are mean validat
 
 | Agent | Battery | Memory | Return | Flights completed |
 |---|---|---|---:|---:|
-| Plain PPO, hidden mode* | No | No | 36 | 15% |
-| Plain PPO, observed mode* | Yes | No | 247 | 86% |
-| Plain PPO, observed mode (step 0: batch 256 / 1024) | Yes | No | 246 / 258 | 87% |
-| Contextual PPO with the true battery (step 0) | Yes | Oracle | 282 | 87% |
-| Contextual PPO with its learned encoder (experiment A rerun, 3 seeds) | No, inferred | xLSTM | 22 | 0–33% |
+| Plain PPO, hidden mode (batch 256 / 1024) | No | No | 23 / 77 | 26% / 15% |
+| Contextual PPO with no context | No | No | 115 | 25% |
+| Plain PPO, observed mode (batch 256 / 1024) | Yes | No | 246 / 258 | 88% / 86% |
+| Contextual PPO with the true battery | Yes | Oracle | 282 | 86% |
+| Contextual PPO with its learned encoder (experiment A rerun, 3 seeds) | No, inferred | xLSTM | 22 | 17% |
 
-\* Eight seeds with discount 0.99 and reward scale 0.01. All other rows use reward scale 0.1 and eight seeds, except the A rerun. The blind agent has not yet been measured at reward scale 0.1.
+All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0–2), the same 18 validation flights.
 
 **What this shows so far:**
 
-- **The environment side holds for memoryless agents.** Knowing the battery is worth about 200 points: 247 against 36, and 86% against 15% of flights completed.
+- **The environment side holds for memoryless agents.** With every learner, knowing the battery is worth 170–220 points (246 vs 23, 258 vs 77, 282 vs 115), and completion rises from 15–26% to 86–88%.
 - **The memory agent's machinery works.** Given the true battery, Contextual PPO matches or beats plain PPO with the battery.
-- **The learned encoder doesn't yet deliver.** Experiment A scores at the blind level. Its planes fly like blind agents, fast until the battery runs out, even though its battery estimate is fairly accurate on average (R² 0.80).
+- **The learned encoder doesn't yet deliver.** Experiment A scores 22, below Contextual PPO with no context at all (115, all 8 seeds between 90 and 139). Its planes fly like blind agents, fast until the battery runs out, even though its battery estimate is fairly accurate on average (R² 0.80).
 
 **Why, from the step 1 controls**, which replace the encoder with the true battery plus controlled noise:
 

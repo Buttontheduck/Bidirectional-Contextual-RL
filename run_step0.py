@@ -20,6 +20,7 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions 1a_early 1b_early 1c_early --battery-noises 0.03 0.06 0.12   # step 1: early noise
     python run_step0.py --conditions 1a_sharp 1b_sharp 1c_sharp 1a_linear 1b_linear 1c_linear \
         --battery-noises 0.06 0.12 0.25                     # step 1: in-flight noise (gone by flight step 350)
+    python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7   # memoryless controls
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
@@ -70,6 +71,11 @@ CONDITIONS = {
     "1a_linear": ("ppo/main_battery_plane_ppo.py", "+experiment=S1a_inflight_noise_bs256", "ppo"),
     "1b_linear": ("ppo/main_battery_plane_ppo.py", "+experiment=S1b_inflight_noise_bs1024", "ppo"),
     "1c_linear": ("main_battery_plane_contextual_ppo.py", "+step1=cppo_inflight_noise", "cppo"),
+    # Memoryless controls: 0a, 0b and 0c in hidden mode, without the battery and without memory (0c_blind: A without
+    # its encoder)
+    "0a_blind": ("ppo/main_battery_plane_ppo.py", "+experiment=S0a_blind_bs256", "ppo"),
+    "0b_blind": ("ppo/main_battery_plane_ppo.py", "+experiment=S0b_blind_bs1024", "ppo"),
+    "0c_blind": ("main_battery_plane_contextual_ppo.py", "+step0=cppo_blind", "cppo"),
 }
 # Extra overrides of a condition (the in-flight configs default to the sharp profile)
 CONDITION_OVERRIDES = {name: ["env.battery_noise_flight=linear"] for name in ("1a_linear", "1b_linear", "1c_linear")}
@@ -79,6 +85,7 @@ NOISY_CONDITIONS = ["1a", "1b", "1c"]
 SWITCH_SOURCES = {"1a_switch": "0a", "1b_switch": "0b", "1c_switch": "0c"}
 EARLY_NOISE_CONDITIONS = ["1a_early", "1b_early", "1c_early"]
 INFLIGHT_CONDITIONS = ["1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear"]
+BLIND_CONDITIONS = ["0a_blind", "0b_blind", "0c_blind"]
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]

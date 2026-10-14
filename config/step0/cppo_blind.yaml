@@ -1,0 +1,22 @@
+# @package _global_
+# Memoryless control with step 0's settings (ENCODER_PLAN.md), run 0c_blind: CPPO without the battery and without memory.
+#
+# Run 0c (config/step0/cppo_oracle.yaml) in hidden mode, with NoContextEncoder in place of the true battery
+# (step0_oracle.py): the actor and critic read the four hidden-mode values alone, plain PPO's inputs in hidden mode,
+# and the previous action has no effect. It is 0c without the battery, and the experiment A rerun (config/rerun/)
+# without its encoder: the same learner, PPO settings, reward scale, discount, budget and scoring.
+#
+#   python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7
+defaults:
+  - /step0/cppo_oracle
+  - _self_
+experiment_id: S0c_blind
+env:
+  observation_mode: hidden
+cppo:
+  context_source: none
+wandb:
+  # With the inherited "cppo_" prefix: cppo_S0c_blind_gamma0.99_rs0.1_s0 in group cppo_S0c_blind_gamma0.99_rs0.1
+  run_name: S0c_blind_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S0c_blind_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, step0, blind]

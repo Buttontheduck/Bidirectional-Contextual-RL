@@ -1,0 +1,14 @@
+# @package _global_
+# Memoryless control with step 0's settings (ENCODER_PLAN.md), run 0a_blind: run 0a (S0a_observed_bs256) in hidden mode,
+# so plain PPO sees neither the battery nor any history; minibatches of 256 shuffled transitions.
+#
+#   python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7
+defaults:
+  - /experiment/S0a_observed_bs256
+  - _self_
+env:
+  observation_mode: hidden
+wandb:
+  run_name: S0a_blind_bs256_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S0a_blind_bs256_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, step0, blind]

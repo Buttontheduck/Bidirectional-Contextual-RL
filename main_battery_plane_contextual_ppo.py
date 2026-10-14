@@ -58,14 +58,16 @@ from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS  # no
 from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights, terminal_outcome,
 )
-from step0_oracle import TrueBatteryPolicy  # noqa: E402
+from step0_oracle import NoContextPolicy, TrueBatteryPolicy  # noqa: E402
 from step1_controls import (  # noqa: E402
     FLIGHT_PROFILES, BatteryNoiseSwitch, battery_noise_at, make_noisy_battery, switch_source_mismatches,
 )
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
-# cppo.context_source: the xLSTM encoder, or the true battery of step 0 (step0_oracle.py)
-CONTEXT_SOURCES = ("encoder", "oracle")
+# cppo.context_source: the xLSTM encoder, the true battery of step 0, or no context at all (memoryless; step0_oracle.py)
+CONTEXT_SOURCES = ("encoder", "oracle", "none")
+# Policy of each context source; None: cppo.policy with the xLSTM encoder
+CONTEXT_POLICIES = {"encoder": None, "oracle": TrueBatteryPolicy, "none": NoContextPolicy}
 
 
 def context_source_from(cfg: DictConfig) -> str:
@@ -388,18 +390,22 @@ def validate_config(cfg: DictConfig) -> None:
     initial_model_from(cfg)   # a late switch must name the model it continues
     if context_source not in CONTEXT_SOURCES:
         raise ValueError(f"cppo.context_source must be one of {CONTEXT_SOURCES}")
-    if context_source == "oracle":
-        if cfg.env.observation_mode != "observed":
-            raise ValueError(
-                "cppo.context_source=oracle requires env.observation_mode=observed: "
-                "Step 0 keeps noisy speed; full mode supplies exact speed"
-            )
-        if (cppo.encoder_objective != "rl" or cppo.velocity_head.enabled or cppo.context_head != "point"
-                or int(cppo.context_dim) != 1):
-            raise ValueError(
-                "cppo.context_source=oracle has no encoder to train: it needs cppo.encoder_objective=rl, "
-                "cppo.velocity_head.enabled=false, cppo.context_head=point and cppo.context_dim=1"
-            )
+    if context_source == "oracle" and cfg.env.observation_mode != "observed":
+        raise ValueError(
+            "cppo.context_source=oracle requires env.observation_mode=observed: "
+            "Step 0 keeps noisy speed; full mode supplies exact speed"
+        )
+    if context_source == "none" and cfg.env.observation_mode != "hidden":
+        raise ValueError(
+            "cppo.context_source=none requires env.observation_mode=hidden: the memoryless control sees neither the "
+            "battery nor exact speed, like experiment A"
+        )
+    if context_source != "encoder" and (cppo.encoder_objective != "rl" or cppo.velocity_head.enabled
+                                        or cppo.context_head != "point" or int(cppo.context_dim) != 1):
+        raise ValueError(
+            f"cppo.context_source={context_source} has no encoder to train: it needs cppo.encoder_objective=rl, "
+            "cppo.velocity_head.enabled=false, cppo.context_head=point and cppo.context_dim=1"
+        )
     if cppo.encoder_objective == "supervised" and (keys is None or int(cppo.context_dim) != 1):
         raise ValueError(
             "cppo.encoder_objective=supervised fits z_t to the charge b_t: it needs cppo.context_info_keys=[b0,b] "
@@ -438,7 +444,7 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
     keys = cppo.context_info_keys
     velocity = cppo.velocity_head
     return ContextualPPO(
-        policy=TrueBatteryPolicy if context_source_from(cfg) == "oracle" else cppo.policy,
+        policy=CONTEXT_POLICIES[context_source_from(cfg)] or cppo.policy,
         env=env,
         learning_rate=cppo.learning_rate,
         n_steps=int(cppo.n_steps),

@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13, results below); the rest of steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), and the memoryless controls at step 0's settings (2026-10-14; results below); the rest of steps 1–5 planned.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -175,9 +175,68 @@ The new settings did not rescue A. It stays at the blind level, and the planes f
 - **CPPO's training works with a perfect battery.** 0c matches plain PPO with the battery: 249, against 247 for `sb3` observed at 0.99 and 0.01.
 - **Knowing the battery is worth about 200 points.** At 0.99 and 0.01, plain PPO scores 247 with it and 36 without it. That gap is what an encoder can win back.
 - **So the A–F failure lies in the encoder, or in training it together with the policy.** A–F's encoder runs scored around 50, near the blind level. The A rerun with the new settings (22) confirms it: A's unscaled rewards were not the cause.
-- **Settings from here on:** discount 0.99 and reward scale 0.1 (confirmed on 8 seeds). The blind agent was measured at 0.99 and 0.01 (36); measure it at 0.1 before comparing encoders with it. A blind agent reaches about 100 with discount 0.995.
+- **Settings from here on:** discount 0.99 and reward scale 0.1 (confirmed on 8 seeds). The blind agent was measured at 0.99 and 0.01 (36); at 0.1 see the memoryless results below (77 with batch 1024, 115 with CPPO's learner). A blind agent reaches about 100 with discount 0.995.
 - **Low-battery flights fail for every learner and setting**, even with the true battery. This is not a CPPO problem.
 - **Runs are exactly reproducible.** 0c with unscaled rewards repeated its earlier scores (333, 240, 58), so the spread between seeds is the real noise.
+
+**Memoryless agent with step 0's settings (2026-10-14).** The A rerun (22, 17% of flights completed, all failures empty batteries) looks like the memoryless agent: plain PPO in hidden mode scored 36 at reward scale 0.01 and 16 at reward scale 1, with 15–22% completed and the same failures (`sb3_screen1` / `sb3_confirm1`, 8 seeds each). But those runs used another reward scale, only one learner (plain PPO, batch 1024), and a script outside this repo. This control repeats step 0 with the battery hidden and no memory, so that A, the memoryless agent and the agents that see the battery differ in one thing at a time:
+
+| Run | Learner | Sees the battery | Memory | Same as |
+|---|---|---|---|---|
+| 0a_blind | Plain PPO, batch 256 | No (hidden mode) | No | 0a without the battery |
+| 0b_blind | Plain PPO, batch 1024 | No | No | 0b without the battery; the learner of the `sb3_*` runs |
+| 0c_blind | CPPO with no context (`cppo.context_source=none`) | No | No | 0c without the battery, **and the A rerun without its encoder** |
+
+- **Everything else as step 0 and the A rerun:** discount 0.99, reward scale 0.1, 2M steps, 8 environments × 512 steps, 10 epochs, the same networks. The actor and critic have 67,588 and 67,329 parameters, exactly plain PPO's in hidden mode.
+- **Seeds 0–7**, like step 0's confirmation at reward scale 0.1. Memoryless runs vary a lot (one of the 8 `sb3` runs at 0.01 broke down, −295). Training reset seeds are 0–14 and validation seeds 1000–1002; the final test stays unused.
+- **Scoring:** the same validation flights and scoring as everything else, i.e. the late score (1.5M–2M), and completion, battery-empty and ground-crash rates of the final model, overall and for each starting battery.
+- **Implementation:** `step0_oracle.py` adds `NoContextEncoder` (`z_t = 0`, no parameters, no memory) and `NoContextPolicy`, whose actor and critic read the observation only (shared with the oracle in `ObservationOnlyPolicy`). Configs: `config/step0/cppo_blind.yaml`, `ppo/configs/experiment/S0a_blind_bs256.yaml`, `S0b_blind_bs1024.yaml`. `validate_config` requires hidden mode and rejects encoder settings with `context_source=none`.
+- **Report:** `report_step0.py` accepts 0a_blind, 0b_blind and 0c_blind. They share A's protocol, so one report holds A and the three controls.
+- **Checks (`checks.step0_checks`):**
+  - Each control differs from its step 0 run only in the observation mode (and, for 0c_blind, the context source).
+  - 0c_blind differs from the A rerun only in the context source and the encoder objective.
+  - With the same weights, the memoryless CPPO gives exactly plain PPO's hidden-mode values and actions, and the previous action has no effect.
+  - Only the actor and critic learn, and a saved model reloads as `NoContextPolicy`.
+  - Mislabeled runs are rejected by the report.
+- **W&B:** `S0a_blind_bs256_gamma0.99_rs0.1_s<seed>`, `S0b_blind_bs1024_…`, `cppo_S0c_blind_gamma0.99_rs0.1_s<seed>`, tag `blind`.
+
+**Comparisons, fixed before running:**
+1. **A vs. 0c_blind** (same learner): does the encoder add anything? Seeds 0–2 paired, and A's three seeds against 0c_blind's eight.
+2. **0a, 0b, 0c vs. their blind versions** (same seeds 0–7, already run at reward scale 0.1): what knowing the battery is worth for each learner, the environment's main claim.
+3. **0b_blind vs. the `sb3` runs** at 0.01 and 1: how much the reward scale matters without the battery.
+
+```bash
+# 3 controls x seeds 0-7 = 24 runs of 2M steps, all at once with 1 thread each, about 15-20 minutes
+nohup python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7 --jobs 24 --threads 1 > run_blind.log 2>&1 &
+# The launcher prints the report command for the 24 runs; add the A rerun to the same report with
+#   --run A runs_cppo/d36o544n/config.yaml runs_cppo/d36o544n --run A runs_cppo/rxguqn34/config.yaml runs_cppo/rxguqn34 \
+#   --run A runs_cppo/ho5et2ek/config.yaml runs_cppo/ho5et2ek
+# Optional, to put A on 8 seeds too (hours): python run_step0.py --conditions A --seeds 3 4 5 6 7 --threads 4
+```
+
+**Memoryless agent results (2026-10-14).** Seeds 0–7 (A: 0–2), scored like step 0. One report holds A and the three controls (`runs_step0/20261014-020124/report_blind_and_A.json`); the step 0 rows come from the 8-seed confirmation at reward scale 0.1. W&B groups: `S0a_blind_bs256_gamma0.99_rs0.1`, `S0b_blind_bs1024_gamma0.99_rs0.1`, `cppo_S0c_blind_gamma0.99_rs0.1`.
+
+| Agent | Sees the battery | Memory | Late score | Seeds | Completed | Battery ran out | Hit the ground |
+|---|---|---|---:|---|---:|---:|---:|
+| 0a: plain PPO, batch 256 | Yes | No | 246 | 185 – 349 | 88% | 6% | 6% |
+| 0a_blind | No | No | 23 | −14 – 111 | 26% | 74% | 0% |
+| 0b: plain PPO, batch 1024 | Yes | No | 258 | 212 – 304 | 86% | 5% | 9% |
+| 0b_blind | No | No | 77 | 42 – 136 | 15% | 85% | 0% |
+| 0c: CPPO, true battery | Yes | — | 282 | 212 – 361 | 86% | 4% | 10% |
+| 0c_blind: CPPO, no context | No | No | 115 | 90 – 139 | 25% | 75% | 0% |
+| **A rerun: CPPO, learned encoder** | No (infers it) | Yes | **22** | 106 / −3 / −37 | 17% | 83% | 0% |
+
+Flights completed by starting battery (20 / 30 / 40 / 50 / 60 / 70%): 0c 21 / 96 / 100 / 100 / 100 / 100%; 0c_blind 0 / 0 / 0 / 0 / 50 / 100%; A 0 / 0 / 0 / 0 / 33 / 67%.
+
+- **A is worse than the same learner without any context.** CPPO with no battery and no memory scores 115, all 8 seeds between 90 and 139. A scores 22. Seed by seed: equal on seed 0 (106 vs 110), far below on seeds 1 and 2 (−3 vs 139, −37 vs 90), below every memoryless seed. So in two of three seeds the encoder makes CPPO worse, not just useless.
+- **A fails as many flights as the memoryless agents:** 17% completed against 15–26%. Every failure, in A and all three controls, is an empty battery. All of them lose every flight that starts at 40% or less.
+- **Knowing the battery is worth 170–220 points with every learner** (246 vs 23, 258 vs 77, 282 vs 115), and completion rises from 15–26% to 86–88%: the environment's main claim, now at matched settings.
+- **Reward scale 0.1 helps the memoryless agent too:** plain PPO with batch 1024 scores 77, against 36 at 0.01 and 16 at 1 (`sb3` runs). None of the 24 runs broke down.
+- **Without the battery, CPPO's learner does best** (115, against 77 and 23 for plain PPO) and varies least across seeds. The memoryless level that A should beat is therefore 115, not the 16–36 used earlier.
+- **Why A does worse is open.** Candidates:
+  - The encoder changes after every update, so the actor and critic keep chasing a moving input. This is the motivation for a frozen encoder.
+  - The estimate misleads in a consistent way: the average guess at take-off, then a clock (see the encoder-error section below).
+  - With three seeds this can't be settled; A on seeds 3–7 would firm it up.
 
 ### 1. Bracket the encoder with controls
 

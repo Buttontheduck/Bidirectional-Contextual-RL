@@ -9,6 +9,9 @@ more steps with noise; scored on 0.5M-1M after the switch); each is scored the s
 (the protocol includes the battery noise and the schedule). 1a_early, 1b_early, 1c_early see the noise only until
 env.battery_noise_until (500k), then the true battery; scored like step 0, the final validation with the true battery.
 1a_sharp ... 1c_linear see the noise early in every flight and the exact battery from flight step 350 (in-flight noise).
+0a_blind, 0b_blind, 0c_blind are the memoryless controls: 0a, 0b, 0c in hidden mode, without the battery and without
+memory (0c_blind: CPPO with no context, cppo.context_source=none). They share A's protocol, so one report can hold A and
+the three of them.
 
 Example (repeat --run for every condition and seed):
     python report_step0.py --run 0a runs_ppo/<id>/config.yaml runs_ppo/<id> \
@@ -35,7 +38,9 @@ from contextual_ppo.torch_layers import XLSTMRolloutEncoder
 
 
 CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch", "1a_early", "1b_early", "1c_early",
-              "1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear")
+              "1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear", "0a_blind", "0b_blind", "0c_blind")
+# Memoryless controls: the step 0 run each condition repeats in hidden mode, without the battery and without memory
+BLIND = {"0a_blind": "0a", "0b_blind": "0b", "0c_blind": "0c"}
 # Step 1's noisy oracle: the step 0 run each condition repeats with noise on the battery
 NOISY_REPEATS = {"1a": "0a", "1b": "0b", "1c": "0c"}
 # Step 1's late switch: the step 0 run whose final model each condition keeps training
@@ -72,7 +77,8 @@ def run_kind(condition: str) -> str:
     """The step 0 run (0a, 0b, 0c) a step 1 condition repeats with some battery noise; A and step 0 runs themselves."""
     if condition in INFLIGHT_NOISE:
         return INFLIGHT_NOISE[condition][0]
-    return NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition) or condition
+    return (NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition)
+            or BLIND.get(condition) or condition)
 
 
 def evaluation_protocol(cfg, condition: str) -> dict:
@@ -101,7 +107,8 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     if continues != (schedule == "switch"):
         raise ValueError(f"{condition} " + ("must continue a saved step 0 model (training.init_model)" if schedule == "switch"
                                             else "must start from scratch (no training.init_model)"))
-    mode = "hidden" if kind == "A" else "observed"
+    # A and the memoryless controls see no battery
+    mode = "hidden" if kind == "A" or condition in BLIND else "observed"
     if cfg.env.observation_mode != mode:
         raise ValueError(f"Step 0 requires env.observation_mode={mode} for {condition}")
     if not cfg.evaluation.deterministic or int(cfg.evaluation.frequency) != EVAL_FREQUENCY:
@@ -114,8 +121,9 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     if int(cfg.training.n_envs) != 8:
         raise ValueError("Step 0 requires eight training environments")
     if kind == "0c":
-        if "cppo" not in cfg or cfg.cppo.get("context_source") != "oracle":
-            raise ValueError(f"{condition} requires CPPO with context_source=oracle")
+        source = "none" if condition in BLIND else "oracle"
+        if "cppo" not in cfg or cfg.cppo.get("context_source") != source:
+            raise ValueError(f"{condition} requires CPPO with context_source={source}")
         training.validate_config(cfg)
         if int(cfg.cppo.n_minibatches) != 4:
             raise ValueError(f"{condition} requires four whole-stream minibatches")
@@ -241,8 +249,9 @@ def main() -> None:
             raise ValueError(f"Checkpoint rollout/epoch settings do not match Step 0: {directory}")
         kind = run_kind(condition)
         if kind == "0c":
-            if model.n_minibatches != 4 or not isinstance(model.policy, training.TrueBatteryPolicy):
-                raise ValueError(f"{condition} checkpoint must use the oracle policy and four minibatches: {directory}")
+            policy = training.NoContextPolicy if condition in BLIND else training.TrueBatteryPolicy
+            if model.n_minibatches != 4 or not isinstance(model.policy, policy):
+                raise ValueError(f"{condition} checkpoint must use {policy.__name__} and four minibatches: {directory}")
         elif kind == "A":
             if model.n_minibatches != 4 or not isinstance(model.policy.encoder, XLSTMRolloutEncoder):
                 raise ValueError(f"A checkpoint must use the learned xLSTM encoder and four minibatches: {directory}")
