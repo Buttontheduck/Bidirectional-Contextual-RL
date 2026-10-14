@@ -491,6 +491,7 @@ Good pilot's flights at step 250, by starting battery:
 - **For the plan:**
   - An encoder trained on varied flights (step 3) can remove the encoder's own half of the error (on the pilot's flights from about 0.16 to 0.08 at step 250, and to 0.01–0.03 from 40% up).
   - On low-battery flights no encoder can help unless the policy learns to probe first, and the policy should get the estimate's uncertainty (the Gaussian head of C–F).
+  - An easy alternative environment, `EASY_ENV_WARMUP.md`: a 5-second autopilot take-off at full throttle before the agent takes control, which reveals the battery (best possible error 0.05 at hand-over, against 0.12 after 2 s), with the starting battery raised so that the hand-over battery stays uniform on 0.2–0.7.
   - A further control: use the ideal estimator itself as the encoder and train PPO on top. That would give the best score any hidden-mode agent can reach, the honest target for an encoder. At full grid size it is too slow for 2M steps; a coarser grid would take roughly 2 hours per run.
 
 ### 2. Run every condition through plain PPO

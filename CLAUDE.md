@@ -37,6 +37,7 @@ nohup python run_step0.py --conditions 1a_sharp 1b_sharp 1c_sharp 1a_linear 1b_l
 python step1_encoder_error.py --a-runs <A rerun dirs> --pilot-runs <0c dirs, same seeds> --output runs_step0/encoder_error.json  # A encoder's error over a flight, ~30 s
 nohup python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7 --jobs 24 --threads 1 > run_blind.log 2>&1 &   # memoryless controls at step 0's settings, ~15-20 min
 python step1_ideal_estimator.py --a-runs <A rerun dirs> --pilot-runs <0c dirs, same seeds> --output runs_step0/ideal_estimator.json  # best possible battery estimate on the same flights, ~3 min
+python warmup_information.py                         # EASY_ENV_WARMUP.md: what a forced full-throttle take-off reveals, ~2 min
 python -m unittest checks.step1_checks -v
 python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0       # one 0c run: CPPO, true battery
 python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0   # one 0a run (S0b_observed_bs1024: 0b)

@@ -260,6 +260,8 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 2. Train the encoder offline on varied flights from many pilots, gentle and hard, so it learns to read the battery rather than the clock.
 3. Freeze it and train PPO on top, against the oracle and noisy-oracle controls.
 
+**An easy alternative environment** (`EASY_ENV_WARMUP.md`, not implemented yet): a 5-second autopilot take-off at full throttle before the agent takes control reveals the battery to the encoder, while the battery at hand-over stays uniform on 0.2–0.7. It removes the hardest autogenic step (deciding to spend battery to learn the battery), so the current environment stays the main, hard version.
+
 ## 7. Repository map
 
 | Path | What it is |
@@ -274,6 +276,7 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 | `step1_fly_with_noise.py`, `step1_encoder_error.py` | Step 1 analyses |
 | `checks/` | `unittest` checks: configs, seeds, logging, controls |
 | `GRID_PLAN.md`, `ENCODER_PLAN.md` | The A–F grid; the encoder-versus-policy plan with all results so far |
+| `EASY_ENV_WARMUP.md`, `warmup_information.py` | The easy alternative environment (forced take-off) and its measurement |
 | `CLAUDE.md` | Working notes: commands, architecture, protocol rules |
 | `papers/` | The taxonomy paper and the three allogenic-context papers |
 
