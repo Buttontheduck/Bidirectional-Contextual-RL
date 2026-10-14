@@ -232,6 +232,7 @@ Details, tables and W&B groups are in `ENCODER_PLAN.md`. Scores are mean validat
 | Plain PPO, observed mode (batch 256 / 1024) | Yes | No | 246 / 258 | 88% / 86% |
 | Contextual PPO with the true battery | Yes | Oracle | 282 | 86% |
 | Contextual PPO with its learned encoder (experiment A rerun, 3 seeds) | No, inferred | xLSTM | 22 | 17% |
+| Plain PPO with the ideal estimate (batch 256 / 1024) | No, estimated perfectly | Frozen ideal estimator | 283 / 323 | 88% / 92% |
 
 All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0–2), the same 18 validation flights.
 
@@ -239,6 +240,7 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0
 
 - **The environment side holds for memoryless agents.** With every learner, knowing the battery is worth 170–220 points (246 vs 23, 258 vs 77, 282 vs 115), and completion rises from 15–26% to 86–88%.
 - **The memory agent's machinery works.** Given the true battery, Contextual PPO matches or beats plain PPO with the battery.
+- **A perfect battery estimate is enough.** Plain PPO reading the ideal estimator's estimate (the best estimate possible from the same inputs) scores 283 / 323, above plain PPO with the true battery (246 / 258). Flown with the true battery instead, the same policies score 280 / 310, so they are simply better pilots. The bottleneck is the learned encoder.
 - **The learned encoder doesn't yet deliver.** Experiment A scores 22, below Contextual PPO with no context at all (115, all 8 seeds between 90 and 139). Its planes fly like blind agents, fast until the battery runs out, even though its battery estimate is fairly accurate on average (R² 0.80).
 
 **Why, from the step 1 controls**, which replace the encoder with the true battery plus controlled noise:

@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, and the ideal estimator on the validation flights (2026-10-14; results below); the rest of steps 1–5 planned.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below); pilots and a frozen learned encoder (steps 3–4) next.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -529,10 +529,11 @@ Then every condition runs on the same SB3 PPO setup as the p01–p04 baselines. 
 - **Speed:** a run alone trains at about 1,000 steps per second, but 32 side by side at first managed only about 40 each. With 8 × 30,000 candidates per run, every run's data went to main memory instead of the processor's cache.
   - The fix is pruning (`context.prune_below: 30`): candidates whose weight falls below 10⁻¹³ of the best one are dropped, and the rest move to a smaller set.
   - The estimates stay the same to about 10⁻¹², 6–14 times faster (`checks.step2_checks` compares pruned and exact).
-  - With 32 runs side by side each now trains at about 420 steps per second: about 1.5 hours per 2M-step launch, at about 0.6 GB of memory per run.
+  - With 32 runs side by side each now trains at about 420 steps per second early in training, and about 0.6 GB of memory per run.
+  - Later in training, flights get longer and gentle flights keep more candidates, so the 32-run launch of the ideal-context runs took about 3.5 hours.
 
 
-**Plain PPO with the ideal estimate (2026-10-14).** What is the best score an agent that can't see the battery can reach in the hard environment? Plain PPO in hidden mode reads the ideal estimator's battery estimate through the context wrapper. This is the best possible frozen encoder: it reads the battery from the physics on every kind of flight and never changes.
+**Plain PPO with the ideal estimate: design (2026-10-14).** What is the best score an agent that can't see the battery can reach in the hard environment? Plain PPO in hidden mode reads the ideal estimator's battery estimate through the context wrapper. This is the best possible frozen encoder: it reads the battery from the physics on every kind of flight and never changes.
 
 | Run | Learner | What PPO reads | Compared with |
 |---|---|---|---|
@@ -554,9 +555,95 @@ Then every condition runs on the same SB3 PPO setup as the p01–p04 baselines. 
 - **std:** if the `_std` runs score clearly higher (beyond the seed spread), give the learned encoder an uncertainty output too (the Gaussian head of C–F).
 
 ```bash
-# 4 conditions x seeds 0-7 = 32 runs of 2M steps, all at once with 1 thread each, about 1.5 hours
+# 4 conditions x seeds 0-7 = 32 runs of 2M steps, all at once with 1 thread each, about 3.5 hours
 nohup python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1 > run_ideal_ppo.log 2>&1 &
 ```
+
+**Plain PPO with the ideal estimate: results (2026-10-14).** All 32 runs finished, none failed. Each run took 1.5–3.5 hours with 32 side by side (about 3.5 hours for the launch), not the 1.5 hours estimated from the first rollouts. Later in training flights get longer, and on gentle flights the estimator keeps many candidates alive.
+
+The reports, one per variant: `runs_step0/20261014-044145/step0_report_ideal.json` and `step0_report_ideal_std.json`. W&B groups: `S2a_ideal_bs256_gamma0.99_rs0.1`, `S2b_ideal_bs1024_gamma0.99_rs0.1`, `S2a_ideal_std_bs256_gamma0.99_rs0.1`, `S2b_ideal_std_bs1024_gamma0.99_rs0.1`. The true-battery rows come from the 8-seed step 0 confirmation at reward scale 0.1, and the memoryless rows from the memoryless controls; all use the same settings, seeds 0–7 and scoring.
+
+*Late score (1.5M–2M), mean over seeds 0–7 (spread across seeds = population std):*
+
+| Plain PPO | True battery (0a / 0b) | No battery, no memory (0a_blind / 0b_blind) | Ideal estimate (2a / 2b_ideal) | Ideal estimate + std (2a / 2b_ideal_std) |
+|---|---:|---:|---:|---:|
+| Batch 256 | 246 (52) | 23 (41) | **283** (40) | **303** (19) |
+| Batch 1024 | 258 (30) | 77 (32) | **323** (22) | **325** (16) |
+
+*Per seed (0–7):*
+
+| Run | Seeds 0–7 |
+|---|---|
+| 0a, true battery | 349, 246, 233, 231, 310, 219, 199, 185 |
+| 2a_ideal | 243, 285, 312, 285, 222, 355, 304, 256 |
+| 2a_ideal_std | 306, 300, 317, 307, 327, 320, 265, 281 |
+| 0b, true battery | 268, 292, 265, 248, 256, 304, 212, 222 |
+| 2b_ideal | 329, 323, 270, 332, 342, 344, 323, 321 |
+| 2b_ideal_std | 348, 309, 304, 337, 309, 329, 319, 347 |
+
+*Outcomes of the final models (18 validation flights per seed):*
+
+| Run | Completed | Battery ran out | Hit the ground |
+|---|---:|---:|---:|
+| 0a / 0b (true battery) | 88% / 86% | 6% / 5% | 6% / 9% |
+| 0a_blind / 0b_blind | 26% / 15% | 74% / 85% | 0% / 0% |
+| 2a_ideal / 2b_ideal | 88% / 92% | 10% / 2% | 2% / 6% |
+| 2a_ideal_std / 2b_ideal_std | 90% / 90% | 5% / 3% | 6% / 7% |
+
+*By starting battery (20 / 30 / 40 / 50 / 60 / 70%), final models:*
+
+| Run | Flights completed | Return | Mean throttle |
+|---|---|---|---|
+| 0a, true battery | 29 / 100 / 100 / 100 / 100 / 100% | −160 / 178 / 243 / 322 / 411 / 512 | −0.12 / 0.32 / 0.40 / 0.48 / 0.57 / 0.65 |
+| 2a_ideal | 29 / 96 / 100 / 100 / 100 / 100% | −121 / 168 / 259 / 334 / 429 / 521 | 0.19 / 0.29 / 0.38 / 0.47 / 0.57 / 0.64 |
+| 2a_ideal_std | 42 / 96 / 100 / 100 / 100 / 100% | −45 / 195 / 276 / 353 / 449 / 542 | 0.25 / 0.34 / 0.40 / 0.50 / 0.60 / 0.67 |
+| 0b, true battery | 17 / 100 / 100 / 100 / 100 / 100% | −215 / 169 / 238 / 313 / 402 / 508 | −0.01 / 0.30 / 0.37 / 0.45 / 0.54 / 0.63 |
+| 2b_ideal | 54 / 96 / 100 / 100 / 100 / 100% | 1 / 196 / 272 / 356 / 462 / 561 | 0.28 / 0.34 / 0.41 / 0.51 / 0.62 / 0.69 |
+| 2b_ideal_std | 42 / 96 / 100 / 100 / 100 / 100% | −54 / 209 / 291 / 376 / 476 / 577 | 0.24 / 0.35 / 0.44 / 0.55 / 0.65 / 0.73 |
+| 0a_blind / 0b_blind | 0–42% up to 60%, 67–100% at 70% | −202 to 380 / −241 to 510 | about 1.0 at 20–40%, falling to 0.8–0.9 at 70% |
+
+*Gap closed* = (ideal − memoryless) / (true battery − memoryless), on the same seeds:
+
+| | Ideal estimate | Ideal estimate + std |
+|---|---:|---:|
+| Batch 256 | 116% | 125% |
+| Batch 1024 | 136% | 137% |
+
+**Why above the true battery? The swap check.** `step2_swap_battery.py` flies the final 2a_ideal and 2b_ideal models over the validation flights twice: once with the estimate they were trained on, and once with the true battery swapped into the same input (`context.source=true_battery`). Results are in `runs_step0/20261014-044145/swap_true_battery.json`.
+
+| Final models | Flown with the ideal estimate | Flown with the true battery instead |
+|---|---:|---:|
+| 2a_ideal (batch 256) | 265, 88% completed | **280**, 92% completed |
+| 2b_ideal (batch 1024) | 308, 92% completed | **310**, 92% completed |
+
+```bash
+python step2_swap_battery.py --runs runs_step0/20261014-044145/runs.json --output runs_step0/20261014-044145/swap_true_battery.json
+```
+
+**What it shows:**
+
+- **A perfect frozen encoder is enough in the hard environment.** Plain PPO reading the ideal estimate closes the whole gap between "no battery" (23 / 77) and "true battery" (246 / 258), and goes beyond it: 283 / 323, or 303 / 325 with the std. Completion rises from 15–26% to 88–92%. This holds although gentle flying hides the battery on low-battery flights: on 20%-battery flights the ideal-estimate agents complete 29–54%, against 17–29% with the true battery.
+- **By the decision rule fixed before running, the encoder is the bottleneck.** A's learned encoder (22) and the memoryless agents (23–115) are far below what a good battery estimate makes possible with the same environment and PPO settings. A's failure comes from its encoder (what it learned, and learning it together with the policy), not from the environment being unsolvable for an agent that must infer its battery.
+- **The estimate-trained policies are simply better pilots.** Flown with the true battery instead of the estimate, they score the same or slightly higher (280 vs 265, 310 vs 308), still above the agents trained on the true battery (246, 258).
+  - So the estimate carried no information beyond the battery that the policies depend on: the advantage comes from training, not from what they read.
+  - The difference shows most on low-battery flights. On 20%-battery flights the true-battery agents' mean throttle is negative (−0.12 and −0.01): they push the cruise motor backwards on average, which slows the plane and still costs battery. The estimate-trained agents fly forward gently (0.19–0.28) and complete more of those flights.
+  - On high-battery flights they throttle about as hard or slightly harder (0.64–0.73 against 0.63–0.65 at 70%) and earn more there (521–577 against 508–512).
+- **A likely reason, not yet tested: uncertainty early in each flight helps PPO learn.** The estimate starts every flight at the same guess (0.45) and becomes accurate as the flight goes on, so the policy first learns behaviour that works for every battery and then refines it. The in-flight noise runs showed the same pattern: with noise fading out by mid-flight, the agents scored 284 / 351 / 309 against 276 / 275 / 282 with the true battery from the start (seeds 0–2).
+- **The std input helps a little at most.**
+  - At batch 256: 303 against 283, better on 6 of 8 seeds, and much tighter across seeds (spread 19 against 40), with more 20%-battery flights completed (42% against 29%). But the difference is within about 1.3 standard errors.
+  - At batch 1024: no difference (325 against 323, better on 4 of 8 seeds).
+  - By the decision rule ("clearly higher beyond the seed spread") the std is optional. A learned encoder can start with a point estimate; an uncertainty output (the Gaussian head of C–F) remains worth trying.
+- **Batch 1024 does better than batch 256** with the ideal estimate (323 against 283), as it did without memory (77 against 23), and varies less across seeds.
+
+**Caveats:**
+- The true-battery runs come from an earlier launch, with the same code path and settings; the swap check, which uses the same models and flights, supports the comparison.
+- The ideal estimate is computed online on a coarser grid (101 × 301) with pruning, which matches the full computation to about 1e-12. It is still a bound for estimators with this physics model and prior, not for encoders with other information.
+- The learner is plain PPO. CPPO with the ideal estimate was not run; CPPO's own learner did best without memory (115), so it may do at least as well.
+
+**Next steps:**
+1. **Pilots and an offline-trained frozen encoder** (steps 3–4). Plug it into the same wrapper (`context.source=encoder`) and compare with these runs. The target is to get close to the ideal estimator's error at each flight step on every pilot style (`step1_ideal_estimator.py`), and a PPO score near 283 / 323.
+2. **Optional and cheap: A's own encoder, frozen, under a fresh plain PPO** (`context.source=encoder`, `context.encoder_model=runs_cppo/<A run>/final_model.zip`). Between A (22) and the ideal (283 / 323), this separates what A's encoder knows from the cost of training it together with the policy.
+3. **Optional:** rerun 0a / 0b in one launch with the ideal runs, to rule out launch-to-launch differences. And test the "uncertainty helps training" idea directly, for example the true battery with noise fading out by mid-flight against the true battery alone, on 8 seeds.
 
 ### 3. Pilots
 
