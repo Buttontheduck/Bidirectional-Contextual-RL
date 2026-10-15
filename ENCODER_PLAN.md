@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured (results below); diagnostic probes of the encoder, then freezing it under plain PPO, next.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes running since 2026-10-15 22:18 (results below); freezing the encoder under plain PPO next.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -795,18 +795,20 @@ python -m unittest checks.step3_checks -v
 - **Launch:** 3 seeds of each design side by side, 2 threads each, W&B project `battery-encoder` (groups `E1_point_main` and `E3_point_b0_main`).
 - **Cost:** about 62 (E1) and 65 (E3) minutes per pass. The step-by-step xLSTM training is limited by memory speed: one run alone does about 7,700 flight steps per second, six together about 22,700 in total, and more threads or runs don't help.
 
-**Status after 5 passes (validation, best pass so far):**
+**Status after 6 passes (2026-10-15 22:45; validation, best pass so far):**
 
 | | Typical error | At 1 s | At 5 s | At 20 s | Gap closed |
 |---|---:|---:|---:|---:|---:|
 | Clock-only estimate | 0.141 | 0.144 | 0.144 | 0.139 | 0% |
 | **Floor (ideal estimator)** | **0.084** | 0.133 | 0.096 | 0.071 | 100% |
-| E1, seeds 0–2 | 0.127–0.130 | 0.144–0.145 | 0.139–0.140 | 0.119–0.124 | 19–25% |
-| E3, seeds 0–2 | 0.128–0.131 | 0.144–0.155 | 0.140–0.148 | 0.120–0.121 | 17–23% |
+| E1, seeds 0–2 | 0.126–0.128 | 0.144 | 0.138–0.139 | 0.118–0.120 | 24–26% |
+| E3, seeds 0–2 | 0.127–0.128 | 0.144–0.145 | 0.140–0.141 | 0.119–0.121 | 22–24% |
 
 *Gap closed* = (clock − encoder) / (clock − floor).
-- **The encoders have barely moved since pass 2** (best validation error 0.128–0.131 then, 0.127–0.131 now).
-- **E3's starting-battery head has stayed at 0.136–0.139:** the same as guessing the average starting battery (0.144). The encoder does not identify the starting battery.
+- **The encoders have barely moved since pass 2** (best validation error 0.128–0.131 then, 0.126–0.128 now).
+- **E1 seed 2 stopped first** (after pass 6, best pass 3, 6.3 h). Its test error is 0.129, against 0.144 for the clock and 0.085 for the floor: 26% of the gap, the same picture as on validation.
+- **E3's starting-battery head has stayed at 0.136–0.137** (one pass at 0.149–0.152): the same as guessing the average starting battery (0.144). The encoder does not identify the starting battery.
+- **Training error is as high as validation error** (about 0.131 against 0.127 at pass 5): the encoder underfits; it isn't memorising flights.
 
 **The floor (`step4_floor.py`, `runs_encoder/step4/floor_v2_main`).** This is the best estimate possible on the same flights from the same inputs: the ideal estimator (`IdealBatteryEstimator`) over the 1,900 validation and 1,900 test flights. It reads hidden observations and executed actions only, knows the physics exactly, and is deterministic.
 
@@ -844,17 +846,53 @@ Per style (validation), the clock, the floor, and the best pass of E1 and E3 see
 - **The floor itself is trustworthy:** its stated uncertainty matches its errors (median 0.40–0.42 against 0.45 for a calibrated estimate), and its grid is fine enough (climb-rate mismatch 0.0016 m/s).
 - **Grid:** step 2's grid (101 × 301, with pruning) is the default. The full grid (201 × 601) gave the same estimates within 0.003 (mean 0.0002) on 160 flights, but took 12 times longer (126 s against 10 s) because its arrays spill out of the CPU caches and run at memory speed beside the training runs. The floor took 3.1 minutes with 16 processes.
 
-**Diagnostics (built, not yet run): `step4_probes.py`.** These test whether the stall comes from xLSTM or from the training, on the same split and error measures:
+**Diagnostics (running since 2026-10-15 22:18): `step4_probes.py`.** These test whether the stall comes from xLSTM or from the training, on the same split and error measures:
 - **Test tasks, each with a label computed from the flights:**
   - `count`: thrust used so far, dt/E × Σ(a_x² + a_y²) over the executed actions. It is fully determined by the inputs, so its floor is 0. Tests counting.
   - `find`: the starting battery, on full-throttle flights, where the speed gives it away. Tests reading the battery from the speed.
   - `battery`: the real task.
 - **Architectures:** A's xLSTM, and PyTorch's GRU and LSTM (2 layers of width 128, A's head). The GRU and LSTM read whole flights in optimised code: about 4.4 and 2.8 minutes per pass over all training flights, against about an hour for the xLSTM.
+- **Checks (`checks.step4_checks`):**
+  - The count label adds exactly dt/E × (a_x² + a_y²) of the previous action at every step, from the actions only.
+  - No encoder looks ahead: changing a flight after a step never changes the estimates up to it, for the xLSTM, GRU and LSTM. So no encoder can use how long a flight lasts, which on full-throttle flights gives the starting battery away.
+  - Padding changes nothing, and runs are reproducible.
+  - Four flights of every style of dataset v2, replayed in a hidden-mode plane with the same seed and actions, match the recorded inputs and labels within 3e-8.
+- **Launch (22:18):** the GRU on all three tasks, seeds 0–2, 1 thread each at low priority (`nice`), beside the E1/E3 runs. A pass takes 8.1–8.7 minutes for `battery` and `count`.
+
+**Early probe results:**
+
+| Task | GRU | Clock-only | Floor |
+|---|---:|---:|---:|
+| `count`, validation, after 3 passes | 0.007–0.011 | 0.083 | 0 |
+| `battery`, validation, after 3 passes | 0.127–0.129 | 0.141 | 0.084 |
+| `find` on dataset v2 (1,600 training flights), test | 0.122–0.124 | 0.122 | 0.057 |
+| `find` at 5 s / 20 s | 0.143–0.147 / 0.091–0.093 | 0.143 / 0.094 | 0.060 / 0.022 |
+
+- **Counting is learnable:** after 3 passes the GRU's error is about a tenth of the clock's (the count ends at 0.21 on average, at most 0.70).
+- **On the real task, the GRU after 3 passes is where the xLSTM is after 6** (0.127–0.129 against 0.126–0.128). Too early to compare.
+- **On `find`, the GRU learned only the clock:**
+  - On full-throttle flights the clock knows something: a plane still flying late probably started with more battery, since low-battery flights run out first.
+  - The GRU didn't use the speed, while the ideal estimator's estimate of b0 (its posterior mean over the starting batteries, on the same 200 test flights) is within 0.022 by 20 s.
+- **But that `find` run was too short to judge:**
+  - With 1,600 training flights a pass is only 50 gradient steps, and the runs stopped after 350–600 steps. E1 does 475 per pass.
+  - With only 200 validation flights the error jumped by chance (0.122–0.134), so early stopping came too soon.
+
+**`find` again, on 20,000 full-throttle flights (`runs_encoder/pilot_flights/ft20k`, launched 22:41).**
+- `pilots.py --styles full_throttle --flights 20000` generated them in 73 seconds with 12 processes.
+- **Checked:**
+  - The first 2,000 are bit-for-bit those of dataset v2.
+  - The 20,000 seeds (8,100,000–8,119,999) are distinct and overlap no other style. No held-out seed is among them.
+  - The physics settings are the same, and the style doesn't leak.
+- **Split:** 16,000 / 2,000 / 2,000, by the same rule. A pass is now about 500 gradient steps, like E1, and early stopping is decided on 2,000 validation flights.
+- **W&B:** a run on a non-default dataset adds the dataset folder to its name: group `probe_gru_find_narrow_ft20k`, runs `..._s0/1/2`.
+- **Expected to finish:** around 23:55–01:00, like the `battery` and `count` runs.
 
 ```bash
 python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4      # E3: --design E3
 python step4_floor.py --output runs_encoder/step4/floor_v2_main --jobs 16           # about 3 minutes
 python step4_probes.py --arch gru --task battery --seed 0                           # tasks count, find, battery; archs xlstm, gru, lstm
+python pilots.py --output runs_encoder/pilot_flights/ft20k --styles full_throttle --flights 20000 --jobs 12   # about 1 minute
+python step4_probes.py --arch gru --task find --seed 0 --data runs_encoder/pilot_flights/ft20k
 python -m unittest checks.step4_checks -v
 ```
 
@@ -879,7 +917,7 @@ Steps 1–5 originally listed 8 conditions × 3 seeds = 24 PPO runs: oracle, thr
    - Split by whole flights for validation. Keep some styles out entirely for the cross-pilot matrix.
    - Train until the validation loss plateaus. Reuse the enc1 training setup where it fits; its input is `pilots.load_flights` (observations, previous actions, true battery, style).
    - Save it so `FrozenEncoderContext` can load it. Done: each run saves `encoder_model.zip`, a Contextual_PPO model holding the best encoder.
-2. **Measure it before plugging it in** (section 4). The floor is measured (0.084 on validation, step 4 results above); the encoders close only 17–25% of the gap so far. Next, the diagnostic probes (`step4_probes.py`: counting, finding, GRU / LSTM). Still to do:
+2. **Measure it before plugging it in** (section 4). The floor is measured (0.084 on validation, step 4 results above); the encoders close only 22–26% of the gap so far. The diagnostic probes (`step4_probes.py`: counting, finding, GRU / LSTM) are running. Still to do:
    - Error at 1, 5 and 20 s and over the whole flight, for each style.
    - Compare against the clock-only estimate and the ideal estimator (`step1_ideal_estimator.py`) on the same flights.
    - Run the leak test: test the `main_plus_aware` encoder on battery-blind pilots.

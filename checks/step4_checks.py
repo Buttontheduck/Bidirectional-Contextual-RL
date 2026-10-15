@@ -197,6 +197,23 @@ class Step4Checks(unittest.TestCase):
         for a, b in zip(count, PR.task_labels("count", changed, dt, E)):
             np.testing.assert_array_equal(a, b)
 
+    def test_no_encoder_looks_ahead(self):
+        # Changing a flight after step t0 never changes the estimates up to t0 (e.g. how long the flight lasts, which on
+        # full-throttle flights gives the starting battery away, can't reach an earlier estimate)
+        i, t0 = int(np.argmax(self.flights.lengths)), 30
+        batch = self.flights.batch([i])
+        changed = {key: value.clone() for key, value in batch.items()}
+        changed["observations"][:, t0 + 1:] += torch.randn_like(changed["observations"][:, t0 + 1:])
+        changed["prev_actions"][:, t0 + 1:] = -changed["prev_actions"][:, t0 + 1:]
+        changed["mask"][:, t0 + 40:] = False                                  # and a shorter flight
+        for arch in PR.ARCHS:
+            torch.manual_seed(0)
+            model = PR.make_model(arch, self.cfg, 32, 2).eval()
+            with torch.no_grad():
+                before, after = PR.predict(model, arch, batch), PR.predict(model, arch, changed)
+            torch.testing.assert_close(after[0, :t0 + 1], before[0, :t0 + 1], rtol=0, atol=1e-6, msg=arch)
+            self.assertFalse(torch.allclose(after[0, t0 + 1:t0 + 40], before[0, t0 + 1:t0 + 40]), arch)
+
     def test_gru_and_lstm_read_the_same_inputs_and_padding_changes_nothing(self):
         short, long = (int(i) for i in np.argsort(self.flights.lengths)[[0, -1]])
         for arch in ("gru", "lstm"):

@@ -25,7 +25,8 @@ The training seed sets only the initial weights and the batch order. Each epoch 
 scored once with the best checkpoint, next to the clock-only estimate (the mean label at each flight step).
 
 Outputs (<output root>/<name>/; runs_encoder/ is gitignored): config.json, metrics.jsonl, best.pt, last.pt, result.json.
-W&B: project battery-encoder, group probe_<arch>_<task>_<mix>[_n<train flights>][_lr<rate>], run <group>_s<seed>.
+W&B: project battery-encoder, group probe_<arch>_<task>_<mix>[_<dataset folder, if not v2>][_n<train flights>][_lr<rate>],
+run <group>_s<seed>.
 
     python step4_probes.py --arch gru --task battery --seed 0
     python step4_probes.py --arch xlstm --task count --train-flights 3000 --seed 0
@@ -154,7 +155,9 @@ def main(argv=None) -> None:
     th.set_num_threads(args.threads)
     if th.get_num_interop_threads() != 1:
         th.set_num_interop_threads(1)
-    group = (f"probe_{args.arch}_{args.task}_{mix}" + (f"_n{args.train_flights}" if args.train_flights else "")
+    # Another dataset than v2 adds its folder name, so W&B names and run directories stay distinct
+    data_tag = "" if args.data.resolve() == T.DEFAULT_DATA.resolve() else f"_{args.data.name}"
+    group = (f"probe_{args.arch}_{args.task}_{mix}{data_tag}" + (f"_n{args.train_flights}" if args.train_flights else "")
              + (f"_lr{args.learning_rate:g}" if args.learning_rate != DEFAULT_LEARNING_RATE else ""))
     name = f"{group}_s{args.seed}"
     run_dir = args.output_root / name
@@ -169,12 +172,16 @@ def main(argv=None) -> None:
     core = bp.BatteryPlaneVec(n_envs=1, observation_mode="hidden", seed=0, **env_kwargs)
     steps_at = {f"{s}s": int(round(s / core.dt)) for s in T.SECONDS_AT}
     flights, _ = T.load(args.data, mix, args.max_flights)
+    leaking = [s for s in pilots.MIXES[mix] if manifest["styles"][s]["leaks"]]
     data = {"observations": flights.observations, "prev_actions": flights.prev_actions, "batteries": flights.batteries,
             "styles": flights.styles, "seeds": flights.seeds}
     # From here on, Flights.batteries holds the task's labels (the true battery only for --task battery)
     flights = T.Flights({**data, "batteries": task_labels(args.task, data, core.dt, core.E)})
     rows = {split: flights.indices(split) for split in ("train", "validation", "test")}
-    if args.train_flights is not None and args.train_flights < len(rows["train"]):
+    if args.train_flights is not None:
+        # The run's name says _n<train flights>: refuse a subset that isn't one
+        if args.train_flights >= len(rows["train"]):
+            parser.error(f"--train-flights {args.train_flights} is not smaller than the {len(rows['train'])} training flights")
         rows["train"] = rows["train"][np.unique(np.linspace(0, len(rows["train"]) - 1, args.train_flights).round().astype(int))]
     if any(len(r) == 0 for r in rows.values()):
         parser.error(f"Empty split: { {k: len(v) for k, v in rows.items()} }")
@@ -189,7 +196,7 @@ def main(argv=None) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     settings = {
         "arch": args.arch, "task": args.task, "name": name, "group": group, "seed": args.seed, "mix": mix,
-        "styles": list(pilots.MIXES[mix]), "data": str(args.data), "train_flights": args.train_flights,
+        "styles": list(pilots.MIXES[mix]), "leaking_styles": leaking, "data": str(args.data), "train_flights": args.train_flights,
         "batch_size": args.batch_size, "learning_rate": args.learning_rate, "max_grad_norm": args.max_grad_norm,
         "max_epochs": args.max_epochs, "patience": args.patience, "threads": args.threads, "max_flights": args.max_flights,
         "hidden": args.hidden if args.arch != "xlstm" else None, "layers": args.layers if args.arch != "xlstm" else None,
