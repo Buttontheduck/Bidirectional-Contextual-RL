@@ -1,4 +1,4 @@
-"""CPU checks of step 4 (ENCODER_PLAN.md), offline encoder training: python -m unittest checks.step4_checks -v
+"""CPU checks of step 4 (ENCODER_PLAN.md), offline encoder training and its floor: python -m unittest checks.step4_checks -v
 
 The checks that train read the pilot flights of dataset v2 (runs_encoder/pilot_flights/v2, gitignored) and are skipped
 without it; the others use a few flights generated on the spot.
@@ -16,6 +16,8 @@ import torch
 
 from context_wrapper import FrozenEncoderContext
 import pilots as P
+import step4_floor as F
+import step4_probes as PR
 import train_encoder as T
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +150,112 @@ class Step4Checks(unittest.TestCase):
         stepped = [source.step(np.array([True]), observations[t:t + 1], previous[t:t + 1], np.array([t == 0]),
                                np.array([False]), [{}])[0, 0] for t in range(len(observations))]
         np.testing.assert_allclose(stepped, expected[0].numpy(), atol=1e-5)
+
+    def test_floor_reads_hidden_inputs_and_agrees_with_the_physics(self):
+        grid = {"b_points": 41, "vx_points": 121, "prune_below": 30.0}
+        rows = range(len(self.flights.seeds))
+        flights = [(self.flights.seeds[i], self.flights.observations[i], self.flights.prev_actions[i]) for i in rows]
+        # Every flight is explained, including those that end with an empty battery or on the ground
+        estimates = F.estimate_flights(flights, grid, {})
+        for i, flight in zip(rows, estimates):
+            n = self.flights.lengths[i]
+            self.assertEqual((len(flight["means"]), len(flight["stds"])), (n, n))
+            errors = np.abs(flight["means"] - self.flights.batteries[i])
+            if self.flights.styles[i] == "full_throttle":
+                # At the cap all flight: the battery is known within a few percent by 20 s (or the flight's end)
+                self.assertLess(errors[min(400, n - 1)], 0.05)
+            if self.flights.styles[i] == "steady_below":
+                # Never at the cap: the battery stays uncertain
+                self.assertGreater(flight["stds"][-1], 0.08)
+        # Nothing carries over between flights in a worker: a flight alone or after others gets the same estimates,
+        # so the results don't depend on --jobs or --chunk
+        alone = F.estimate_flights(flights[-1:], grid, {})[0]
+        np.testing.assert_array_equal(alone["means"], estimates[-1]["means"])
+        np.testing.assert_array_equal(alone["stds"], estimates[-1]["stds"])
+        # An observation with a battery column is refused
+        seed, observations, prev_actions = flights[0]
+        with_battery = np.concatenate([observations, np.full((len(observations), 1), 0.5, np.float32)], axis=1)
+        with self.assertRaises(ValueError):
+            F.estimate_flights([(seed, with_battery, prev_actions)], grid, {})
+
+    def test_probe_labels_come_from_the_flights_as_defined(self):
+        data = P.load_flights(self.data, STYLES)
+        dt, E = 0.05, 100.0
+        count, find, battery = (PR.task_labels(task, data, dt, E) for task in ("count", "find", "battery"))
+        for i in range(len(data["seeds"])):
+            prev = data["prev_actions"][i].astype(np.float64)
+            # count: zero at the start, then a_{t-1}^2 * dt / E added at every step (inputs only)
+            self.assertEqual(count[i][0], 0.0)
+            # (float32 labels: rounding of about 1e-7, against increments of about 1e-4)
+            np.testing.assert_allclose(np.diff(count[i]), dt / E * (prev[1:] ** 2).sum(axis=1), atol=1e-6)
+            self.assertTrue((np.diff(count[i]) <= 2 * dt / E + 1e-6).all())
+            # find: the starting battery at every step; battery: the true battery
+            np.testing.assert_array_equal(find[i], np.full(len(find[i]), data["batteries"][i][0], np.float32))
+            np.testing.assert_array_equal(battery[i], data["batteries"][i])
+        # count never reads the battery: other batteries, the same labels
+        changed = {**data, "batteries": [b * 0.5 for b in data["batteries"]]}
+        for a, b in zip(count, PR.task_labels("count", changed, dt, E)):
+            np.testing.assert_array_equal(a, b)
+
+    def test_gru_and_lstm_read_the_same_inputs_and_padding_changes_nothing(self):
+        short, long = (int(i) for i in np.argsort(self.flights.lengths)[[0, -1]])
+        for arch in ("gru", "lstm"):
+            torch.manual_seed(0)
+            model = PR.make_model(arch, self.cfg, 32, 2).eval()
+            self.assertEqual(model.input_projection.in_features, 6)       # o_t (4) and a_{t-1} (2): no battery
+            with torch.no_grad():
+                alone = PR.predict(model, arch, self.flights.batch([short]))
+                together = PR.predict(model, arch, self.flights.batch([short, long]))
+            n = self.flights.lengths[short]
+            torch.testing.assert_close(together[0, :n], alone[0], rtol=0, atol=1e-6)
+            self.assertTrue(((together > 0) & (together < 1)).all())
+
+    @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
+    def test_probes_end_to_end_are_reproducible_and_refuse_reuse(self):
+        with tempfile.TemporaryDirectory() as folder:
+            def probe(root, *extra):
+                PR.main(["--arch", "gru", "--task", "find", "--seed", "1", "--output-root", str(root), "--max-flights", "8",
+                         "--max-epochs", "1", "--batch-size", "4", "--threads", "1", "--hidden", "16", "--wandb-mode",
+                         "disabled", "--log-every", "1000", *extra])
+                return root / "probe_gru_find_narrow_n5_s1"
+            first, again = probe(Path(folder) / "a", "--train-flights", "5"), probe(Path(folder) / "b", "--train-flights", "5")
+            a = torch.load(first / "best.pt", weights_only=False)["state_dict"]
+            b = torch.load(again / "best.pt", weights_only=False)["state_dict"]
+            for key in a:
+                torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
+            settings = json.loads((first / "config.json").read_text())
+            self.assertEqual(settings["split"]["flights"], {"train": 5, "validation": 8, "test": 8})
+            self.assertEqual(settings["styles"], ["full_throttle"])
+            result = json.loads((first / "result.json").read_text())
+            self.assertEqual(set(result["test"]["rmse_by_style"]), {"full_throttle"})
+            with self.assertRaises(SystemExit):
+                probe(Path(folder) / "a", "--train-flights", "5")
+
+    @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
+    def test_floor_end_to_end(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / "floor"
+            args = ["--output", str(out), "--max-flights", "6", "--jobs", "2", "--chunk", "3", "--b-points", "41",
+                    "--vx-points", "121"]
+            # In a fresh process: it never loads torch, W&B or Hydra, so it can't touch the training runs' W&B
+            code = (f"import sys, step4_floor as F; F.main({args!r}); "
+                    "print('loaded:', sorted(m for m in ('torch', 'wandb', 'hydra') if m in sys.modules))")
+            run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+            self.assertIn("loaded: []", run.stdout)
+            result = json.loads((out / "floor.json").read_text())
+            self.assertGreater(result["validation"]["calibration_median"], 0)
+            for split in ("validation", "test"):
+                self.assertLess(result[split]["rmse"], result[f"clock_{split}"]["rmse"] + 0.05)
+                self.assertLess(result[split]["max_vy_mismatch"], 0.05)
+            with np.load(out / "estimates.npz") as arrays:
+                seeds, offsets, splits = arrays["seeds"], arrays["flight_offsets"], arrays["splits"]
+                self.assertEqual(len(seeds), 12)
+                self.assertEqual(offsets[-1], len(arrays["means"]))
+                self.assertTrue(all(T.split_of(s) == split != "train" for s, split in zip(seeds, splits)))
+                self.assertFalse(set(seeds.tolist()) & P.HELD_OUT_SEEDS)
+            with self.assertRaises(SystemExit):
+                F.main(args)
 
     @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
     def test_training_end_to_end_is_reproducible_and_refuses_reuse(self):

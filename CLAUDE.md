@@ -44,9 +44,11 @@ python -m unittest checks.step1_checks -v
 python -m unittest checks.step2_checks -v          # context_wrapper.py: frozen battery estimate appended for plain PPO
 python pilots.py --output runs_encoder/pilot_flights/<name> --jobs 30 --policy-reports <report_step0 reports>  # step 3: pilot flights for the offline encoder, ~5 min
 python -m unittest checks.step3_checks -v          # pilots.py: no hidden channel, below-cap pilots, replay without leaks
-python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4   # step 4: A's encoder trained offline on the pilot flights (E3: + b0 head), ~25 min per epoch, early stopping
+python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4   # step 4: A's encoder trained offline on the pilot flights (E3: + b0 head); 6 runs x 2 threads side by side: ~45 min per epoch each, early stopping
 python train_encoder.py --design E3 --seed 0 --smoke                             # tiny run, W&B disabled, runs_encoder/step4_smoke/
-python -m unittest checks.step4_checks -v          # train_encoder.py: split by flight seed, inputs, padding, reproducible, loads in the context wrapper
+python step4_floor.py --output runs_encoder/step4/floor_v2_main --jobs 16   # the floor: ideal estimator on the encoders' validation/test flights, ~4 min
+python step4_probes.py --arch gru --task battery --seed 0     # step 4 diagnostics: tasks count (thrust used so far), find (b0, full-throttle flights), battery; archs xlstm, gru, lstm (GRU ~4 min per epoch)
+python -m unittest checks.step4_checks -v          # train_encoder.py: split by flight seed, inputs, padding, reproducible, loads in the context wrapper; step4_floor.py; step4_probes.py
 python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0       # one 0c run: CPPO, true battery
 python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0   # one 0a run (S0b_observed_bs1024: 0b)
 python -m unittest checks.step0_checks -v
