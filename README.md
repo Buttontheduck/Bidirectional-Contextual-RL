@@ -274,6 +274,7 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 | `ppo/` | Plain SB3 PPO baselines (hidden and observed mode) |
 | `step0_oracle.py`, `step1_controls.py` | The true-battery and noisy-battery controls |
 | `context_wrapper.py` | A frozen battery estimate (the ideal estimator or a saved encoder) appended to plain PPO's observations |
+| `pilots.py` | Pilot flights in many styles for training a battery encoder offline |
 | `flight_logging.py` | Flight diagnostics shared by both learners (validation, rollouts, gradient norms, final validation) |
 | `run_grid.py`, `run_step0.py`, `report_step0.py`, `evaluate_final_test.py` | Launchers, reports and the one-time final test |
 | `step1_fly_with_noise.py`, `step1_encoder_error.py` | Step 1 analyses |

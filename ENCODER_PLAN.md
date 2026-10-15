@@ -668,6 +668,95 @@ Three training mixes:
 2. All battery-blind pilots.
 3. Mix 2 plus the PPO checkpoints.
 
+**The pilots (implemented 2026-10-14).** `pilots.py` flies BatteryPlane in many ways and records each flight as an encoder reads it: the hidden-mode observation o_t, the previous executed action a_{t-1} (zero at the start), and, as the training label only, the true battery b_t. The list above was revised after step 1 and the ideal estimator, with three goals: break the link between time and battery (A's encoder learned a clock), include the flights that matter (probing, then saving energy; gentle flying on a low battery), and close leaks.
+
+| | Style | What it does |
+|---|---|---|
+| Keep | `probe_hold` | Full throttle for 1–10 s, then hold 25–50 m/s below the cap, repeated 1–4 times. The first probe is at take-off half the time |
+| Keep | `steady_below` | A constant throttle or a held speed, always below the cap (throttle ≤ 0.55, so at most 11 m/s², under the 11.5 m/s² cap of an empty battery). The battery never shows: the encoder must learn to keep its best guess and count the drain |
+| Keep | `random_hold` | Random throttle, reverse included, held for random durations; random lift. Each flight draws its own level and spread, so flights drain at different rates |
+| Keep | `shaky` | A new random throttle and lift at every step around a per-flight level and spread |
+| Keep, low weight | `wavy` | Sinusoidal throttle with random offset, amplitude, period (1–20 s) and phase |
+| Keep, as control | `full_throttle` | Full throttle all flight, climbing to the ceiling: A-like data, only in the narrow mix |
+| Change | `hold_speed` | Hold 45–65 m/s (the reward band), steering by the smoothed noisy speed. `battery_plane.policy_hold_goal` steers by the true speed, which would pass a cleaner battery signal through the actions than any agent has |
+| Change | `cruise` | Hold the cheapest speed for the altitude, steering by the smoothed noisy speed (changed from `policy_cruise`) |
+| Add | `endurance` | A full-throttle probe of 3–8 s at take-off, then gentle flying to the end: late-flight, low-battery data, which full-throttle pilots never reach |
+| Add | `blind_ppo` | The memoryless PPO policies (0a_blind, 0b_blind, 0c_blind), stochastic half the time: real PPO flying with no battery information |
+| Add | `replay_good` | Good pilots (true battery: 0a, 0b, 0c; ideal estimate: 2a/2b_ideal and their _std) fly a shadow plane with its own random battery and start, and their actions fly the recorded plane. The flying looks battery-aware, but the actions say nothing about the recorded plane's battery |
+| Separate mix | `aware_good` | The same good pilots flying the recorded plane itself. **Leaks:** their actions depend on its true battery or on a battery estimate, so an encoder could read the battery from the actions |
+
+**Common to all styles:**
+- Every scripted style draws an altitude programme per flight (level, climb, the ceiling, changing targets, or low), steered by the exact observed altitude and climb rate, with a guard against hitting the ground.
+- `policy_budgeted` is not used: it reads the true battery.
+
+**What a pilot may read:**
+- **Scripted pilots:** the hidden-mode observation (noisy speed, exact altitude and climb rate, time left), their own randomness, and physics formulas that hold no plane state (`PlanePhysics`: drag, the cheapest speed). They steer by an exponentially smoothed speed reading, never the true speed or the battery.
+- **Policy pilots:** what their model was trained on. Memoryless pilots read the hidden observation; replayed and aware pilots read their plane's observed observation, or the hidden one plus their own ideal estimate (`PolicyDriver`). A policy must have been trained with the dataset's physics settings (`env.kwargs`).
+
+**Seeds:** every flight has its own seed: style k uses 100,000 + k × 1,000,000 + i. Everything else random in a flight derives from it, so no two flights share noise and every flight is reproducible:
+- the pilot's own randomness, `np.random.default_rng([flight seed, style, 17])`
+- the k-th action-sampling seed of a stochastic policy pilot, flight seed × 64 + k (`sampling_seed`)
+- the k-th shadow plane of a replayed pilot, 1,000,000,000 + flight seed × 64 + k (`shadow_seed`)
+
+None of these touches the training (0–14, and 0–707 for the first reset of each environment), validation (1000–1002) or final-test (2000–2002) seeds, and `fly` refuses the held-out ones.
+
+**Mixes (`pilots.MIXES`):**
+- `narrow`: full throttle only (the A-like control).
+- `main`: every battery-blind style.
+- `main_plus_aware`: main plus `aware_good`, always tested on battery-blind pilots to catch an encoder that reads the battery from the actions.
+
+**Checks (`checks.step3_checks`):**
+- **No hidden channel:** a scripted pilot replayed on a recorded flight's hidden observations, without any plane, gives exactly the recorded actions.
+- **Below-cap pilots never reach the cap,** and probes do; outside its probes `probe_hold` never does.
+- **Records match the environment:** the hidden-mode observations and batteries equal those of a hidden-mode plane flown with the same actions.
+- **Reproducible, and refuses held-out seeds.**
+- **Replay doesn't leak:** a replayed good pilot's actions are identical whatever the recorded plane's battery (0.25 or 0.65), deterministic or stochastic. An aware pilot's are not, and it is flagged.
+- **Memoryless pilots must be battery-blind,** and a policy trained with other physics settings is refused.
+- **Seeds never overlap:** recorded, shadow and sampling seeds are unique and apart from the training, validation and final-test seeds. Every stochastic start, in every flight and style, uses its own seed: two stochastic flights fly different noise, and the same flight twice the same.
+- **The leaking style is never in the narrow or main mix.**
+- **The clock-only R² is right** on synthetic data.
+- **End to end:** generation writes the expected files and is reproducible.
+
+**The first dataset (`runs_encoder/pilot_flights/v1`, gitignored):** 19,500 flights with 19,500 distinct seeds, about 5 minutes with 30 processes, 208 MB. Its policy pilots are the 24 memoryless and 56 good models of the step 0, memoryless-control and ideal-estimate reports.
+
+**What each style's `.npz` holds:**
+- the inputs `observations` and `prev_actions`
+- the label `batteries`
+- `privileged_saturated`, `privileged_b0` and `privileged_vx0`, diagnostics that are never inputs
+- seeds, lengths, outcomes and the observed starting altitude
+
+`load_flights` returns only the inputs, the label and each flight's style.
+
+| Style | Flights | Mean length | Completed | Steps at the cap | Clock R² |
+|---|---:|---:|---:|---:|---:|
+| probe_hold | 3,000 | 630 | 64% | 32% | 0.28 |
+| steady_below | 2,000 | 680 | 88% | 0% | 0.10 |
+| random_hold | 2,000 | 526 | 27% | 44% | 0.37 |
+| shaky | 1,000 | 611 | 55% | 22% | 0.29 |
+| wavy | 500 | 610 | 57% | 22% | 0.25 |
+| hold_speed | 1,500 | 517 | 20% | 74% | 0.41 |
+| cruise | 1,000 | 699 | 99% | 2% | 0.04 |
+| endurance | 1,500 | 686 | 92% | 16% | 0.12 |
+| full_throttle (narrow) | 2,000 | 470 | 1% | 100% | 0.51 |
+| blind_ppo | 1,500 | 493 | 18% | 89% | 0.51 |
+| replay_good | 2,000 | 620 | 73% | 28% | 0.18 |
+| aware_good (separate) | 1,500 | 688 | 95% | 25% | 0.48 |
+| **Mix narrow / main / main_plus_aware** | 2,000 / 16,000 / 17,500 | | | | **0.51 / 0.19 / 0.20** |
+
+- **The clock is much weaker in the main mix:** it explains 19% of the battery's spread, against 51% in the narrow control and about 45% in A–F's flights.
+- **Two first versions of the random styles failed this test.** A shared drain rate let a clock explain 74% (`random_hold`) and 93% (`shaky`), until each flight drew its own throttle level and spread.
+- **`blind_ppo` flies like A** (89% of steps at the cap, clock R² 0.51). It is still in the main mix, because a new pilot flies like that early in training.
+
+```bash
+# About 5 minutes with 30 processes; the policy pilots load their models from the reports
+python pilots.py --output runs_encoder/pilot_flights/v1 --jobs 30 --policy-reports \
+    runs_step0/20261014-020124/report_blind_and_A.json runs_step0/20261013-042940/step0_report_rs0.1_seeds0-7.json \
+    runs_step0/20261014-044145/step0_report_ideal.json runs_step0/20261014-044145/step0_report_ideal_std.json
+python -m unittest checks.step3_checks -v
+```
+
+**Next:** offline training of the encoder on these flights (step 4), measured against the ideal estimator at each flight step and for each style, then frozen under plain PPO through the context wrapper.
+
 ### 4. Measure the encoder properly before plugging it in
 
 - **Don't report pooled R².** The clock gets 0.45 of it for free. Report RMSE at 1 s, 5 s and 20 s into the flight, against the clock-only baseline and an ideal estimator. The enc1 study already computes prior and ideal baselines, so reuse that setup.
