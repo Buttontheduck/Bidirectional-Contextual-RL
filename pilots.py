@@ -76,6 +76,19 @@ def sampling_seed(flight_seed: int, k: int) -> int:
     return flight_seed * SEEDS_PER_FLIGHT + k
 
 
+SEGMENT_SEED_BASE = 10_000_000_000
+
+
+def segment_seed(flight_seed: int, j: int) -> int:
+    """
+    Seed of the j-th segment of a switching flight: the segment's pilot draws its randomness, action-sampling seeds and
+    shadow planes from it. Distinct for every flight and j, and above every flight and shadow seed.
+    """
+    if not 0 <= j < SEEDS_PER_FLIGHT:
+        raise ValueError(f"At most {SEEDS_PER_FLIGHT} segments per flight")
+    return SEGMENT_SEED_BASE + flight_seed * SEEDS_PER_FLIGHT + j
+
+
 def shadow_seed(flight_seed: int, k: int) -> int:
     """Reset seed of the k-th shadow plane of a replayed flight: distinct for every flight and k, above every flight seed."""
     if not 0 <= k < SEEDS_PER_FLIGHT:
@@ -88,19 +101,25 @@ SCRIPTED_STYLES = ("probe_hold", "steady_below", "random_hold", "shaky", "wavy",
 POLICY_STYLES = ("blind_ppo", "replay_good", "aware_good")
 # Styles whose actions depend on the recorded plane's battery or on a battery estimate: never in the main mixes
 LEAKING_STYLES = frozenset({"aware_good"})
-STYLES = SCRIPTED_STYLES + POLICY_STYLES
+# switching comes last, so adding it left every other style's seeds unchanged
+STYLES = SCRIPTED_STYLES + POLICY_STYLES + ("switching",)
+# Styles a switching flight changes between (the policy ones only with policies); never a leaking style
+SWITCH_STYLES = ("probe_hold", "steady_below", "random_hold", "shaky", "wavy", "hold_speed", "cruise", "endurance",
+                 "full_throttle", "blind_ppo", "replay_good")
+# For the check that switching never ties gentle flying to a low battery
+GENTLE_STYLES, HARD_STYLES = frozenset({"steady_below", "cruise"}), frozenset({"full_throttle", "hold_speed"})
 # Default flights per style (about 20k flights in all)
 DEFAULT_FLIGHTS = {"probe_hold": 3000, "steady_below": 2000, "random_hold": 2000, "shaky": 1000, "wavy": 500,
                    "hold_speed": 1500, "cruise": 1000, "endurance": 1500, "full_throttle": 2000, "blind_ppo": 1500,
-                   "replay_good": 2000, "aware_good": 1500}
+                   "replay_good": 2000, "aware_good": 1500, "switching": 3000}
 MIXES = {
     "narrow": ("full_throttle",),
     "main": ("probe_hold", "steady_below", "random_hold", "shaky", "wavy", "hold_speed", "cruise", "endurance",
-             "blind_ppo", "replay_good"),
+             "blind_ppo", "replay_good", "switching"),
     "main_plus_aware": ("probe_hold", "steady_below", "random_hold", "shaky", "wavy", "hold_speed", "cruise",
-                        "endurance", "blind_ppo", "replay_good", "aware_good"),
+                        "endurance", "blind_ppo", "replay_good", "switching", "aware_good"),
 }
-assert not (set(MIXES["narrow"]) | set(MIXES["main"])) & LEAKING_STYLES
+assert not (set(MIXES["narrow"]) | set(MIXES["main"]) | set(SWITCH_STYLES)) & LEAKING_STYLES
 # Report conditions (report_step0.py) whose models fly as policy pilots
 BLIND_CONDITIONS = ("0a_blind", "0b_blind", "0c_blind")
 GOOD_CONDITIONS = ("0a", "0b", "0c", "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std")
@@ -593,6 +612,45 @@ class AwareGood(Pilot):
         return self.driver.act(np.asarray(obs, np.float32))
 
 
+class Switching(Pilot):
+    """
+    Changes style in the middle of the flight: segments of 30-250 steps, each flown by a fresh pilot of a style drawn
+    uniformly from ``styles``. The whole plan (every switch time and every style) is drawn at take-off from the
+    flight's random stream, before anything is observed, and a segment's style never depends on the time or on any
+    observation. So which style flies, gentle or hard, has nothing to do with the battery: the flights can't teach
+    "low battery -> gentle flying". Each segment's pilot gets its own seed (segment_seed), so no two segments share
+    randomness, action-sampling noise or a shadow plane; it counts flight steps from its own start.
+    """
+
+    name = "switching"
+
+    def __init__(self, physics, pilots: dict[str, Pilot]) -> None:
+        super().__init__(physics)
+        if not pilots or any(p.leaks or p.observation != "hidden" for p in pilots.values()):
+            raise ValueError("switching needs battery-blind pilots that read the hidden observation")
+        self.pilots, self.styles = pilots, tuple(pilots)
+
+    def reset(self, rng, obs, flight_seed=0):
+        super().reset(rng, obs, flight_seed)
+        self.plan: list[tuple[int, str]] = []
+        t = 0
+        while t < self.physics.T:
+            self.plan.append((t, str(rng.choice(self.styles))))
+            t += int(rng.integers(30, 251))
+        if len(self.plan) > SEEDS_PER_FLIGHT:
+            raise ValueError("Too many segments for the per-flight seeds")
+        self.segment = -1
+
+    def act(self, obs, t):
+        if self.segment + 1 < len(self.plan) and t >= self.plan[self.segment + 1][0]:
+            self.segment += 1
+            seed = segment_seed(self.flight_seed, self.segment)
+            style = self.plan[self.segment][1]
+            self.pilot = self.pilots[style]
+            self.pilot.reset(np.random.default_rng([seed, STYLES.index(style), 23]), obs, seed)
+        return self.pilot.act(obs, t - self.plan[self.segment][0])
+
+
 # ------------------------------------------------------------------------------------------------------- flights
 
 
@@ -653,6 +711,11 @@ def make_pilot(style: str, physics: PlanePhysics, policies: dict[str, list[str]]
         return ReplayGood(physics, drivers_for(policies.get("good", []), env_kwargs), env_kwargs)
     if style == "aware_good":
         return AwareGood(physics, drivers_for(policies.get("good", []), env_kwargs))
+    if style == "switching":
+        # The policy styles join when their policies are given
+        usable = [s for s in SWITCH_STYLES if s in SCRIPTED_PILOTS or (s == "blind_ppo" and policies.get("blind"))
+                  or (s == "replay_good" and policies.get("good"))]
+        return Switching(physics, {s: make_pilot(s, physics, policies, env_kwargs) for s in usable})
     raise ValueError(f"Unknown pilot style {style!r}; one of {STYLES}")
 
 

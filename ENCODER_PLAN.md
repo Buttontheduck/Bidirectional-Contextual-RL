@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below); pilots and a frozen learned encoder (steps 3–4) next.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15); offline training of the encoder on those flights, then freezing it under plain PPO (step 4), next.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -683,6 +683,7 @@ Three training mixes:
 | Add | `endurance` | A full-throttle probe of 3–8 s at take-off, then gentle flying to the end: late-flight, low-battery data, which full-throttle pilots never reach |
 | Add | `blind_ppo` | The memoryless PPO policies (0a_blind, 0b_blind, 0c_blind), stochastic half the time: real PPO flying with no battery information |
 | Add | `replay_good` | Good pilots (true battery: 0a, 0b, 0c; ideal estimate: 2a/2b_ideal and their _std) fly a shadow plane with its own random battery and start, and their actions fly the recorded plane. The flying looks battery-aware, but the actions say nothing about the recorded plane's battery |
+| Add | `switching` | Changes style mid-flight: segments of 30–250 steps, each flown by a fresh pilot of a style drawn uniformly from the battery-blind styles (the scripted ones, `blind_ppo`, `replay_good`). The whole plan (switch times and styles) is drawn at take-off, before anything is observed, and a segment's style never depends on the time or on any observation. So it can't teach "low battery → gentle flying" |
 | Separate mix | `aware_good` | The same good pilots flying the recorded plane itself. **Leaks:** their actions depend on its true battery or on a battery estimate, so an encoder could read the battery from the actions |
 
 **Common to all styles:**
@@ -697,6 +698,7 @@ Three training mixes:
 - the pilot's own randomness, `np.random.default_rng([flight seed, style, 17])`
 - the k-th action-sampling seed of a stochastic policy pilot, flight seed × 64 + k (`sampling_seed`)
 - the k-th shadow plane of a replayed pilot, 1,000,000,000 + flight seed × 64 + k (`shadow_seed`)
+- the j-th segment of a switching flight, 10,000,000,000 + flight seed × 64 + j (`segment_seed`). The segment's pilot draws its randomness, sampling seeds and shadow planes from it, in ranges above every other seed
 
 None of these touches the training (0–14, and 0–707 for the first reset of each environment), validation (1000–1002) or final-test (2000–2002) seeds, and `fly` refuses the held-out ones.
 
@@ -712,8 +714,12 @@ None of these touches the training (0–14, and 0–707 for the first reset of e
 - **Reproducible, and refuses held-out seeds.**
 - **Replay doesn't leak:** a replayed good pilot's actions are identical whatever the recorded plane's battery (0.25 or 0.65), deterministic or stochastic. An aware pilot's are not, and it is flagged.
 - **Memoryless pilots must be battery-blind,** and a policy trained with other physics settings is refused.
-- **Seeds never overlap:** recorded, shadow and sampling seeds are unique and apart from the training, validation and final-test seeds. Every stochastic start, in every flight and style, uses its own seed: two stochastic flights fly different noise, and the same flight twice the same.
-- **The leaking style is never in the narrow or main mix.**
+- **Seeds never overlap:** recorded, shadow, sampling and switching-segment seeds are unique and apart from the training, validation and final-test seeds. Every stochastic start, in every flight and style, uses its own seed: two stochastic flights fly different noise, and the same flight twice the same.
+- **The leaking style is never in the narrow or main mix,** nor among the styles a switching flight changes between.
+- **Switching never ties gentle flying to a low battery:**
+  - the same flight with a 25% or a 65% battery gets the same plan
+  - gentle styles are as common in segments that start after mid-flight as before (22.5% against 22.9%, expected 2/9)
+  - the battery when a gentle segment starts equals the battery when a hard one starts (0.241 against 0.243, 300 flights)
 - **The clock-only R² is right** on synthetic data.
 - **End to end:** generation writes the expected files and is reproducible.
 
@@ -726,6 +732,11 @@ None of these touches the training (0–14, and 0–707 for the first reset of e
 - seeds, lengths, outcomes and the observed starting altitude
 
 `load_flights` returns only the inputs, the label and each flight's style.
+
+**Dataset v2 (`runs_encoder/pilot_flights/v2`)** adds 3,000 `switching` flights (mean length 569, 42% completed, 49% of steps at the cap, clock R² 0.32): 22,500 flights, 22,500 distinct seeds.
+- `switching` comes last in the style list, so every other style kept its seeds.
+- Its 12 other styles are bit-for-bit identical to v1, generated in a separate run: the generation is fully deterministic.
+- Clock R² of the mixes in v2: narrow 0.51, main 0.20 (19,000 flights), main_plus_aware 0.21.
 
 | Style | Flights | Mean length | Completed | Steps at the cap | Clock R² |
 |---|---:|---:|---:|---:|---:|
@@ -740,22 +751,33 @@ None of these touches the training (0–14, and 0–707 for the first reset of e
 | full_throttle (narrow) | 2,000 | 470 | 1% | 100% | 0.51 |
 | blind_ppo | 1,500 | 493 | 18% | 89% | 0.51 |
 | replay_good | 2,000 | 620 | 73% | 28% | 0.18 |
+| switching (v2) | 3,000 | 569 | 42% | 49% | 0.32 |
 | aware_good (separate) | 1,500 | 688 | 95% | 25% | 0.48 |
-| **Mix narrow / main / main_plus_aware** | 2,000 / 16,000 / 17,500 | | | | **0.51 / 0.19 / 0.20** |
+| **Mix narrow / main / main_plus_aware (v2)** | 2,000 / 19,000 / 20,500 | | | | **0.51 / 0.20 / 0.21** |
 
-- **The clock is much weaker in the main mix:** it explains 19% of the battery's spread, against 51% in the narrow control and about 45% in A–F's flights.
+In v1, without `switching`, the main and main_plus_aware mixes had 16,000 and 17,500 flights, with clock R² 0.19 and 0.20.
+
+- **The clock is much weaker in the main mix:** it explains 20% of the battery's spread, against 51% in the narrow control and about 45% in A–F's flights.
 - **Two first versions of the random styles failed this test.** A shared drain rate let a clock explain 74% (`random_hold`) and 93% (`shaky`), until each flight drew its own throttle level and spread.
 - **`blind_ppo` flies like A** (89% of steps at the cap, clock R² 0.51). It is still in the main mix, because a new pilot flies like that early in training.
 
 ```bash
 # About 5 minutes with 30 processes; the policy pilots load their models from the reports
-python pilots.py --output runs_encoder/pilot_flights/v1 --jobs 30 --policy-reports \
+python pilots.py --output runs_encoder/pilot_flights/v2 --jobs 30 --policy-reports \
     runs_step0/20261014-020124/report_blind_and_A.json runs_step0/20261013-042940/step0_report_rs0.1_seeds0-7.json \
     runs_step0/20261014-044145/step0_report_ideal.json runs_step0/20261014-044145/step0_report_ideal_std.json
 python -m unittest checks.step3_checks -v
 ```
 
 **Next:** offline training of the encoder on these flights (step 4), measured against the ideal estimator at each flight step and for each style, then frozen under plain PPO through the context wrapper.
+
+**Alternative training target: the ideal estimator as a teacher (optional).** Train the encoder to match the calculator's guess (and its uncertainty) instead of, or as well as, the true battery.
+- **Why:** where the battery can't be known, such as gentle low-battery flights, the true battery is a noisy target. The calculator's guess is the clean version of what the encoder should output: the best estimate possible from the same inputs. An encoder trained on the true battery with squared error aims for the same thing on average, but learns it from noisier targets.
+- **The catch:** it brings knowledge of the physics into training. The ideal estimator knows the exact dynamics, the prior and the speed noise. That is a design choice worth stating openly; the true-battery labels remain the default.
+- **How:**
+  - Run `IdealBatteryEstimator` over every pilot flight (hidden observations and executed actions) and store its mean and std per step next to the true battery. With pruning that is about 0.3–1 s per flight, minutes for the dataset with 30 processes.
+  - Train a point head on the mean, or a Gaussian head on the mean and std (for example by matching the two Gaussians), alone or alongside the true-battery loss.
+- **Compare:** encoders trained on the true battery, on the teacher and on both, measured against the ideal estimator at 1, 5 and 20 s into the flight for each pilot style, and then frozen under plain PPO.
 
 ### 4. Measure the encoder properly before plugging it in
 
@@ -772,14 +794,28 @@ python -m unittest checks.step3_checks -v
 - Write the decision rules from sections 0 and 1 down before running anything.
 - Optional extra condition: start from the pretrained encoder, then keep training it online the way CPPO does now. That shows whether online training helps or hurts once the encoder starts out good.
 
-Steps 1–5 currently list 8 conditions × 3 seeds = 24 PPO runs: oracle, three noisy oracles, clock-only, and three frozen encoders. Step 0 is a separate nine-run screen (0a, 0b and 0c, three seeds each). Review its results before committing to those later runs. Reuse 0a as the later oracle only if the wrapper and training/evaluation protocol are verified equivalent.
+Steps 1–5 originally listed 8 conditions × 3 seeds = 24 PPO runs: oracle, three noisy oracles, clock-only, and three frozen encoders (one per mix).
+- **Done:** the oracle (step 0's 0a, 0b and 0c, 8 seeds) and the noisy oracles (step 1, plus its switch, early-noise and in-flight variants). The ideal-estimate runs (step 2) were added; they compared against the 0a / 0b runs from an earlier launch with the same code path, and the swap check backs that comparison.
+- **Still open:** the frozen encoders, and the clock-only control. The clock-only control is less urgent now: the memoryless controls and A's clock-like encoder already sit at the bottom of the range.
 
 ## Next steps
 
-The enc1 setup on the server already covers the offline training step. The new pieces are:
+**Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).
 
-1. **The CPPO oracle bypass.** Done: `cppo.context_source=oracle`, verified by `checks.step0_checks` (see Step 0).
-2. **The step 0 runs.** Done: CPPO can use the true battery, with discount 0.99 and reward scale 0.1 (Step 0 results). The A rerun with these settings scored 22, near the blind level, so the encoder side is the problem. Next: step 1.
-3. **The context wrapper.** If Step 0 supports proceeding, implement the frozen-encoder and control inputs for plain PPO.
-4. **The pilot generator.**
-5. **The remaining controls.** Verify whether Step 0's plain-PPO oracle can be reused; add the clock-only and noisy-oracle conditions when the follow-up scope is fixed.
+1. **Train the encoder offline on dataset v2 (step 4).**
+   - The xLSTM on the `main` mix, with an LSTM for comparison. Also train on `narrow` (the A-like control) and on `main_plus_aware` (the leak test).
+   - Split by whole flights for validation. Keep some styles out entirely for the cross-pilot matrix.
+   - Train until the validation loss plateaus. Reuse the enc1 training setup where it fits; its input is `pilots.load_flights` (observations, previous actions, true battery, style).
+   - Save it so `FrozenEncoderContext` can load it. Today that loader reads a saved Contextual_PPO model, so either save the encoder inside one or give the wrapper a loader for a standalone encoder.
+2. **Measure it before plugging it in** (section 4):
+   - Error at 1, 5 and 20 s and over the whole flight, for each style.
+   - Compare against the clock-only estimate and the ideal estimator (`step1_ideal_estimator.py`) on the same flights.
+   - Run the leak test: test the `main_plus_aware` encoder on battery-blind pilots.
+3. **Freeze it under plain PPO**, with `context.source=encoder` and `context.encoder_model=...`. Use 8 seeds at step 0's settings (gamma 0.99, reward scale 0.1).
+   - Compare against the ideal estimate (283 / 323), the true battery (246 / 258) and memoryless PPO (23 / 77).
+   - Then the closed-loop check: the encoder's error on the PPO policy's own flights.
+4. **Optional:**
+   - Train on the ideal estimator as a teacher (section 3).
+   - Freeze A's own encoder under plain PPO (step 2's next steps).
+   - Add earlier PPO checkpoints (0.5M / 1M / 1.5M steps) or more seeds as pilots, if the encoder's error is limited by data.
+   - Start from the pretrained encoder and keep training it online, as CPPO does (section 5).

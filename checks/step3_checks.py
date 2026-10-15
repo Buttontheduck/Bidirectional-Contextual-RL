@@ -59,7 +59,7 @@ class Step3Checks(unittest.TestCase):
     def test_scripted_pilots_read_only_the_hidden_observation(self):
         # Replaying a recorded flight's hidden observations, without any plane, gives the same actions: a pilot has no
         # other channel (plane state, true speed, battery)
-        for style in P.SCRIPTED_STYLES:
+        for style in (*P.SCRIPTED_STYLES, "switching"):
             with self.subTest(style=style):
                 pilot = P.make_pilot(style, self.physics, {})
                 self.assertEqual((pilot.observation, pilot.leaks), ("hidden", False))
@@ -146,6 +146,14 @@ class Step3Checks(unittest.TestCase):
         # Action-sampling seeds: one per flight and policy start
         sampling = [P.sampling_seed(seed, k) for seed in recorded[::50] for k in range(P.SEEDS_PER_FLIGHT)]
         self.assertEqual(len(set(sampling)), len(sampling))
+        # Switching segments: one seed per flight and segment, and the seeds derived from them in ranges of their own
+        segments = [P.segment_seed(seed, j) for seed in recorded[::50] for j in range(P.SEEDS_PER_FLIGHT)]
+        self.assertEqual(len(set(segments)), len(segments))
+        self.assertGreater(min(segments), max(shadows))
+        derived = ([P.shadow_seed(seed, k) for seed in segments[::97] for k in range(P.SEEDS_PER_FLIGHT)]
+                   + [P.sampling_seed(seed, k) for seed in segments[::97] for k in range(P.SEEDS_PER_FLIGHT)])
+        self.assertGreater(min(derived), max(segments))
+        self.assertFalse(set(derived) & (set(shadows) | set(sampling) | set(recorded)))
         with self.assertRaises(ValueError):
             P.shadow_seed(recorded[0], P.SEEDS_PER_FLIGHT)
 
@@ -155,7 +163,8 @@ class Step3Checks(unittest.TestCase):
             blind = saved_policy(Path(folder), "S0a_blind_bs256")
             # Models load first: loading re-seeds torch with the model's training seed, once per model and worker
             pilots = {style: P.make_pilot(style, self.physics, policies) for style, policies in
-                      (("blind_ppo", {"blind": [blind]}), ("replay_good", {"good": [good]}), ("aware_good", {"good": [good]}))}
+                      (("blind_ppo", {"blind": [blind]}), ("replay_good", {"good": [good]}), ("aware_good", {"good": [good]}),
+                       ("switching", {"blind": [blind], "good": [good]}))}
             seeds_used = []
             original = torch.manual_seed
 
@@ -189,9 +198,41 @@ class Step3Checks(unittest.TestCase):
             again = P.fly(pilot, P.flight_seed("replay_good", i), flight_rng("replay_good", i))
             np.testing.assert_array_equal(again["prev_actions"], a["prev_actions"])
 
+    def test_switching_never_ties_gentle_flying_to_a_low_battery(self):
+        pilot = P.make_pilot("switching", self.physics, {})
+        self.assertFalse(pilot.leaks)
+        # The plan is drawn at take-off: the same flight with a low or a high battery switches at the same times to the
+        # same styles
+        actions_with_battery(pilot, 0.25, 3, steps=700)
+        low = list(pilot.plan)
+        actions_with_battery(pilot, 0.65, 3, steps=700)
+        self.assertEqual(pilot.plan, low)
+        self.assertGreater(len(low), 2)
+        # A segment's style doesn't depend on the time: gentle styles are as common late in a flight as early
+        early, late = [], []
+        for index in range(400):
+            pilot.reset(flight_rng("switching", index), np.zeros(4, np.float32), P.flight_seed("switching", index))
+            for start, style in pilot.plan:
+                (early if start < 350 else late).append(style in P.GENTLE_STYLES)
+        self.assertLess(abs(np.mean(early) - np.mean(late)), 0.05)
+        # Flown: the battery when a gentle segment starts is the battery when a hard one starts (no "low -> gentle")
+        gentle, hard = [], []
+        for index in range(150):
+            flight = P.fly(pilot, P.flight_seed("switching", index), flight_rng("switching", index))
+            for start, style in pilot.plan:
+                if 0 < start <= flight["length"]:
+                    battery = flight["batteries"][start]
+                    if style in P.GENTLE_STYLES:
+                        gentle.append(battery)
+                    elif style in P.HARD_STYLES:
+                        hard.append(battery)
+        self.assertGreater(min(len(gentle), len(hard)), 100)
+        self.assertLess(abs(np.mean(gentle) - np.mean(hard)), 0.05)
+
     def test_leaking_pilots_stay_out_of_the_main_mixes(self):
         for mix in ("narrow", "main"):
             self.assertFalse(set(P.MIXES[mix]) & P.LEAKING_STYLES)
+        self.assertFalse(set(P.SWITCH_STYLES) & P.LEAKING_STYLES)
         self.assertEqual(P.LEAKING_STYLES, {style for style in P.STYLES if style == "aware_good"})
         self.assertTrue(set(P.MIXES["main_plus_aware"]) >= P.LEAKING_STYLES)
         with tempfile.TemporaryDirectory() as folder:
