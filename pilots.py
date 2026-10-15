@@ -789,19 +789,22 @@ def save_style(directory: Path, style: str, flights: list[dict]) -> dict:
 
 
 def load_flights(directory: str | Path, styles) -> dict:
-    """The flights of the given styles (or a mix name), as lists of per-flight arrays, with each flight's style."""
+    """The flights of the given styles (or a mix name), as lists of per-flight arrays, with each flight's style and
+    seed (an identifier, e.g. for splitting; never an input)."""
     directory = Path(directory)
     styles = MIXES[styles] if isinstance(styles, str) else tuple(styles)
-    out = {"observations": [], "prev_actions": [], "batteries": [], "styles": []}
+    out = {"observations": [], "prev_actions": [], "batteries": [], "styles": [], "seeds": []}
     for style in styles:
         with np.load(directory / f"{style}.npz") as data:
             # Each access to an .npz array decompresses all of it: read every array once
-            offsets, arrays = data["flight_offsets"], {key: data[key] for key in ("observations", "prev_actions", "batteries")}
+            offsets, seeds = data["flight_offsets"], data["seeds"]
+            arrays = {key: data[key] for key in ("observations", "prev_actions", "batteries")}
         for i in range(len(offsets) - 1):
             part = slice(offsets[i], offsets[i + 1])
             for key, values in arrays.items():
                 out[key].append(values[part])
             out["styles"].append(style)
+            out["seeds"].append(int(seeds[i]))
     return out
 
 

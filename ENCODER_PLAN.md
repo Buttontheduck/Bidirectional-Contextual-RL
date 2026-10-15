@@ -731,7 +731,7 @@ None of these touches the training (0–14, and 0–707 for the first reset of e
 - `privileged_saturated`, `privileged_b0` and `privileged_vx0`, diagnostics that are never inputs
 - seeds, lengths, outcomes and the observed starting altitude
 
-`load_flights` returns only the inputs, the label and each flight's style.
+`load_flights` returns only the inputs, the label, and each flight's style and seed (an identifier for splitting, never an input).
 
 **Dataset v2 (`runs_encoder/pilot_flights/v2`)** adds 3,000 `switching` flights (mean length 569, 42% completed, 49% of steps at the cap, clock R² 0.32): 22,500 flights, 22,500 distinct seeds.
 - `switching` comes last in the style list, so every other style kept its seeds.
