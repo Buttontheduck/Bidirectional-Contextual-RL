@@ -26,8 +26,14 @@ Outputs (<output root>/<name>/; runs_encoder/ is gitignored):
                         critic are untrained and unused)
     result.json         validation and test errors of the best encoder and of the clock-only estimate
 
+--resume continues a finished run from its last checkpoint with more patience or more epochs, into a new run directory
+<name>_resumed (W&B group <group>_resumed): the same settings, data and model code, the weights and optimizer state of
+its last epoch, and the batch order replayed up to there, so it continues as the uninterrupted run would have. Its
+metrics.jsonl starts with the original run's epochs, and its best checkpoint starts as the original's.
+
     python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4
     python train_encoder.py --design E3 --seed 0 --smoke        # tiny correctness run, W&B disabled
+    python train_encoder.py --resume runs_encoder/step4/E1_point_main_s2 --patience 8 --max-epochs 40
 """
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ import hashlib
 from importlib.metadata import version
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -266,6 +273,24 @@ def save_policy_model(cfg, encoder, path: Path) -> None:
     env.close()
 
 
+def epoch_log(row: dict, b0_head: bool) -> dict:
+    """The W&B log of one metrics.jsonl row."""
+    validation = row["validation"]
+    log = {"validation/b_rmse": validation["rmse"], "validation/b_mse": validation["mse"], "train/epoch_b_mse": row["train_b_mse"],
+           "epoch": row["epoch"], "epoch_seconds": row["epoch_seconds"],
+           **{f"validation/b_rmse_at_{k}": v for k, v in validation["rmse_at"].items()},
+           **{f"validation/by_style/{k}": v for k, v in validation["rmse_by_style"].items()}}
+    if b0_head:
+        log["validation/b0_rmse"] = validation["b0_rmse"]
+    return log
+
+
+# Settings a resumed run takes from the original run (they define the training it continues)
+RESUMED_SETTINGS = ("design", "seed", "data", "mix", "batch_size", "learning_rate", "max_grad_norm", "b0_weight", "max_flights")
+# Code a resumed run must share with the original (train_encoder.py itself may have gained options since)
+RESUME_SAME_CODE = tuple(path for path in HASHED_CODE if path != "train_encoder.py")
+
+
 def git_state() -> dict:
     def run(*args):
         return subprocess.run(["git", *args], cwd=PROJECT_ROOT, capture_output=True, text=True).stdout.strip()
@@ -274,8 +299,8 @@ def git_state() -> dict:
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--design", choices=sorted(DESIGNS), required=True)
-    parser.add_argument("--seed", type=int, required=True, help="Initial weights and batch order (not the split)")
+    parser.add_argument("--design", choices=sorted(DESIGNS), help="Required unless --resume")
+    parser.add_argument("--seed", type=int, help="Initial weights and batch order (not the split); required unless --resume")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA, help="pilots.py output folder")
     parser.add_argument("--mix", default="main", help="A mix of pilots.MIXES")
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "runs_encoder" / "step4")
@@ -290,7 +315,32 @@ def main(argv=None) -> None:
     parser.add_argument("--max-flights", type=int, default=None, help="Only the first flights of each split")
     parser.add_argument("--wandb-mode", default=None, help="online, offline or disabled (default: WANDB_MODE)")
     parser.add_argument("--smoke", action="store_true", help="48 flights per split, 2 epochs, W&B disabled")
+    parser.add_argument("--resume", type=Path, default=None, help="A finished run directory to continue (see above)")
     args = parser.parse_args(argv)
+    previous = history = None
+    if args.resume is not None:
+        if args.smoke:
+            parser.error("--resume and --smoke exclude each other")
+        if not (args.resume / "result.json").is_file():
+            parser.error(f"{args.resume} has not finished (no result.json): wait for it, or it failed")
+        previous = json.loads((args.resume / "config.json").read_text())
+        history = [json.loads(line) for line in open(args.resume / "metrics.jsonl")]
+        for key in RESUMED_SETTINGS:
+            option = key.replace("_", "-")
+            value = getattr(args, key)
+            if value is not None and value != parser.get_default(key) and str(value) != str(previous[key]):
+                parser.error(f"--{option} {value}: --resume continues with the original run's --{option} ({previous[key]})")
+            setattr(args, key, Path(previous[key]) if key == "data" else previous[key])
+        if args.b0_weight is None:
+            args.b0_weight = parser.get_default("b0_weight")
+        if args.max_epochs <= len(history):
+            parser.error(f"--max-epochs {args.max_epochs}: the run already did {len(history)} epochs")
+        best_row = min(history, key=lambda r: r["validation"]["mse"])
+        if len(history) - best_row["epoch"] >= args.patience:
+            parser.error(f"Under --patience {args.patience} the run would already have stopped (best epoch {best_row['epoch']} "
+                         f"of {len(history)}): give more patience")
+    elif args.design is None or args.seed is None:
+        parser.error("--design and --seed are required unless --resume")
     if args.smoke:
         args.max_flights, args.max_epochs, args.wandb_mode, args.log_every = args.max_flights or 48, 2, "disabled", 1
         args.output_root = args.output_root.with_name(args.output_root.name + "_smoke")
@@ -312,7 +362,7 @@ def main(argv=None) -> None:
         th.set_num_interop_threads(1)     # only once per process, before any parallel work
     design = DESIGNS[args.design]
     b0_head = design["b0_head"]
-    group = f"{args.design}_{design['label']}_{args.mix}"
+    group = f"{args.design}_{design['label']}_{args.mix}" + ("_resumed" if previous else "")
     name = f"{group}_s{args.seed}"
     run_dir = args.output_root / name
     if run_dir.exists() and any(run_dir.iterdir()):
@@ -357,16 +407,43 @@ def main(argv=None) -> None:
         "git": git_state(), "versions": {pkg: version(pkg) for pkg in ("torch", "xlstm", "numpy", "stable-baselines3")},
         "started": datetime.now().isoformat(timespec="seconds"),
     }
+    if previous:
+        changed = [path for path in RESUME_SAME_CODE if previous["code_sha256"].get(path) != settings["code_sha256"][path]]
+        if changed or previous["data_sha256"] != settings["data_sha256"]:
+            run_dir.rmdir()
+            parser.error(f"{args.resume} was trained with other {'code: ' + ', '.join(changed) if changed else 'data'}")
+        settings["resumed_from"] = {"run_dir": str(args.resume), "name": previous["name"], "epochs": len(history),
+                                    "hours": json.loads((args.resume / "result.json").read_text())["hours"],
+                                    "code_sha256": previous["code_sha256"]}
     (run_dir / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
-    run = wandb.init(project=WANDB_PROJECT, name=name, group=group, tags=["step4", args.design, args.mix],
+    run = wandb.init(project=WANDB_PROJECT, name=name, group=group, tags=["step4", args.design, args.mix] + (["resumed"] if previous else []),
                      config=json.loads((run_dir / "config.json").read_text()), mode=args.wandb_mode, dir=str(PROJECT_ROOT))
     print(f"{name}: {settings['split']['flights']} flights, {settings['encoder']['parameters']:,} parameters, "
           f"run directory {run_dir}", flush=True)
 
-    best, best_epoch, stale, step = float("inf"), 0, 0, 0
+    best, best_epoch, stale, step, first_epoch = float("inf"), 0, 0, 0, 1
+    if previous:
+        last = th.load(args.resume / "last_encoder.pt", weights_only=False)
+        if last["epoch"] != len(history):
+            parser.error(f"{args.resume}: last_encoder.pt is from epoch {last['epoch']}, metrics.jsonl has {len(history)}")
+        encoder.load_state_dict(last["state_dict"])
+        optimizer.load_state_dict(last["optimizer"])
+        # The batch order of the epochs already done, drawn again so the next epoch's is the uninterrupted run's
+        for _ in range(last["epoch"]):
+            length_batches(rows["train"], flights.lengths, args.batch_size, rng)
+        best_row = min(history, key=lambda r: r["validation"]["mse"])
+        best, best_epoch, step, first_epoch = best_row["validation"]["mse"], best_row["epoch"], last["step"], last["epoch"] + 1
+        stale = len(history) - best_epoch
+        shutil.copyfile(args.resume / "best_encoder.pt", run_dir / "best_encoder.pt")
+        for row in history:
+            run.log(epoch_log(row, b0_head), step=row["step"])
+        print(f"Resuming {previous['name']} after epoch {last['epoch']} (best epoch {best_epoch}), patience {args.patience}, "
+              f"up to epoch {args.max_epochs}", flush=True)
     started = time.time()
     with open(run_dir / "metrics.jsonl", "w") as metrics:
-        for epoch in range(1, args.max_epochs + 1):
+        for row in history or []:
+            metrics.write(json.dumps(row) + "\n")
+        for epoch in range(first_epoch, args.max_epochs + 1):
             epoch_start, losses = time.time(), []
             for rows_batch in length_batches(rows["train"], flights.lengths, args.batch_size, rng):
                 batch = flights.batch(rows_batch)
@@ -403,13 +480,7 @@ def main(argv=None) -> None:
                    "best_epoch": best_epoch, "epoch_seconds": time.time() - epoch_start}
             metrics.write(json.dumps(row) + "\n")
             metrics.flush()
-            log = {"validation/b_rmse": validation["rmse"], "validation/b_mse": validation["mse"], "train/epoch_b_mse": row["train_b_mse"],
-                   "epoch": epoch, "epoch_seconds": row["epoch_seconds"],
-                   **{f"validation/b_rmse_at_{k}": v for k, v in validation["rmse_at"].items()},
-                   **{f"validation/by_style/{k}": v for k, v in validation["rmse_by_style"].items()}}
-            if b0_head:
-                log["validation/b0_rmse"] = validation["b0_rmse"]
-            run.log(log, step=step)
+            run.log(epoch_log(row, b0_head), step=step)
             print(f"epoch {epoch}: validation b_t rmse {validation['rmse']:.4f} (at 1/5/20 s: "
                   + " / ".join(f"{v:.4f}" for v in validation["rmse_at"].values())
                   + f"){' best' if improved else ''}, {row['epoch_seconds'] / 60:.1f} min", flush=True)

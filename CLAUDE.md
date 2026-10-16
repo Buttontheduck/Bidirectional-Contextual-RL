@@ -46,6 +46,7 @@ python pilots.py --output runs_encoder/pilot_flights/<name> --jobs 30 --policy-r
 python -m unittest checks.step3_checks -v          # pilots.py: no hidden channel, below-cap pilots, replay without leaks
 python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4   # step 4: A's encoder trained offline on the pilot flights (E3: + b0 head); 6 runs x 2 threads side by side: ~1 h per epoch each (memory-bound), early stopping
 python train_encoder.py --design E3 --seed 0 --smoke                             # tiny run, W&B disabled, runs_encoder/step4_smoke/
+python train_encoder.py --resume runs_encoder/step4/E1_point_main_s2 --patience 8 --max-epochs 40   # continue a finished run exactly where it stopped, into <name>_resumed (W&B group <group>_resumed)
 python step4_floor.py --output runs_encoder/step4/floor_v2_main --jobs 16   # the floor: ideal estimator on the encoders' validation/test flights, ~4 min
 python step4_probes.py --arch gru --task battery --seed 0     # step 4 diagnostics: tasks count (thrust used so far), find (b0, full-throttle flights), battery; archs xlstm, gru, lstm (GRU ~4 min per epoch); another --data adds its folder to the W&B names
 python pilots.py --output runs_encoder/pilot_flights/ft20k --styles full_throttle --flights 20000 --jobs 12   # 20,000 full-throttle flights for the find probe (first 2,000 = v2's), ~1 min

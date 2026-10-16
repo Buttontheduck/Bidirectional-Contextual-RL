@@ -25,8 +25,8 @@ The training seed sets only the initial weights and the batch order. Each epoch 
 scored once with the best checkpoint, next to the clock-only estimate (the mean label at each flight step).
 
 Outputs (<output root>/<name>/; runs_encoder/ is gitignored): config.json, metrics.jsonl, best.pt, last.pt, result.json.
-W&B: project battery-encoder, group probe_<arch>_<task>_<mix>[_<dataset folder, if not v2>][_n<train flights>][_lr<rate>],
-run <group>_s<seed>.
+W&B: project battery-encoder, group probe_<arch>_<task>_<mix>[_<dataset folder, if not v2>][_n<train flights>][_lr<rate>]
+[_p<patience>][_max<epochs>] (the last four when not the defaults), run <group>_s<seed>.
 
     python step4_probes.py --arch gru --task battery --seed 0
     python step4_probes.py --arch xlstm --task count --train-flights 3000 --seed 0
@@ -158,7 +158,9 @@ def main(argv=None) -> None:
     # Another dataset than v2 adds its folder name, so W&B names and run directories stay distinct
     data_tag = "" if args.data.resolve() == T.DEFAULT_DATA.resolve() else f"_{args.data.name}"
     group = (f"probe_{args.arch}_{args.task}_{mix}{data_tag}" + (f"_n{args.train_flights}" if args.train_flights else "")
-             + (f"_lr{args.learning_rate:g}" if args.learning_rate != DEFAULT_LEARNING_RATE else ""))
+             + (f"_lr{args.learning_rate:g}" if args.learning_rate != DEFAULT_LEARNING_RATE else "")
+             + (f"_p{args.patience}" if args.patience != parser.get_default("patience") else "")
+             + (f"_max{args.max_epochs}" if args.max_epochs != parser.get_default("max_epochs") and not args.smoke else ""))
     name = f"{group}_s{args.seed}"
     run_dir = args.output_root / name
     if run_dir.exists() and any(run_dir.iterdir()):

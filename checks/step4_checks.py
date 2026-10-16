@@ -234,7 +234,7 @@ class Step4Checks(unittest.TestCase):
                 PR.main(["--arch", "gru", "--task", "find", "--seed", "1", "--output-root", str(root), "--max-flights", "8",
                          "--max-epochs", "1", "--batch-size", "4", "--threads", "1", "--hidden", "16", "--wandb-mode",
                          "disabled", "--log-every", "1000", *extra])
-                return root / "probe_gru_find_narrow_n5_s1"
+                return root / "probe_gru_find_narrow_n5_max1_s1"           # 1 epoch, not the default 20
             first, again = probe(Path(folder) / "a", "--train-flights", "5"), probe(Path(folder) / "b", "--train-flights", "5")
             a = torch.load(first / "best.pt", weights_only=False)["state_dict"]
             b = torch.load(again / "best.pt", weights_only=False)["state_dict"]
@@ -273,6 +273,41 @@ class Step4Checks(unittest.TestCase):
                 self.assertFalse(set(seeds.tolist()) & P.HELD_OUT_SEEDS)
             with self.assertRaises(SystemExit):
                 F.main(args)
+
+    @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
+    def test_resume_continues_exactly_like_an_uninterrupted_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            whole = train(folder / "whole", "--max-epochs", "2", "--patience", "5")
+            first = train(folder / "first")                                   # 1 epoch, finished
+            options = ["--output-root", str(folder / "resumed"), "--threads", "1", "--wandb-mode", "disabled", "--log-every", "1000"]
+            T.main(["--resume", str(first), "--max-epochs", "2", "--patience", "5", *options])
+            resumed = folder / "resumed" / "E3_point_b0_main_resumed_s0"
+            # The same weights, optimizer state and step count as the run that never stopped
+            a, b = (torch.load(run / "last_encoder.pt", weights_only=False) for run in (whole, resumed))
+            self.assertEqual((a["epoch"], a["step"]), (b["epoch"], b["step"]))
+            for key in a["state_dict"]:
+                torch.testing.assert_close(b["state_dict"][key], a["state_dict"][key], rtol=0, atol=0)
+            torch.testing.assert_close(b["optimizer"]["state"], a["optimizer"]["state"], rtol=0, atol=0)
+            rows_a, rows_b = ([json.loads(line) for line in open(run / "metrics.jsonl")] for run in (whole, resumed))
+            self.assertEqual([r["validation"] for r in rows_a], [r["validation"] for r in rows_b])
+            settings = json.loads((resumed / "config.json").read_text())
+            self.assertEqual(settings["resumed_from"]["name"], "E3_point_b0_main_s0")
+            self.assertEqual((settings["group"], settings["patience"], settings["max_flights"]), ("E3_point_b0_main_resumed", 5, 8))
+            self.assertTrue((resumed / "result.json").is_file() and (resumed / "encoder_model.zip").is_file())
+            # Refused: an unfinished run, other training settings, no epochs left, and a patience it already ran out of
+            unfinished = folder / "unfinished"
+            shutil.copytree(first, unfinished)
+            (unfinished / "result.json").unlink()
+            stalled = folder / "stalled"                      # its second epoch made worse than its first
+            shutil.copytree(whole, stalled)
+            rows_a[1]["validation"]["mse"] = rows_a[0]["validation"]["mse"] + 1.0
+            (stalled / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows_a))
+            for argv in (["--resume", str(unfinished), "--max-epochs", "2"], ["--resume", str(first), "--max-epochs", "2", "--batch-size", "8"],
+                         ["--resume", str(first), "--max-epochs", "1"], ["--resume", str(stalled), "--max-epochs", "4", "--patience", "1"],
+                         ["--resume", str(first), "--design", "E1", "--max-epochs", "2"]):
+                with self.assertRaises(SystemExit, msg=argv):
+                    T.main([*argv, "--output-root", str(folder / "refused"), "--wandb-mode", "disabled"])
 
     @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
     def test_training_end_to_end_is_reproducible_and_refuses_reuse(self):
