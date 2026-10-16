@@ -928,16 +928,124 @@ The `find` floor is the ideal estimator's posterior mean of b0 on the first 200 
 **What the probes show:**
 - **The task is learnable by a small recurrent encoder trained offline:** the GRU got about three quarters of the way from the clock to the best possible estimate.
 - **The difficulty is a long plateau, not an impossible task.** Each encoder first learns the clock and counting. Learning to read the battery at the cap comes much later and suddenly, after about 4,500 gradient steps on the real task. With little data (`find` on 1,600 flights) or impatient early stopping (GRU seed 2, and possibly E1/E3), runs end on the plateau.
-- **Whether the xLSTM would click too is open.**
+- **Whether the xLSTM would click too was open on 2026-10-16 at 00:48; it did (see "The xLSTM clicked too" below).**
   - Its curves so far look like the GRU's before the click: E1 seed 0 0.129, 0.129, 0.130, 0.134, 0.127, 0.126, **0.124** at pass 7, and E3 seed 0 0.123 at pass 7.
   - But it takes about an hour per pass, so the click would come after 9–10 hours if it comes at the same number of steps.
   - E1 seed 2 and E3 seed 2 already stopped, after 6 and 7 passes. On 2026-10-16 at 00:48, the other four were at passes 7–8.
 
 **Next for step 4:**
-1. **The GRU on `battery` with patient early stopping** (8 passes without improvement, up to 40 passes), 3 seeds, so all of them get past the click and finish improving.
-2. **Give the xLSTM the same chance:** continue its runs from `last_encoder.pt` with more patience (`train_encoder.py` needs a resume option), or test it on `find` on 20,000 flights first.
+1. **The GRU on `battery` with patient early stopping** (8 passes without improvement, up to 40 passes), 3 seeds: now the baseline cell of the 2 × 2 plan below.
+2. **Give the xLSTM the same chance:** done (`train_encoder.py --resume`, and `find` on 20,000 flights): it clicked too (below).
 3. **The `find` floor on all 2,000 test flights** of `ft20k`.
 4. **Freeze the best encoder under plain PPO.** For a GRU, the context wrapper needs to load one (`FrozenEncoderContext` reads a Contextual_PPO model with the xLSTM today).
+
+**The xLSTM clicked too (status 2026-10-16 20:28).** Given enough passes, the xLSTM learns the battery the same way as the GRU, after the same plateau:
+- **Real task (validation, best pass):**
+  - E1 seed 1: 0.100, pass 20 of 20
+  - E3 seeds 0 / 1: 0.102 / 0.101
+  - E1 seed 0: 0.105, stopped at pass 16
+  - the resumed E1 / E3 seed 2: 0.102 / 0.101
+  - the GRU: 0.099–0.101
+- **The click:** most runs clicked after 9–11 passes, like the GRU. The two runs stopped early at passes 6–7 clicked once resumed with patience 8.
+- **`find`, 20,000 full-throttle flights:** 0.061–0.067 after 15 passes, against 0.062–0.064 for the GRU.
+- **Cost:** about 75–100 minutes per pass beside the other runs, against about 6–8 for the GRU.
+- **So the xLSTM is a fit encoder:** as accurate as the GRU, but about 15 times slower to train.
+- **E3's starting-battery head makes no clear difference.**
+
+### Plan: a ConvGRU encoder, a 2 × 2 test, and learned encoders in PPO (2026-10-16)
+
+**Objective.**
+1. Find out whether better input processing helps a GRU encoder learn the battery faster (a shorter plateau) and closer to the ideal estimator. Today's GRU is about 0.05 away from the ideal estimate at every point of the flight. Test two changes separately:
+   - dropping `tau` (time left) from the encoder's input
+   - a short causal filter and a per-step MLP before the GRU
+2. Make GRU-type encoders loadable by the context wrapper, so plain PPO can train with a frozen learned encoder: the GRU already trained, and the best cell of the grid.
+
+**The grid (E1's target, 5 seeds per cell):**
+
+| | `tau` kept | `tau` dropped |
+|---|---|---|
+| **GRU** (linear 6 → 128, GRU 2 × 128, A's head) | the patient baseline, which is also the patient GRU rerun | `tau` alone |
+| **ConvGRU** (filter + MLP → GRU 2 × 128, A's head) | the front-end alone | both |
+
+- **Shared settings:** E1's target and loss, dataset v2 main mix, the same split by flight seed, Adam 3e-4, batch 32, clipping 1.0, A's head (128 → 128 → 1, tanh, sigmoid).
+- **Patient early stopping:** 8 passes without improvement, at most 40 passes.
+- **Both rows keep the same GRU core,** so the comparison isolates the front-end. A small version (GRU 1 × 64) is an optional fifth cell.
+- **ConvGRU front-end:**
+  - inputs: altitude, noisy speed, climb rate, previous throttle and lift, plus `tau` in the kept column, plus a 0/1 channel marking real frames against start-of-flight padding
+  - a causal Conv1d (window 16 = 0.8 s, 32 channels, SiLU)
+  - a per-step MLP 32 → 128 → 128 (SiLU), then LayerNorm
+  - then the GRU
+
+**Decision rules, set before running:**
+- Plateau length = passes until validation first falls below 0.115.
+- Final quality = test error overall, at 1, 5 and 20 s, and per style, against the floor.
+- A change helps if it improves either by more than the seed spread, in all seeds.
+- If only the both-changes cell helps, report the two changes as working together.
+
+**Implementation:**
+1. **`recurrent_encoders.py`** (new; project glue, nothing in `contextual_ppo/` changes, so A–F is unaffected):
+   - `GRUEncoder`: the probe GRU's exact architecture and parameter names, so the GRUs already trained load directly.
+   - `ConvGRUEncoder`.
+   - One interface:
+     - full-flight mode for training: zero-pad the start, one Conv1d call, one GRU call
+     - one-step mode for the wrapper: a rolling buffer of the last 15 frames plus the GRU state, zeroed at episode starts
+     - the initial and reset state, and the "drop `tau`" option inside the encoder
+   - Full-flight mode refuses sequences with an episode start in the middle.
+   - `save_encoder` / `load_encoder`: an `encoder.pt` holding the architecture, its settings and the weights.
+2. **`train_encoder.py`:**
+   - `--arch {xlstm, gru, convgru}` (default `xlstm`: E1/E3 unchanged, names included), `--drop-tau`, `--hidden`, `--layers`.
+   - The b0 head works for every architecture.
+   - The new architectures save `encoder.pt`; the xLSTM keeps `encoder_model.zip`.
+   - Names like `E1_convgru_notau_point_main_s0`.
+   - A resume compares only the code files the original run recorded, so the xLSTM runs stay resumable.
+3. **`context_wrapper.py`:** `context.source=encoder` with a `.pt` model steps the standalone encoder (one memory per environment, reset at episode starts, frozen). A `.zip` model keeps the xLSTM path.
+4. **Export** the probe GRUs' best checkpoints to `encoder.pt`, so PPO can use the current best GRU at once.
+5. **Checks:**
+   - full flight and one step at a time agree within 1e-5, for both architectures, with and without `tau`
+   - no look-ahead, including through the filter window
+   - with `tau` dropped, `tau` never changes the output
+   - padding changes nothing
+   - the exported probe GRU reproduces its outputs exactly
+   - the wrapper's estimates equal full-flight mode on recorded flights, and stay frozen while PPO trains
+   - resume works for the new architectures and still for the xLSTM runs
+   - distinct names, reproducible runs
+6. Smoke runs and timing, then launch: 12 runs, 1 thread each, low priority.
+7. Measure against the floor: overall, by flight time, per style, and the encoder-minus-calculator difference.
+8. **Afterwards, separately:** plain PPO with the frozen encoder (`context.source=encoder`), 8 seeds at step 0's settings, validation seeds 1000–1002 only. Compare with the ideal estimate (283 / 323), the true battery (246 / 258) and memoryless PPO (23 / 77).
+
+**Doubts:**
+- **Dropping `tau` may change little:** a GRU can build its own clock by counting steps. If it matters, it will most likely show in plateau length.
+- **The remaining gap may come from training length rather than input processing** (GRU seed 1 was still improving at pass 20). So the comparison is against the patient baseline, not the earlier runs.
+- **Click timing varies between seeds;** 3 seeds may not separate small effects (5 per cell is cheap).
+- **CPU:** 12 more runs beside xLSTM runs means about 30 of 32 threads, and everything slows down.
+- **Start-of-flight padding:** the filter sees 15 padded frames at take-off. The 0/1 channel marks them, and the checks guarantee training and stepping treat them alike.
+- **A lower error on pilot flights does not guarantee better PPO:** PPO's own flights differ. The frozen-PPO test and the closed-loop error on PPO's flights decide.
+- **The floor stays valid with `tau` dropped:** the ideal estimator never needs it.
+
+**The stopped xLSTM runs, finalized (2026-10-16 20:45).** The six runs still going were stopped by hand at 20:33 and finished with `--finalize`: the best checkpoint is scored on the test flights, and the W&B run gets its test summary and is marked finished.
+- **Real task, test error:** E3 seed 1: 0.102 (best pass 18); E3 seed 2, resumed: 0.101 (best pass 17); E1 seed 2, resumed: 0.103 (best pass 17).
+- **The runs that ended on their own (validation):** E1 seed 0: 0.105, E1 seed 1: 0.100, E3 seed 0: 0.102.
+- **`find`, test error:** 0.066 / 0.061 / 0.062 (best passes 9 / 14 / 11 of 15), against 0.062–0.064 for the GRU.
+- **The clock gets 0.144 on the real task and 0.124 on `find`.**
+- `--finalize` (`train_encoder.py`, `step4_probes.py`) does what a run's natural end does. A check confirms it gives the same `result.json` and model as a run that finished on its own.
+
+**The 2 × 2 plan, built (steps 1–6, 2026-10-16).**
+- **The pieces:**
+  - `recurrent_encoders.py`: `GRUEncoder`, `ConvGRUEncoder`, `encoder.pt`, and export of the probe GRUs
+  - `train_encoder.py --arch gru | convgru --drop-tau`
+  - the context wrapper loads an `encoder.pt`
+  - the three probe GRUs are exported to `runs_encoder/step4_probes/probe_gru_battery_main_s{0,1,2}/encoder.pt`
+- **Checks (80 in the project pass):**
+  - whole flight and one step at a time agree within 1e-5, for both architectures, with and without `tau`
+  - no look-ahead, including through the filter window
+  - with `tau` dropped, `tau` never changes the output
+  - the wrapper's estimates equal whole-flight estimates and stay frozen while PPO trains
+  - an exported probe GRU gives exactly the probe's estimates
+  - the new architectures train, resume exactly and finalize
+  - an xLSTM run from before `--arch` still resumes
+- **Sizes:** GRU 232,193 weights; ConvGRU 255,905 (255,393 without `tau`).
+- **Timing:** with 20 runs at once (1 thread each), about 9–14 minutes per pass, against about 3.5 minutes alone. The grid should take about 5–7 hours, and at most about 10.
+- **Planned launch:** 4 cells × 5 seeds, E1's target, patience 8, up to 40 passes, `--output-root runs_encoder/step4_grid`. Names: `E1_gru_point_main`, `E1_gru_notau_point_main`, `E1_convgru_point_main`, `E1_convgru_notau_point_main` (`_s0` to `_s4`).
 
 ```bash
 python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4      # E3: --design E3

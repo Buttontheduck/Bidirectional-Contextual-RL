@@ -31,6 +31,7 @@ W&B: project battery-encoder, group probe_<arch>_<task>_<mix>[_<dataset folder, 
     python step4_probes.py --arch gru --task battery --seed 0
     python step4_probes.py --arch xlstm --task count --train-flights 3000 --seed 0
     python step4_probes.py --arch gru --task find --seed 0 --smoke        # tiny run, W&B disabled
+    python step4_probes.py --finalize runs_encoder/step4_probes/<run>      # a run stopped by hand: what its natural end does
 """
 from __future__ import annotations
 
@@ -114,11 +115,56 @@ def evaluate(model, arch: str, flights: T.Flights, rows: np.ndarray, steps_at: d
     return tally.summary()
 
 
+def finalize_run(run_dir: Path, wandb_mode: str | None = None) -> dict:
+    """What a probe run's natural end does, for a run stopped by hand (train_encoder.finalize_run): result.json from the
+    best checkpoint and the W&B summary, with the run's own flights, labels and training subset."""
+    import battery_plane as bp
+
+    settings, rows, best_row, last, best = T.stopped_run_state(run_dir, "last.pt", "best.pt")
+    cfg = T.encoder_config([f"training.seed={settings['seed']}"])
+    data_dir = Path(settings["data"])
+    manifest = json.loads((data_dir / "manifest.json").read_text())
+    core = bp.BatteryPlaneVec(n_envs=1, observation_mode="hidden", seed=0, **dict(manifest["env_kwargs"]))
+    flights, _ = T.load(data_dir, settings["mix"], settings["max_flights"])
+    data = {"observations": flights.observations, "prev_actions": flights.prev_actions, "batteries": flights.batteries,
+            "styles": flights.styles, "seeds": flights.seeds}
+    flights = T.Flights({**data, "batteries": task_labels(settings["task"], data, core.dt, core.E)})
+    rows_split = {split: flights.indices(split) for split in ("train", "validation", "test")}
+    if settings["train_flights"] is not None:
+        rows_split["train"] = rows_split["train"][
+            np.unique(np.linspace(0, len(rows_split["train"]) - 1, settings["train_flights"]).round().astype(int))]
+    if {k: int(len(v)) for k, v in rows_split.items()} != settings["split"]["flights"]:
+        raise ValueError(f"{run_dir}: the rebuilt split differs from the run's {settings['split']['flights']}")
+    clock = T.clock_estimate(flights, rows_split["train"])
+    steps_at = settings["steps_at"]
+    model = make_model(settings["arch"], cfg, settings["hidden"] or 128, settings["layers"] or 2)
+    model.load_state_dict(best["state_dict"])
+    validation = evaluate(model, settings["arch"], flights, rows_split["validation"], steps_at)
+    if not np.isclose(validation["rmse"], best_row["validation"]["rmse"], rtol=0, atol=1e-5):
+        raise ValueError(f"{run_dir}: the best checkpoint gives validation {validation['rmse']:.6f}, metrics.jsonl "
+                         f"{best_row['validation']['rmse']:.6f}")
+    result = {
+        "name": settings["name"], "group": settings["group"], "task": settings["task"], "arch": settings["arch"],
+        "best_epoch": best_row["epoch"], "epochs": len(rows), "steps": last["step"],
+        "hours": sum(r["epoch_seconds"] for r in rows) / 3600,
+        "validation": validation, "test": evaluate(model, settings["arch"], flights, rows_split["test"], steps_at),
+        "clock_validation": T.evaluate_clock(clock, flights, rows_split["validation"], steps_at),
+        "clock_test": T.evaluate_clock(clock, flights, rows_split["test"], steps_at),
+        "stopped_by_hand": True, "finalized": datetime.now().isoformat(timespec="seconds"),
+    }
+    (run_dir / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+    result["wandb"] = T.finish_wandb_run(settings["name"], {
+        "best_epoch": result["best_epoch"], "test/rmse": result["test"]["rmse"], "stopped_by_hand": True,
+        **{f"test/rmse_at_{k}": v for k, v in result["test"]["rmse_at"].items()},
+        "clock_test/rmse": result["clock_test"]["rmse"]}, wandb_mode)
+    return result
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--arch", choices=ARCHS, required=True)
-    parser.add_argument("--task", choices=TASKS, required=True)
-    parser.add_argument("--seed", type=int, required=True, help="Initial weights and batch order (not the split)")
+    parser.add_argument("--arch", choices=ARCHS, help="Required unless --finalize")
+    parser.add_argument("--task", choices=TASKS, help="Required unless --finalize")
+    parser.add_argument("--seed", type=int, help="Initial weights and batch order (not the split); required unless --finalize")
     parser.add_argument("--data", type=Path, default=T.DEFAULT_DATA, help="pilots.py output folder")
     parser.add_argument("--mix", default=None, help="A mix of pilots.MIXES (default: narrow for find, main otherwise)")
     parser.add_argument("--train-flights", type=int, default=None, help="An evenly spaced subset of the training flights")
@@ -135,7 +181,21 @@ def main(argv=None) -> None:
     parser.add_argument("--max-flights", type=int, default=None, help="Only some flights of each split (checks)")
     parser.add_argument("--wandb-mode", default=None, help="online, offline or disabled (default: WANDB_MODE)")
     parser.add_argument("--smoke", action="store_true", help="48 flights per split, 2 epochs, W&B disabled")
+    parser.add_argument("--finalize", type=Path, default=None, help="A run directory stopped by hand to finish")
     args = parser.parse_args(argv)
+    if args.finalize is not None:
+        import torch as th
+
+        th.set_num_threads(args.threads)
+        try:
+            result = finalize_run(args.finalize, args.wandb_mode)
+        except ValueError as error:
+            parser.error(str(error))
+        print(f"{result['name']}: finalized, best epoch {result['best_epoch']} of {result['epochs']}, test rmse "
+              f"{result['test']['rmse']:.4f} (clock only {result['clock_test']['rmse']:.4f}); {result['wandb']}", flush=True)
+        return
+    if args.arch is None or args.task is None or args.seed is None:
+        parser.error("--arch, --task and --seed are required unless --finalize")
     if args.smoke:
         args.max_flights, args.max_epochs, args.wandb_mode, args.log_every = args.max_flights or 48, 2, "disabled", 1
         args.output_root = args.output_root.with_name(args.output_root.name + "_smoke")

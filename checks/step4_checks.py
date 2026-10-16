@@ -1,4 +1,5 @@
-"""CPU checks of step 4 (ENCODER_PLAN.md), offline encoder training and its floor: python -m unittest checks.step4_checks -v
+"""CPU checks of step 4 (ENCODER_PLAN.md), offline encoder training, its floor, the probes and the standalone encoders:
+python -m unittest checks.step4_checks -v
 
 The checks that train read the pilot flights of dataset v2 (runs_encoder/pilot_flights/v2, gitignored) and are skipped
 without it; the others use a few flights generated on the spot.
@@ -14,8 +15,9 @@ import unittest
 import numpy as np
 import torch
 
-from context_wrapper import FrozenEncoderContext
+from context_wrapper import ContextVecEnv, FrozenEncoderContext, StandaloneEncoderContext, make_context_source
 import pilots as P
+import recurrent_encoders as R
 import step4_floor as F
 import step4_probes as PR
 import train_encoder as T
@@ -274,6 +276,171 @@ class Step4Checks(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 F.main(args)
 
+    @staticmethod
+    def small_encoder(arch, drop_tau, aux=True, seed=0):
+        torch.manual_seed(seed)
+        extra = {"conv_channels": 8, "window": 16} if arch == "convgru" else {}
+        return R.build_encoder(arch, drop_tau=drop_tau, hidden=32, layers=2, head_arch=[16], aux_dim=1 if aux else None, **extra).eval()
+
+    def test_standalone_encoders_give_the_same_estimates_over_a_flight_and_step_by_step(self):
+        rows = [int(i) for i in np.argsort(self.flights.lengths)[[0, len(self.flights.lengths) // 2, -1]]]
+        batch = self.flights.batch(rows)
+        obs, prev, mask = batch["observations"], batch["prev_actions"], batch["mask"]
+        for arch in R.ARCHITECTURES:
+            for drop_tau in (False, True):
+                encoder = self.small_encoder(arch, drop_tau)
+                with torch.no_grad():
+                    whole, whole_aux = encoder(obs, prev)
+                    state, stepped, stepped_aux = encoder.initial_state(len(rows)), [], []
+                    for t in range(obs.shape[1]):
+                        estimate, aux, state = encoder.step(state, obs[:, t], prev[:, t])
+                        stepped.append(estimate)
+                        stepped_aux.append(aux)
+                stepped, stepped_aux = torch.stack(stepped, 1), torch.stack(stepped_aux, 1)
+                torch.testing.assert_close(stepped[mask], whole[mask], rtol=0, atol=1e-5, msg=f"{arch} drop_tau={drop_tau}")
+                torch.testing.assert_close(stepped_aux[mask], whole_aux[mask], rtol=0, atol=1e-5)
+                self.assertTrue(((whole > 0) & (whole < 1)).all())
+
+    def test_standalone_encoders_never_look_ahead_and_ignore_tau_when_told(self):
+        i, t0 = int(np.argmax(self.flights.lengths)), 30
+        batch = self.flights.batch([i])
+        obs, prev = batch["observations"], batch["prev_actions"]
+        later = obs.clone()
+        later[:, t0 + 1:] += torch.randn_like(later[:, t0 + 1:])
+        other_tau = obs.clone()
+        other_tau[..., R.TAU_INDEX] = torch.rand_like(other_tau[..., R.TAU_INDEX])
+        for arch in R.ARCHITECTURES:
+            for drop_tau in (False, True):
+                encoder = self.small_encoder(arch, drop_tau)
+                with torch.no_grad():
+                    base, changed, tau_changed = (encoder(o, prev)[0] for o in (obs, later, other_tau))
+                # The filter window and the GRU see only the past: estimates up to t0 don't move
+                torch.testing.assert_close(changed[0, :t0 + 1], base[0, :t0 + 1], rtol=0, atol=1e-6, msg=arch)
+                self.assertFalse(torch.allclose(changed[0, t0 + 1:t0 + 40], base[0, t0 + 1:t0 + 40]))
+                if drop_tau:
+                    torch.testing.assert_close(tau_changed, base, rtol=0, atol=0, msg=f"{arch} reads tau")
+                else:
+                    self.assertFalse(torch.allclose(tau_changed, base), arch)
+        self.assertEqual(R.build_encoder("convgru", drop_tau=True).conv.in_channels, 6)    # y, v_x, v_y, a_x, a_y, valid
+
+    def test_standalone_encoder_in_the_context_wrapper(self):
+        from checks.step2_checks import episodes, vec_env
+        from stable_baselines3 import PPO
+
+        encoder = self.small_encoder("convgru", True, aux=True, seed=3)
+        with tempfile.TemporaryDirectory() as folder:
+            R.save_encoder(encoder, Path(folder) / "encoder.pt")
+            source = StandaloneEncoderContext(2, Path(folder) / "encoder.pt")
+            # context.source=encoder with a .pt model picks it
+            from omegaconf import OmegaConf
+            cfg = OmegaConf.create({"context": {"source": "encoder", "encoder_model": str(Path(folder) / "encoder.pt")}})
+            self.assertIsInstance(make_context_source(cfg, 2, {}), StandaloneEncoderContext)
+        self.assertEqual(source.dim, 1)
+        self.assertTrue(all(not p.requires_grad for p in source.encoder.parameters()))
+        before = {name: value.clone() for name, value in source.encoder.state_dict().items()}
+        env = ContextVecEnv(vec_env("hidden", T=12), source)
+        finished = episodes(env, 40)
+        self.assertGreaterEqual(len(finished), 4)
+        for episode in finished:
+            observations = torch.as_tensor(np.array(episode["obs"]), dtype=torch.float32)
+            previous = torch.as_tensor(np.concatenate([np.zeros((1, 2), np.float32), np.array(episode["actions"])]))
+            # The wrapper's estimate at every step, final observation included, is the whole-flight estimate
+            with torch.no_grad():
+                expected = source.encoder(observations[None, :, :4], previous[None])[0][0].numpy()
+            np.testing.assert_allclose(observations[:, 4].numpy(), expected, atol=1e-5)
+        PPO("MlpPolicy", env, n_steps=8, batch_size=8, device="cpu", policy_kwargs={"net_arch": [16]}).learn(total_timesteps=32)
+        for name, value in source.encoder.state_dict().items():
+            torch.testing.assert_close(value, before[name])
+
+    @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
+    def test_probe_gru_exports_exactly_and_new_architectures_train_resume_and_finalize(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            # A probe GRU of the battery task, exported to encoder.pt, gives exactly the probe's estimates
+            PR.main(["--arch", "gru", "--task", "battery", "--seed", "0", "--output-root", str(folder / "probe"), "--max-flights", "8",
+                     "--max-epochs", "1", "--batch-size", "4", "--threads", "1", "--hidden", "16", "--wandb-mode", "disabled",
+                     "--log-every", "1000"])
+            probe = folder / "probe" / "probe_gru_battery_main_max1_s0"
+            R.export_probe(probe, folder / "probe.pt")
+            original = PR.make_model("gru", self.cfg, 16, 2)
+            original.load_state_dict(torch.load(probe / "best.pt", weights_only=False)["state_dict"])
+            batch = self.flights.batch(self.flights.indices("test")[:3])
+            with torch.no_grad():
+                torch.testing.assert_close(R.load_encoder(folder / "probe.pt")(batch["observations"], batch["prev_actions"])[0],
+                                           original.eval()(batch["observations"], batch["prev_actions"]), rtol=0, atol=0)
+            # train_encoder.py --arch convgru --drop-tau (E3): its name, its encoder.pt (the best checkpoint)
+            options = ["--design", "E3", "--arch", "convgru", "--drop-tau", "--hidden", "16", "--head-arch", "8", "--seed", "0",
+                       "--max-flights", "8", "--batch-size", "4", "--threads", "1", "--wandb-mode", "disabled", "--log-every", "1000"]
+            T.main([*options, "--output-root", str(folder / "whole"), "--max-epochs", "2", "--patience", "5"])
+            name = "E3_convgru_notau_h16l2_head8_point_b0_main_s0"
+            whole = folder / "whole" / name
+            settings = json.loads((whole / "config.json").read_text())
+            self.assertEqual((settings["arch"], settings["drop_tau"], settings["conv_window"]), ("convgru", True, 16))
+            self.assertTrue((whole / "encoder.pt").is_file() and not (whole / "encoder_model.zip").exists())
+            saved = R.load_encoder(whole / "encoder.pt")
+            best = torch.load(whole / "best_encoder.pt", weights_only=False)["state_dict"]
+            for key, value in saved.state_dict().items():
+                torch.testing.assert_close(value, best[key], rtol=0, atol=0)
+            # Resume continues it exactly (with its architecture), and finalize gives its natural end
+            T.main([*options, "--output-root", str(folder / "first"), "--max-epochs", "1"])
+            T.main(["--resume", str(folder / "first" / name), "--max-epochs", "2", "--patience", "5", "--threads", "1",
+                    "--output-root", str(folder / "resumed"), "--wandb-mode", "disabled", "--log-every", "1000"])
+            resumed = folder / "resumed" / name.replace("_main_s0", "_main_resumed_s0")
+            a, b = (torch.load(run / "last_encoder.pt", weights_only=False)["state_dict"] for run in (whole, resumed))
+            for key in a:
+                torch.testing.assert_close(b[key], a[key], rtol=0, atol=0)
+            stopped = folder / "stopped"
+            shutil.copytree(whole, stopped)
+            (stopped / "result.json").unlink()
+            (stopped / "encoder.pt").unlink()
+            T.main(["--finalize", str(stopped), "--wandb-mode", "disabled", "--threads", "1"])
+            ra, rb = (json.loads((run / "result.json").read_text()) for run in (whole, stopped))
+            self.assertEqual(ra["test"], rb["test"])
+            self.assertTrue((stopped / "encoder.pt").is_file())
+            # The xLSTM refuses the standalone encoders' options
+            with self.assertRaises(SystemExit):
+                T.main(["--design", "E1", "--seed", "0", "--drop-tau", "--output-root", str(folder / "refused"), "--wandb-mode", "disabled"])
+
+    @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
+    def test_finalize_gives_what_a_natural_end_gives(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            same = ("best_epoch", "epochs", "steps", "validation", "test", "clock_validation", "clock_test")
+            # train_encoder.py: a finished run, and a copy of it stopped by hand (no result.json, no model) and finalized
+            natural = train(folder / "natural", "--max-epochs", "2", "--patience", "5")
+            stopped = folder / "stopped"
+            shutil.copytree(natural, stopped)
+            (stopped / "result.json").unlink()
+            (stopped / "encoder_model.zip").unlink()
+            T.main(["--finalize", str(stopped), "--wandb-mode", "disabled", "--threads", "1"])
+            a, b = (json.loads((run / "result.json").read_text()) for run in (natural, stopped))
+            self.assertEqual({k: a[k] for k in (*same, "test_seeds")}, {k: b[k] for k in (*same, "test_seeds")})
+            self.assertTrue(b["stopped_by_hand"])
+            saved = [FrozenEncoderContext(1, run / "encoder_model.zip").encoder.state_dict() for run in (natural, stopped)]
+            for key in saved[0]:
+                torch.testing.assert_close(saved[1][key], saved[0][key], rtol=0, atol=0)
+            # Refused: a run that has finished, and checkpoints that don't match metrics.jsonl
+            mismatched = folder / "mismatched"
+            shutil.copytree(natural, mismatched)
+            (mismatched / "result.json").unlink()
+            rows = (mismatched / "metrics.jsonl").read_text().splitlines()
+            (mismatched / "metrics.jsonl").write_text(rows[0] + "\n")
+            for run in (natural, mismatched):
+                with self.assertRaises(SystemExit, msg=run):
+                    T.main(["--finalize", str(run), "--wandb-mode", "disabled"])
+            # step4_probes.py, the same way
+            PR.main(["--arch", "gru", "--task", "find", "--seed", "1", "--output-root", str(folder / "probe"), "--max-flights", "8",
+                     "--max-epochs", "2", "--patience", "5", "--batch-size", "4", "--threads", "1", "--hidden", "16",
+                     "--wandb-mode", "disabled", "--log-every", "1000", "--train-flights", "5"])
+            natural = folder / "probe" / "probe_gru_find_narrow_n5_p5_max2_s1"
+            stopped = folder / "probe_stopped"
+            shutil.copytree(natural, stopped)
+            (stopped / "result.json").unlink()
+            PR.main(["--finalize", str(stopped), "--wandb-mode", "disabled", "--threads", "1"])
+            a, b = (json.loads((run / "result.json").read_text()) for run in (natural, stopped))
+            self.assertEqual({k: a[k] for k in same}, {k: b[k] for k in same})
+            self.assertTrue(b["stopped_by_hand"])
+
     @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
     def test_resume_continues_exactly_like_an_uninterrupted_run(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -293,6 +460,16 @@ class Step4Checks(unittest.TestCase):
             self.assertEqual([r["validation"] for r in rows_a], [r["validation"] for r in rows_b])
             settings = json.loads((resumed / "config.json").read_text())
             self.assertEqual(settings["resumed_from"]["name"], "E3_point_b0_main_s0")
+            old_style = folder / "old_style"
+            shutil.copytree(first, old_style)
+            config = json.loads((old_style / "config.json").read_text())
+            for key in T.ARCH_SETTINGS:
+                config.pop(key)
+            config["code_sha256"].pop("recurrent_encoders.py")
+            (old_style / "config.json").write_text(json.dumps(config))
+            T.main(["--resume", str(old_style), "--max-epochs", "2", "--patience", "5", "--output-root", str(folder / "old_resumed"),
+                    "--threads", "1", "--wandb-mode", "disabled", "--log-every", "1000"])
+            self.assertTrue((folder / "old_resumed" / "E3_point_b0_main_resumed_s0" / "encoder_model.zip").is_file())
             self.assertEqual((settings["group"], settings["patience"], settings["max_flights"]), ("E3_point_b0_main_resumed", 5, 8))
             self.assertTrue((resumed / "result.json").is_file() and (resumed / "encoder_model.zip").is_file())
             # Refused: an unfinished run, other training settings, no epochs left, and a patience it already ran out of

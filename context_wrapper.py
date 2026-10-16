@@ -11,8 +11,9 @@ Sources (cfg.context.source; the plain-PPO config, ppo/configs/battery_plane_ppo
     none          no wrapper: plain PPO
     ideal         IdealBatteryEstimator (step1_ideal_estimator.py): the posterior mean of b_t, and its std with
                   context.include_std; the best estimate any encoder could make, from hidden observations and actions
-    encoder       the frozen encoder of a saved Contextual_PPO model (context.encoder_model): z_t as that model's actor
-                  and critic read it (Contextual_PPO's context_inputs)
+    encoder       a frozen learned encoder (context.encoder_model): a saved Contextual_PPO model (.zip), whose encoder
+                  gives z_t as that model's actor and critic read it (Contextual_PPO's context_inputs), or a standalone
+                  encoder of recurrent_encoders.py (.pt: GRU or ConvGRU, step 4), whose battery estimate is appended
     true_battery  the true b_t from the env infos (privileged): reproduces observed mode exactly, a check of the wrapper
 Only true_battery reads the env infos; the others read hidden-mode observations and executed actions, never the battery.
 Nothing in a source is trained: the encoder runs without gradient and is not part of the PPO model.
@@ -147,6 +148,40 @@ class FrozenEncoderContext(ContextSource):
         return contexts.numpy().astype(np.float32)
 
 
+class StandaloneEncoderContext(ContextSource):
+    """
+    A standalone encoder of recurrent_encoders.py (an encoder.pt), frozen: its battery estimate b_hat_t from [o_t, a_{t-1}]
+    with the memory carried through the episode, stepped one frame at a time (the same estimates as over the whole
+    flight, checks.step4_checks). One memory per environment, reset where an episode starts; any auxiliary output (E3's
+    b0 head) is not appended.
+    """
+
+    dim = 1
+
+    def __init__(self, n_envs: int, model_path: str | Path) -> None:
+        import torch as th
+
+        from recurrent_encoders import load_encoder
+
+        self.th = th
+        self.encoder = load_encoder(Path(model_path))
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad_(False)
+        self.state = self.encoder.initial_state(n_envs)
+
+    def step(self, rows, observations, prev_actions, starts, finals, infos) -> np.ndarray:
+        th = self.th
+        starts_t = th.as_tensor(starts, dtype=th.bool)
+        prev = th.as_tensor(np.asarray(prev_actions, dtype=np.float32))
+        prev = th.where(starts_t.unsqueeze(-1), th.zeros_like(prev), prev)
+        with th.no_grad():
+            state = self.encoder.reset_state(self.state, starts_t)
+            estimates, _, new_state = self.encoder.step(state, th.as_tensor(np.asarray(observations, dtype=np.float32)), prev)
+            # Only the rows that stepped take the new memory
+            self.state = self.encoder.select_state(th.as_tensor(rows, dtype=th.bool), new_state, self.state)
+        return estimates[:, None].numpy().astype(np.float32)
+
+
 class ContextVecEnv(VecEnvWrapper):
     """
     Appends a frozen context source's output to the observations of a VecEnv (see the module docstring).
@@ -262,8 +297,13 @@ def validate_context(cfg, env_kwargs: dict) -> None:
         if noises is not None and [float(x) for x in noises] != [sigma]:
             raise ValueError(f"context.source=ideal assumes the speed noise of the environment ({sigma:g} m/s); the "
                              f"validation flights use {list(noises)}")
-    if source == "encoder" and (not context.get("encoder_model") or not encoder_model_path(cfg).is_file()):
-        raise ValueError("context.source=encoder needs context.encoder_model: a saved Contextual_PPO model (.zip)")
+    if source == "encoder":
+        if not context.get("encoder_model") or not encoder_model_path(cfg).is_file():
+            raise ValueError("context.source=encoder needs context.encoder_model: a saved Contextual_PPO model (.zip) or a "
+                             "standalone encoder (.pt, recurrent_encoders.py)")
+        if encoder_model_path(cfg).suffix not in (".zip", ".pt"):
+            raise ValueError(f"context.encoder_model must be a .zip (Contextual_PPO) or a .pt (recurrent_encoders.py), "
+                             f"got {encoder_model_path(cfg).name}")
 
 
 def make_context_source(cfg, n_envs: int, env_kwargs: dict) -> ContextSource | None:
@@ -277,7 +317,8 @@ def make_context_source(cfg, n_envs: int, env_kwargs: dict) -> ContextSource | N
                             vx_points=int(context.vx_points), vy_tolerance=float(context.vy_tolerance),
                             prune_below=None if prune is None else float(prune))
     if source == "encoder":
-        return FrozenEncoderContext(n_envs, encoder_model_path(cfg))
+        path = encoder_model_path(cfg)
+        return StandaloneEncoderContext(n_envs, path) if path.suffix == ".pt" else FrozenEncoderContext(n_envs, path)
     return TrueBatteryContext()
 
 

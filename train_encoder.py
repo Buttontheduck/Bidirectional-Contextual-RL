@@ -7,6 +7,11 @@ battery b_t of each step (privileged: a target, never an input). Designs:
     E1  the point head, squared error on b_t
     E3  E1 plus a second head that predicts the flight's starting battery b0 at every step (squared error times
         --b0-weight). It only shapes training: the saved model drops it, and PPO reads the b_t estimate only.
+--arch (ENCODER_PLAN.md, step 4's 2 x 2 plan): xlstm (the default, A's encoder, everything above) or a standalone encoder
+of recurrent_encoders.py, gru or convgru, with --drop-tau (the encoder ignores tau, time left), --hidden, --layers,
+--head-arch and, for convgru, --conv-channels and --conv-window. These save encoder.pt (recurrent_encoders.save_encoder,
+read by the context wrapper) instead of encoder_model.zip, and their names carry the architecture, e.g.
+E1_convgru_notau_point_main_s0; the xLSTM's names are unchanged.
 
 Flights are split by their seed, the same way for every design and training seed: seed % 10 == 8 is validation (early
 stopping and the best checkpoint), seed % 10 == 9 is test (scored once, at the end, with the best checkpoint), the rest
@@ -34,6 +39,10 @@ metrics.jsonl starts with the original run's epochs, and its best checkpoint sta
     python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4
     python train_encoder.py --design E3 --seed 0 --smoke        # tiny correctness run, W&B disabled
     python train_encoder.py --resume runs_encoder/step4/E1_point_main_s2 --patience 8 --max-epochs 40
+    python train_encoder.py --finalize runs_encoder/step4/E3_point_b0_main_s1     # a run stopped by hand
+
+--finalize does for a run stopped by hand (between epochs, so its checkpoints match metrics.jsonl) what its natural end
+does: result.json from the best checkpoint (marked stopped_by_hand), encoder_model.zip, and the W&B run's summary.
 """
 from __future__ import annotations
 
@@ -59,7 +68,13 @@ SECONDS_AT = (1, 5, 20)
 DEFAULT_DATA = PROJECT_ROOT / "runs_encoder" / "pilot_flights" / "v2"
 WANDB_PROJECT = "battery-encoder"
 HASHED_CODE = ("train_encoder.py", "pilots.py", "main_battery_plane_contextual_ppo.py", "config/cppo.yaml",
-               "contextual_ppo/torch_layers.py", "contextual_ppo/policies.py", "battery_plane.py")
+               "contextual_ppo/torch_layers.py", "contextual_ppo/policies.py", "battery_plane.py", "recurrent_encoders.py")
+ARCHS = ("xlstm", "gru", "convgru")
+# The architecture settings a run records; runs from before --arch were A's xLSTM
+ARCH_SETTINGS = ("arch", "drop_tau", "hidden", "layers", "head_arch", "conv_channels", "conv_window")
+XLSTM_ARCH = {"arch": "xlstm", "drop_tau": False, "hidden": None, "layers": None, "head_arch": None, "conv_channels": None,
+              "conv_window": None}
+ARCH_DEFAULTS = {"hidden": 128, "layers": 2, "head_arch": [128, 128], "conv_channels": 32, "conv_window": 16}
 
 
 def split_of(seed: int) -> str:
@@ -169,6 +184,10 @@ def length_batches(rows: np.ndarray, lengths: np.ndarray, batch_size: int, rng: 
 
 def predict(encoder, batch: dict, b0_head: bool):
     """The encoder over whole flights from its initial state: b_t estimates [B, L] and b0 estimates [B, L] (E3)."""
+    if not hasattr(encoder, "unroll"):
+        # recurrent_encoders: causal over whole flights, so the end padding of shorter flights never reaches a real step
+        estimates, b0 = encoder(batch["observations"], batch["prev_actions"])
+        return estimates, b0 if b0_head else None
     state = encoder.initial_state(batch["observations"].shape[0])
     if b0_head:
         contexts, b0, _ = encoder.unroll_with_auxiliary(state, batch["observations"], batch["prev_actions"], batch["mask"])
@@ -259,6 +278,48 @@ def evaluate_clock(clock: np.ndarray, flights: Flights, rows: np.ndarray, steps_
     return tally.summary()
 
 
+def arch_settings(settings: dict) -> dict:
+    """The architecture settings of a run (its config.json or the parsed options), A's xLSTM for runs from before --arch."""
+    return {key: settings.get(key, XLSTM_ARCH[key]) for key in ARCH_SETTINGS}
+
+
+def arch_tag(arch: dict) -> str:
+    """The architecture's part of a run name: empty for A's xLSTM, e.g. _convgru_notau, plus any non-default size."""
+    if arch["arch"] == "xlstm":
+        return ""
+    tag = f"_{arch['arch']}" + ("_notau" if arch["drop_tau"] else "")
+    if (arch["hidden"], arch["layers"]) != (ARCH_DEFAULTS["hidden"], ARCH_DEFAULTS["layers"]):
+        tag += f"_h{arch['hidden']}l{arch['layers']}"
+    if list(arch["head_arch"]) != ARCH_DEFAULTS["head_arch"]:
+        tag += "_head" + "-".join(str(x) for x in arch["head_arch"])
+    if arch["arch"] == "convgru" and (arch["conv_channels"], arch["conv_window"]) != (ARCH_DEFAULTS["conv_channels"], ARCH_DEFAULTS["conv_window"]):
+        tag += f"_c{arch['conv_channels']}w{arch['conv_window']}"
+    return tag
+
+
+def make_model(cfg, arch: dict, b0_head: bool):
+    """A's xLSTM (make_encoder), or a GRU / ConvGRU of recurrent_encoders.py with a b0 head for E3."""
+    if arch["arch"] == "xlstm":
+        return make_encoder(cfg, b0_head)
+    from recurrent_encoders import build_encoder
+
+    kwargs = {"drop_tau": arch["drop_tau"], "hidden": arch["hidden"], "layers": arch["layers"],
+              "head_arch": list(arch["head_arch"]), "aux_dim": 1 if b0_head else None}
+    if arch["arch"] == "convgru":
+        kwargs.update(conv_channels=arch["conv_channels"], window=arch["conv_window"])
+    return build_encoder(arch["arch"], **kwargs)
+
+
+def save_trained(cfg, encoder, arch: dict, run_dir: Path, name: str) -> None:
+    """The best encoder for PPO: encoder_model.zip (a Contextual_PPO model) for the xLSTM, encoder.pt otherwise."""
+    if arch["arch"] == "xlstm":
+        save_policy_model(cfg, encoder, run_dir / "encoder_model.zip")
+    else:
+        from recurrent_encoders import save_encoder
+
+        save_encoder(encoder, run_dir / "encoder.pt", {"name": name})
+
+
 def save_policy_model(cfg, encoder, path: Path) -> None:
     """A Contextual_PPO model (A's settings, hidden mode) holding the encoder without its b0 head, loadable by
     context_wrapper.FrozenEncoderContext. Building the model reseeds torch: call it after training."""
@@ -286,9 +347,89 @@ def epoch_log(row: dict, b0_head: bool) -> dict:
 
 
 # Settings a resumed run takes from the original run (they define the training it continues)
-RESUMED_SETTINGS = ("design", "seed", "data", "mix", "batch_size", "learning_rate", "max_grad_norm", "b0_weight", "max_flights")
+RESUMED_SETTINGS = ("design", "seed", "data", "mix", "batch_size", "learning_rate", "max_grad_norm", "b0_weight", "max_flights",
+                    *ARCH_SETTINGS)
 # Code a resumed run must share with the original (train_encoder.py itself may have gained options since)
 RESUME_SAME_CODE = tuple(path for path in HASHED_CODE if path != "train_encoder.py")
+
+
+def wandb_run_id(name: str) -> str | None:
+    """The id of the latest local W&B run whose console log starts with this run's name line, or None."""
+    for folder in sorted((PROJECT_ROOT / "wandb").glob("run-*"), reverse=True):
+        log = folder / "files" / "output.log"
+        if log.is_file():
+            with open(log, errors="replace") as f:
+                if any(line.startswith(f"{name}: ") for _, line in zip(range(200), f)):
+                    return folder.name.rsplit("-", 1)[-1]
+    return None
+
+
+def finish_wandb_run(name: str, summary: dict, mode: str | None) -> str:
+    """Add the summary of a finished run to its W&B run (resumed by id) and mark it finished; returns what happened."""
+    import wandb
+
+    if mode == "disabled":
+        return "W&B disabled"
+    run_id = wandb_run_id(name)
+    if run_id is None:
+        return f"no local W&B run found for {name}"
+    run = wandb.init(project=WANDB_PROJECT, id=run_id, resume="must", mode=mode, dir=str(PROJECT_ROOT))
+    run.summary.update(summary)
+    run.finish()
+    return f"W&B run {run_id} finished"
+
+
+def stopped_run_state(run_dir: Path, last_name: str, best_name: str) -> tuple[dict, list[dict], dict, dict, dict]:
+    """settings, metrics rows, best row and the last and best checkpoints of a run stopped by hand, checked to agree."""
+    import torch as th
+
+    if (run_dir / "result.json").exists():
+        raise ValueError(f"{run_dir} has already finished (result.json)")
+    settings = json.loads((run_dir / "config.json").read_text())
+    rows = [json.loads(line) for line in open(run_dir / "metrics.jsonl")]
+    last = th.load(run_dir / last_name, weights_only=False)
+    best = th.load(run_dir / best_name, weights_only=False)
+    best_row = min(rows, key=lambda r: r["validation"]["mse"])
+    if last["epoch"] != len(rows) or best["epoch"] != best_row["epoch"]:
+        raise ValueError(f"{run_dir}: checkpoints (last epoch {last['epoch']}, best {best['epoch']}) don't match "
+                         f"metrics.jsonl ({len(rows)} epochs, best {best_row['epoch']})")
+    return settings, rows, best_row, last, best
+
+
+def finalize_run(run_dir: Path, wandb_mode: str | None = None) -> dict:
+    """What a run's natural end does, for a run stopped by hand: result.json from the best checkpoint, encoder_model.zip
+    and the W&B summary. The best checkpoint must reproduce its recorded validation error."""
+    settings, rows, best_row, last, best = stopped_run_state(run_dir, "last_encoder.pt", "best_encoder.pt")
+    cfg = encoder_config([f"training.seed={settings['seed']}"])
+    flights, _ = load(Path(settings["data"]), settings["mix"], settings["max_flights"])
+    rows_split = {split: flights.indices(split) for split in ("train", "validation", "test")}
+    clock = clock_estimate(flights, rows_split["train"])
+    steps_at, b0_head = settings["steps_at"], settings["b0_head"]
+    arch = arch_settings(settings)
+    encoder = make_model(cfg, arch, b0_head)
+    encoder.load_state_dict(best["state_dict"])
+    validation = evaluate(encoder, flights, rows_split["validation"], b0_head, steps_at)
+    if not np.isclose(validation["rmse"], best_row["validation"]["rmse"], rtol=0, atol=1e-5):
+        raise ValueError(f"{run_dir}: the best checkpoint gives validation {validation['rmse']:.6f}, metrics.jsonl "
+                         f"{best_row['validation']['rmse']:.6f}")
+    # This session's epochs: after the resume point for a resumed run (as a resumed run's natural end counts them)
+    first = settings.get("resumed_from", {}).get("epochs", 0)
+    result = {
+        "name": settings["name"], "group": settings["group"], "best_epoch": best_row["epoch"], "epochs": len(rows),
+        "steps": last["step"], "hours": sum(r["epoch_seconds"] for r in rows[first:]) / 3600,
+        "validation": validation, "test": evaluate(encoder, flights, rows_split["test"], b0_head, steps_at),
+        "clock_validation": evaluate_clock(clock, flights, rows_split["validation"], steps_at),
+        "clock_test": evaluate_clock(clock, flights, rows_split["test"], steps_at),
+        "test_seeds": [int(flights.seeds[i]) for i in rows_split["test"]],
+        "stopped_by_hand": True, "finalized": datetime.now().isoformat(timespec="seconds"),
+    }
+    (run_dir / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+    save_trained(cfg, encoder, arch, run_dir, settings["name"])
+    result["wandb"] = finish_wandb_run(settings["name"], {
+        "best_epoch": result["best_epoch"], "test/b_rmse": result["test"]["rmse"], "stopped_by_hand": True,
+        **{f"test/b_rmse_at_{k}": v for k, v in result["test"]["rmse_at"].items()},
+        "clock_test/b_rmse": result["clock_test"]["rmse"]}, wandb_mode)
+    return result
 
 
 def git_state() -> dict:
@@ -311,12 +452,31 @@ def main(argv=None) -> None:
     parser.add_argument("--patience", type=int, default=3, help="Epochs without a better validation error before stopping")
     parser.add_argument("--b0-weight", type=float, default=1.0, help="E3: weight of the b0 head's squared error")
     parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--arch", choices=ARCHS, default="xlstm", help="A's xLSTM, or recurrent_encoders.py's GRU / ConvGRU")
+    parser.add_argument("--drop-tau", action="store_true", help="gru / convgru: the encoder ignores tau (time left)")
+    parser.add_argument("--hidden", type=int, default=ARCH_DEFAULTS["hidden"], help="gru / convgru: GRU width")
+    parser.add_argument("--layers", type=int, default=ARCH_DEFAULTS["layers"], help="gru / convgru: GRU layers")
+    parser.add_argument("--head-arch", type=int, nargs="+", default=ARCH_DEFAULTS["head_arch"], help="gru / convgru: head layers")
+    parser.add_argument("--conv-channels", type=int, default=ARCH_DEFAULTS["conv_channels"], help="convgru: filter channels")
+    parser.add_argument("--conv-window", type=int, default=ARCH_DEFAULTS["conv_window"], help="convgru: filter window (frames)")
     parser.add_argument("--log-every", type=int, default=50, help="Gradient steps between training-loss logs")
     parser.add_argument("--max-flights", type=int, default=None, help="Only the first flights of each split")
     parser.add_argument("--wandb-mode", default=None, help="online, offline or disabled (default: WANDB_MODE)")
     parser.add_argument("--smoke", action="store_true", help="48 flights per split, 2 epochs, W&B disabled")
     parser.add_argument("--resume", type=Path, default=None, help="A finished run directory to continue (see above)")
+    parser.add_argument("--finalize", type=Path, default=None, help="A run directory stopped by hand to finish (see above)")
     args = parser.parse_args(argv)
+    if args.finalize is not None:
+        import torch as th
+
+        th.set_num_threads(args.threads)
+        try:
+            result = finalize_run(args.finalize, args.wandb_mode)
+        except ValueError as error:
+            parser.error(str(error))
+        print(f"{result['name']}: finalized, best epoch {result['best_epoch']} of {result['epochs']}, test b_t rmse "
+              f"{result['test']['rmse']:.4f} (clock only {result['clock_test']['rmse']:.4f}); {result['wandb']}", flush=True)
+        return
     previous = history = None
     if args.resume is not None:
         if args.smoke:
@@ -325,12 +485,13 @@ def main(argv=None) -> None:
             parser.error(f"{args.resume} has not finished (no result.json): wait for it, or it failed")
         previous = json.loads((args.resume / "config.json").read_text())
         history = [json.loads(line) for line in open(args.resume / "metrics.jsonl")]
+        previous_values = {**{key: previous.get(key) for key in RESUMED_SETTINGS}, **arch_settings(previous)}
         for key in RESUMED_SETTINGS:
             option = key.replace("_", "-")
-            value = getattr(args, key)
-            if value is not None and value != parser.get_default(key) and str(value) != str(previous[key]):
-                parser.error(f"--{option} {value}: --resume continues with the original run's --{option} ({previous[key]})")
-            setattr(args, key, Path(previous[key]) if key == "data" else previous[key])
+            value, before = getattr(args, key), previous_values[key]
+            if value is not None and value != parser.get_default(key) and str(value) != str(before):
+                parser.error(f"--{option} {value}: --resume continues with the original run's --{option} ({before})")
+            setattr(args, key, Path(before) if key == "data" else before)
         if args.b0_weight is None:
             args.b0_weight = parser.get_default("b0_weight")
         if args.max_epochs <= len(history):
@@ -341,6 +502,16 @@ def main(argv=None) -> None:
                          f"of {len(history)}): give more patience")
     elif args.design is None or args.seed is None:
         parser.error("--design and --seed are required unless --resume")
+    sizes = ("hidden", "layers", "head_arch", "conv_channels", "conv_window")
+    if args.arch == "xlstm" and (args.drop_tau or any(getattr(args, k) not in (None, parser.get_default(k)) for k in sizes)):
+        parser.error("--drop-tau, --hidden, --layers, --head-arch and --conv-* are for --arch gru / convgru (the xLSTM is A's)")
+    if args.arch != "xlstm" and min([args.hidden, args.layers, *args.head_arch]) < 1:
+        parser.error("--hidden, --layers and --head-arch must be at least 1")
+    if args.arch == "convgru" and (args.conv_channels < 1 or args.conv_window < 2):
+        parser.error("--conv-channels must be at least 1 and --conv-window at least 2")
+    arch = arch_settings(vars(args)) if args.arch != "xlstm" else dict(XLSTM_ARCH)
+    if arch["arch"] == "gru":
+        arch.update(conv_channels=None, conv_window=None)
     if args.smoke:
         args.max_flights, args.max_epochs, args.wandb_mode, args.log_every = args.max_flights or 48, 2, "disabled", 1
         args.output_root = args.output_root.with_name(args.output_root.name + "_smoke")
@@ -362,7 +533,7 @@ def main(argv=None) -> None:
         th.set_num_interop_threads(1)     # only once per process, before any parallel work
     design = DESIGNS[args.design]
     b0_head = design["b0_head"]
-    group = f"{args.design}_{design['label']}_{args.mix}" + ("_resumed" if previous else "")
+    group = f"{args.design}{arch_tag(arch)}_{design['label']}_{args.mix}" + ("_resumed" if previous else "")
     name = f"{group}_s{args.seed}"
     run_dir = args.output_root / name
     if run_dir.exists() and any(run_dir.iterdir()):
@@ -382,7 +553,7 @@ def main(argv=None) -> None:
     clock = clock_estimate(flights, rows["train"])
 
     th.manual_seed(args.seed)
-    encoder = make_encoder(cfg, b0_head)
+    encoder = make_model(cfg, arch, b0_head)
     encoder.train()
     optimizer = th.optim.Adam(encoder.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng([args.seed, 4])
@@ -397,10 +568,12 @@ def main(argv=None) -> None:
         "split": {"rule": f"flight seed % {SPLIT_MODULUS}: {VALIDATION_REMAINDER} validation, {TEST_REMAINDER} test, rest train",
                   "flights": {k: int(len(v)) for k, v in rows.items()},
                   "steps": {k: int(flights.lengths[v].sum()) for k, v in rows.items()}},
-        "encoder": {"xlstm": OmegaConf.to_container(cfg.cppo.xlstm, resolve=True), "context_net_arch": list(cfg.cppo.context_net_arch),
-                    "activation_fn": str(cfg.cppo.activation_fn), "context_activation": cfg.cppo.context_activation,
-                    "b0_net_arch": list(cfg.cppo.velocity_head.net_arch) if b0_head else None,
-                    "parameters": int(sum(p.numel() for p in encoder.parameters()))},
+        **arch,
+        "encoder": ({"xlstm": OmegaConf.to_container(cfg.cppo.xlstm, resolve=True), "context_net_arch": list(cfg.cppo.context_net_arch),
+                     "activation_fn": str(cfg.cppo.activation_fn), "context_activation": cfg.cppo.context_activation,
+                     "b0_net_arch": list(cfg.cppo.velocity_head.net_arch) if b0_head else None}
+                    if arch["arch"] == "xlstm" else {"kwargs": encoder.kwargs})
+                   | {"parameters": int(sum(p.numel() for p in encoder.parameters()))},
         "code_sha256": {path: sha256(PROJECT_ROOT / path) for path in HASHED_CODE},
         "data_sha256": {"manifest.json": sha256(args.data / "manifest.json"),
                         **{f"{s}.npz": sha256(args.data / f"{s}.npz") for s in pilots.MIXES[args.mix]}},
@@ -408,7 +581,9 @@ def main(argv=None) -> None:
         "started": datetime.now().isoformat(timespec="seconds"),
     }
     if previous:
-        changed = [path for path in RESUME_SAME_CODE if previous["code_sha256"].get(path) != settings["code_sha256"][path]]
+        # Only the files the original run recorded (recurrent_encoders.py came later; the xLSTM doesn't use it)
+        changed = [path for path in RESUME_SAME_CODE
+                   if path in previous["code_sha256"] and previous["code_sha256"][path] != settings["code_sha256"][path]]
         if changed or previous["data_sha256"] != settings["data_sha256"]:
             run_dir.rmdir()
             parser.error(f"{args.resume} was trained with other {'code: ' + ', '.join(changed) if changed else 'data'}")
@@ -416,7 +591,7 @@ def main(argv=None) -> None:
                                     "hours": json.loads((args.resume / "result.json").read_text())["hours"],
                                     "code_sha256": previous["code_sha256"]}
     (run_dir / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
-    run = wandb.init(project=WANDB_PROJECT, name=name, group=group, tags=["step4", args.design, args.mix] + (["resumed"] if previous else []),
+    run = wandb.init(project=WANDB_PROJECT, name=name, group=group, tags=["step4", args.design, args.mix, arch["arch"]] + (["notau"] if arch["drop_tau"] else []) + (["resumed"] if previous else []),
                      config=json.loads((run_dir / "config.json").read_text()), mode=args.wandb_mode, dir=str(PROJECT_ROOT))
     print(f"{name}: {settings['split']['flights']} flights, {settings['encoder']['parameters']:,} parameters, "
           f"run directory {run_dir}", flush=True)
@@ -500,7 +675,7 @@ def main(argv=None) -> None:
         "test_seeds": [int(flights.seeds[i]) for i in rows["test"]],
     }
     (run_dir / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
-    save_policy_model(cfg, encoder, run_dir / "encoder_model.zip")
+    save_trained(cfg, encoder, arch, run_dir, name)
     run.summary.update({"best_epoch": best_epoch, "test/b_rmse": result["test"]["rmse"],
                         **{f"test/b_rmse_at_{k}": v for k, v in result["test"]["rmse_at"].items()},
                         "clock_test/b_rmse": result["clock_test"]["rmse"]})

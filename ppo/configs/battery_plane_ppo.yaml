@@ -98,7 +98,7 @@ context:
   # A frozen battery estimate appended to the observation, so plain PPO trains on [o_t, z_t] (context_wrapper.py,
   # ENCODER_PLAN.md step 2). Hidden mode only. none: plain PPO (p01-p04, step 0, step 1).
   #   ideal         the ideal estimator (step1_ideal_estimator.py): the best estimate any encoder could make
-  #   encoder       the frozen encoder of a saved Contextual_PPO model (encoder_model)
+  #   encoder       a frozen learned encoder (encoder_model): a Contextual_PPO model's xLSTM, or a standalone GRU / ConvGRU
   #   true_battery  the true battery from the env infos: reproduces observed mode, a check only
   source: none
   # ideal: also append the estimate's std (the policy then knows how sure the estimate is)
@@ -111,7 +111,8 @@ context:
   # ideal: replay only the candidates whose log weight is within this of the best one (weights above 1e-13 of the best):
   # the same estimates to about 1e-12, 6-14x faster, so that many runs fit side by side; null replays every candidate
   prune_below: 30.0
-  # encoder: a Contextual_PPO final_model.zip whose encoder is frozen and read by this run
+  # encoder: a Contextual_PPO final_model.zip / encoder_model.zip (its xLSTM encoder), or an encoder.pt of
+  # recurrent_encoders.py (train_encoder.py --arch gru | convgru, or an exported probe GRU), frozen and read by this run
   encoder_model: null
 
 evaluation:
