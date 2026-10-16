@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes running since 2026-10-15 22:18 (results below); freezing the encoder under plain PPO next.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock; results below); a patient GRU rerun, the xLSTM given the same time, then freezing the encoder under plain PPO, next.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -846,7 +846,7 @@ Per style (validation), the clock, the floor, and the best pass of E1 and E3 see
 - **The floor itself is trustworthy:** its stated uncertainty matches its errors (median 0.40–0.42 against 0.45 for a calibrated estimate), and its grid is fine enough (climb-rate mismatch 0.0016 m/s).
 - **Grid:** step 2's grid (101 × 301, with pruning) is the default. The full grid (201 × 601) gave the same estimates within 0.003 (mean 0.0002) on 160 flights, but took 12 times longer (126 s against 10 s) because its arrays spill out of the CPU caches and run at memory speed beside the training runs. The floor took 3.1 minutes with 16 processes.
 
-**Diagnostics (running since 2026-10-15 22:18): `step4_probes.py`.** These test whether the stall comes from xLSTM or from the training, on the same split and error measures:
+**Diagnostics (2026-10-15 22:18 to 2026-10-16 00:44): `step4_probes.py`.** These test whether the stall comes from xLSTM or from the training, on the same split and error measures:
 - **Test tasks, each with a label computed from the flights:**
   - `count`: thrust used so far, dt/E × Σ(a_x² + a_y²) over the executed actions. It is fully determined by the inputs, so its floor is 0. Tests counting.
   - `find`: the starting battery, on full-throttle flights, where the speed gives it away. Tests reading the battery from the speed.
@@ -859,17 +859,55 @@ Per style (validation), the clock, the floor, and the best pass of E1 and E3 see
   - Four flights of every style of dataset v2, replayed in a hidden-mode plane with the same seed and actions, match the recorded inputs and labels within 3e-8.
 - **Launch (22:18):** the GRU on all three tasks, seeds 0–2, 1 thread each at low priority (`nice`), beside the E1/E3 runs. A pass takes 8.1–8.7 minutes for `battery` and `count`.
 
-**Early probe results:**
+**GRU probe results (all 12 runs finished 2026-10-16 00:44; test flights, best checkpoint):**
 
-| Task | GRU | Clock-only | Floor |
+| Task | GRU, seeds 0 / 1 / 2 | Clock-only | Floor |
 |---|---:|---:|---:|
-| `count`, validation, after 3 passes | 0.007–0.011 | 0.083 | 0 |
-| `battery`, validation, after 3 passes | 0.127–0.129 | 0.141 | 0.084 |
-| `find` on dataset v2 (1,600 training flights), test | 0.122–0.124 | 0.122 | 0.057 |
-| `find` at 5 s / 20 s | 0.143–0.147 / 0.091–0.093 | 0.143 / 0.094 | 0.060 / 0.022 |
+| **`battery`** (the real task) | **0.101 / 0.100** / 0.127 | 0.144 | 0.085 |
+| `battery` at 1 / 5 / 20 s, seeds 0–1 | 0.143–0.146 / 0.109–0.111 / 0.088–0.090 | 0.145 / 0.147 / 0.142 | 0.136 / 0.096 / 0.072 |
+| `count` | 0.0024 / 0.0029 / 0.0022 | 0.083 | 0 |
+| `find`, 20,000 full-throttle flights | 0.063 / 0.064 / 0.062 | 0.124 | about 0.057 |
+| `find` at 5 / 20 s | 0.061–0.069 / 0.028–0.033 | 0.143 / 0.094 | about 0.060 / 0.022 |
+| `find`, dataset v2 (1,600 flights; too short) | 0.124 / 0.123 / 0.122 | 0.122 | about 0.057 |
 
-- **Counting is learnable:** after 3 passes the GRU's error is about a tenth of the clock's (the count ends at 0.21 on average, at most 0.70).
-- **On the real task, the GRU after 3 passes is where the xLSTM is after 6** (0.127–0.129 against 0.126–0.128). Too early to compare.
+The `find` floor is the ideal estimator's posterior mean of b0 on the first 200 test flights, not yet on all 2,000.
+
+**The GRU learned the real task.**
+- Seeds 0 and 1 closed **73–75%** of the gap between the clock and the floor (test errors 0.101 and 0.100). The xLSTM runs that have finished closed 26% (E1 seed 2: 0.129, E3 seed 2: 0.129).
+- **It "clicked" after a plateau.** Validation by pass:
+  - seed 0: 0.138, 0.131, 0.129, 0.134, 0.127, 0.126, 0.124, 0.127, 0.121, **0.108**, 0.104, 0.108, 0.101, …
+  - seed 1: 0.136, 0.130, 0.129, 0.130, 0.130, 0.126, 0.125, 0.125, 0.122, 0.116, 0.112, 0.106, 0.103, … 0.099
+  - It sat near the clock for 8–9 passes (about 4,500 gradient steps), then dropped to about 0.10 within 3–4 passes.
+- **Seed 2 never got there:** early stopping ended it at pass 7 (best pass 4), before the click. Three passes without improvement is too impatient for this task.
+- **Seed 1 hit the 20-pass limit with its best result on the last pass:** it was still improving.
+- A pass took about 7–8 minutes (1 thread, beside the xLSTM runs); the runs took 2.0–2.3 h.
+
+**Per style (test):** the GRU now reads the battery at the cap and keeps it, where the xLSTM does not.
+
+| Style | Clock | Floor | xLSTM (E1 s2) | GRU s0 | GRU s1 |
+|---|---:|---:|---:|---:|---:|
+| `blind_ppo` | 0.141 | 0.049 | 0.112 | 0.061 | 0.061 |
+| `cruise` | 0.172 | 0.122 | 0.147 | 0.133 | 0.136 |
+| `endurance` | 0.139 | 0.055 | 0.130 | 0.068 | 0.067 |
+| `hold_speed` | 0.126 | 0.054 | 0.111 | 0.069 | 0.063 |
+| `probe_hold` | 0.131 | 0.068 | 0.126 | 0.089 | 0.085 |
+| `random_hold` | 0.129 | 0.072 | 0.114 | 0.102 | 0.102 |
+| `replay_good` | 0.148 | 0.069 | 0.131 | 0.083 | 0.081 |
+| `shaky` | 0.133 | 0.097 | 0.128 | 0.121 | 0.120 |
+| `steady_below` | 0.173 | 0.144 | 0.147 | 0.147 | 0.149 |
+| `switching` | 0.137 | 0.067 | 0.124 | 0.091 | 0.089 |
+| `wavy` | 0.158 | 0.112 | 0.149 | 0.135 | 0.133 |
+
+- The largest gains are on the styles where the battery shows at the cap: `blind_ppo`, `endurance`, `hold_speed`, `replay_good`, `probe_hold`, `switching`. There the GRU is within 0.01–0.025 of the floor.
+- On `steady_below` (the battery never shows), everyone is at the floor.
+- The GRU is furthest from the floor on `cruise`, `wavy`, `shaky` and `random_hold`. These are flights where the information is partial and has to be combined with exact drain counting.
+
+**Both skills, alone, are learnable:**
+- **Counting:** the GRU's error is 0.002–0.003, against 0.083 for the clock (the count ends at 0.21 on average, at most 0.70). It is almost exact.
+- **Finding, given enough training:** on 20,000 full-throttle flights the GRU reached 0.062–0.064, near the floor (about 0.057), and 0.028–0.033 at 20 s (floor about 0.022). It also clicked: validation sat at 0.122–0.129 for 2–3 passes, then fell to about 0.08 in one pass.
+- **On dataset v2's 1,600 flights,** `find` never got past the clock (below).
+
+**`find` on dataset v2's 1,600 full-throttle flights (first runs):**
 - **On `find`, the GRU learned only the clock:**
   - On full-throttle flights the clock knows something: a plane still flying late probably started with more battery, since low-battery flights run out first.
   - The GRU didn't use the speed, while the ideal estimator's estimate of b0 (its posterior mean over the starting batteries, on the same 200 test flights) is within 0.022 by 20 s.
@@ -885,7 +923,21 @@ Per style (validation), the clock, the floor, and the best pass of E1 and E3 see
   - The physics settings are the same, and the style doesn't leak.
 - **Split:** 16,000 / 2,000 / 2,000, by the same rule. A pass is now about 500 gradient steps, like E1, and early stopping is decided on 2,000 validation flights.
 - **W&B:** a run on a non-default dataset adds the dataset folder to its name: group `probe_gru_find_narrow_ft20k`, runs `..._s0/1/2`.
-- **Expected to finish:** around 23:55–01:00, like the `battery` and `count` runs.
+- **Result:** 0.062–0.064 on the test flights (table above); the runs took 1.2–1.5 h, about 6.5 minutes per pass.
+
+**What the probes show:**
+- **The task is learnable by a small recurrent encoder trained offline:** the GRU got about three quarters of the way from the clock to the best possible estimate.
+- **The difficulty is a long plateau, not an impossible task.** Each encoder first learns the clock and counting. Learning to read the battery at the cap comes much later and suddenly, after about 4,500 gradient steps on the real task. With little data (`find` on 1,600 flights) or impatient early stopping (GRU seed 2, and possibly E1/E3), runs end on the plateau.
+- **Whether the xLSTM would click too is open.**
+  - Its curves so far look like the GRU's before the click: E1 seed 0 0.129, 0.129, 0.130, 0.134, 0.127, 0.126, **0.124** at pass 7, and E3 seed 0 0.123 at pass 7.
+  - But it takes about an hour per pass, so the click would come after 9–10 hours if it comes at the same number of steps.
+  - E1 seed 2 and E3 seed 2 already stopped, after 6 and 7 passes. On 2026-10-16 at 00:48, the other four were at passes 7–8.
+
+**Next for step 4:**
+1. **The GRU on `battery` with patient early stopping** (8 passes without improvement, up to 40 passes), 3 seeds, so all of them get past the click and finish improving.
+2. **Give the xLSTM the same chance:** continue its runs from `last_encoder.pt` with more patience (`train_encoder.py` needs a resume option), or test it on `find` on 20,000 flights first.
+3. **The `find` floor on all 2,000 test flights** of `ft20k`.
+4. **Freeze the best encoder under plain PPO.** For a GRU, the context wrapper needs to load one (`FrozenEncoderContext` reads a Contextual_PPO model with the xLSTM today).
 
 ```bash
 python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4      # E3: --design E3
@@ -917,7 +969,7 @@ Steps 1–5 originally listed 8 conditions × 3 seeds = 24 PPO runs: oracle, thr
    - Split by whole flights for validation. Keep some styles out entirely for the cross-pilot matrix.
    - Train until the validation loss plateaus. Reuse the enc1 training setup where it fits; its input is `pilots.load_flights` (observations, previous actions, true battery, style).
    - Save it so `FrozenEncoderContext` can load it. Done: each run saves `encoder_model.zip`, a Contextual_PPO model holding the best encoder.
-2. **Measure it before plugging it in** (section 4). The floor is measured (0.084 on validation, step 4 results above); the encoders close only 22–26% of the gap so far. The diagnostic probes (`step4_probes.py`: counting, finding, GRU / LSTM) are running. Still to do:
+2. **Measure it before plugging it in** (section 4). The floor is measured (0.084 on validation, step 4 results above); the encoders close only 22–26% of the gap so far. The diagnostic probes (`step4_probes.py`) show that a GRU learns the task, to 0.100–0.101 on the test flights (73–75% of the gap), after a long plateau; next, the GRU with patient early stopping, the same chance for the xLSTM, then freezing the better one under plain PPO. Still to do:
    - Error at 1, 5 and 20 s and over the whole flight, for each style.
    - Compare against the clock-only estimate and the ideal estimator (`step1_ideal_estimator.py`) on the same flights.
    - Run the leak test: test the `main_plus_aware` encoder on battery-blind pilots.
