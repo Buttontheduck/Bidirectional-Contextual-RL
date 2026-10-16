@@ -352,6 +352,35 @@ class Step4Checks(unittest.TestCase):
         for name, value in source.encoder.state_dict().items():
             torch.testing.assert_close(value, before[name])
 
+    def test_plain_ppo_script_trains_and_validates_with_a_standalone_encoder(self):
+        from stable_baselines3 import PPO
+
+        from checks.step0_checks import plain_ppo_config, plain_ppo_script
+        from checks.step2_checks import PLAIN_SMALL
+        import main_battery_plane_contextual_ppo as training
+
+        script = plain_ppo_script()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "encoder.pt"
+            R.save_encoder(self.small_encoder("convgru", True, aux=False), path)
+            cfg = plain_ppo_config("+experiment=S0a_blind_bs256", *PLAIN_SMALL, "context.source=encoder",
+                                   f"context.encoder_model={path}", "evaluation.reset_grid.eval_initial_battery=[0.3]")
+            script.validate_ppo(cfg)
+            env = script.make_train_env(cfg)
+            self.assertIsInstance(env, ContextVecEnv)
+            self.assertIsInstance(env.source, StandaloneEncoderContext)
+            self.assertEqual(env.observation_space.shape, (5,))                # hidden observation + the estimate
+            model = PPO("MlpPolicy", env, n_steps=8, batch_size=8, device="cpu", policy_kwargs={"net_arch": [16]})
+            model.learn(total_timesteps=32)
+            result = training.evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)
+            self.assertEqual(len(result["episode_rewards"]), 3)
+            # Another kind of file is refused
+            other = Path(folder) / "encoder.txt"
+            other.write_text("not an encoder")
+            with self.assertRaisesRegex(ValueError, "encoder_model must be"):
+                script.validate_ppo(plain_ppo_config("+experiment=S0a_blind_bs256", *PLAIN_SMALL, "context.source=encoder",
+                                                     f"context.encoder_model={other}"))
+
     @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
     def test_probe_gru_exports_exactly_and_new_architectures_train_resume_and_finalize(self):
         with tempfile.TemporaryDirectory() as folder:
