@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock), the xLSTM given the same time (it learns it too) and the 2 × 2 test of a ConvGRU front-end and dropping `tau` (2026-10-17: neither helps; the plain GRU reaches 0.097), and plain PPO with the frozen GRU (2026-10-17: 209 at batch 256, against 23 without memory, 246 with the true battery and 283 with the ideal estimate), and the closed-loop check (2026-10-17: on PPO's own flights the GRU overestimates the battery after probing, which caused the one collapse; results below), and joint training without pilots or freezing (J0-J5: Contextual PPO with a GRU encoder, 30 runs launched 2026-10-17 14:03 local time; design below).
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock), the xLSTM given the same time (it learns it too) and the 2 × 2 test of a ConvGRU front-end and dropping `tau` (2026-10-17: neither helps; the plain GRU reaches 0.097), and plain PPO with the frozen GRU (2026-10-17: 209 at batch 256, against 23 without memory, 246 with the true battery and 283 with the ideal estimate), and the closed-loop check (2026-10-17: on PPO's own flights the GRU overestimates the battery after probing, which caused the one collapse; results below), and joint training without pilots or freezing (J0-J5: Contextual PPO with a GRU encoder, 30 runs, 2026-10-17: the best rung, J1 with 16 times more encoder training, scores 114, no better than without memory; results below).
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -1288,6 +1288,45 @@ python run_step0.py --conditions J0 J1 J2 J3 J4 J5 --seeds 0 1 2 3 4 --jobs 30 -
 python -m unittest checks.joint_checks -v
 ```
 
+**Results (launched 2026-10-17 12:03 UTC, all 30 runs done by 22:47 UTC).**
+- **Run times:** J0 took 2.7–2.8 h; J1–J4 9.5–9.7 h; J5 10.1–10.2 h, with the 30 runs side by side, 1 thread each.
+- **Reports:** `runs_step0/joint_v2/step0_report_joint_J0.json` … `_J5.json`.
+- **Scoring:** the late score is the mean validation return over 1.5M–2M steps, 5 seeds (0–4). The final validation is of the final checkpoint. W&B groups are `cppo_J<k>_…_gamma0.99_rs0.1_v2`.
+
+| Rung | Late score (median) | Seeds 0–4 | Final | Completed | Battery empty | Encoder on its own flights at the end (validation R², RMSE) |
+|---|---:|---|---:|---:|---:|---|
+| J0: A's budget, GRU | 45 ± 37 (55) | 102, 2, 55, 8, 55 | 40 | 14% | 86% | 0.84, 0.060 |
+| **J1: 16× encoder training, all episodes kept** | **114 ± 38 (98)** | 139, 88, 70, 98, 174 | 121 | 23% | 77% | 0.84, 0.060 |
+| J2: J1 + entropy bonus | 63 ± 26 (51) | 65, 51, 39, 112, 49 | 69 | 9% | 91% | 0.82, 0.062 |
+| J3: J2 + Gaussian head | 70 ± 50 (81) | 142, 48, −8, 81, 88 | 71 | 31% | 68% | 0.82, 0.063 |
+| J4: J3 + curiosity | 83 ± 49 (72) | 72, 62, 18, 97, 166 | 61 | 27% | 73% | 0.79, 0.068 |
+| J5: J1 + warm-up | 94 ± 55 (100) | 4, 100, 66, 155, 145 | 103 | 26% | 74% | 0.70, 0.083 |
+
+**For comparison** (late score, same settings):
+
+| Reference | Score |
+|---|---:|
+| A rerun (xLSTM, 3 seeds) | 22 |
+| Memoryless Contextual PPO | 115 |
+| Contextual PPO with the true battery | 282 |
+| Plain PPO with the frozen GRU, batch 256 | 209 |
+| Plain PPO with the ideal estimate | 283 / 323 |
+
+**What it shows:**
+- **Joint training still doesn't work.** No rung beats Contextual PPO without memory (115), and all stay far below the frozen GRU trained on pilot flights (209) and the true battery (282). The planes still run out of battery on 68–91% of the validation flights.
+- **More encoder training is the only change that helps:** J0 → J1, 45 → 114. Even so, it only reaches the memoryless level.
+- **The GRU alone changes little:** J0 at 45 against A at 22, with a large spread (2–102).
+- **The extras don't add anything on top of J1:**
+  - The entropy bonus makes it worse (63).
+  - The Gaussian head (70) and the curiosity bonus (83) don't recover J1's level, though they complete a few more flights (27–31%).
+  - The warm-up (94) has a wide spread (4–155), and its encoder fits its own flights worst (R² 0.70).
+- **The encoder again fits mostly a clock:** on its own policy's flights it reaches validation R² 0.79–0.84 (RMSE about 0.06). That is like experiment A, whose encoder looked accurate on its own flights while it had learned "battery falls a fixed amount per step".
+- **The loop holds:** the policy flies fast and narrowly, so the flights stay narrow, so the clock stays good enough for the encoder, so the policy has no reason to use it. More encoder training, exploration, an uncertainty input, curiosity and a warm-up on random flights didn't break it within 2M steps.
+- **What did break it:** training the encoder first on varied flights from many pilots, then freezing it (step 4: 209).
+- **Possible next steps for joint training:**
+  - Start Contextual PPO from the pretrained GRU (frozen at first, then trained online), testing whether online training keeps or loses what the pilots taught.
+  - Mix pilot flights into the joint encoder's training data.
+
 ## Next steps
 
 **Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).
@@ -1304,8 +1343,9 @@ python -m unittest checks.joint_checks -v
 3. **Freeze it under plain PPO**, with `context.source=encoder` and `context.encoder_model=...`. Use 8 seeds at step 0's settings (gamma 0.99, reward scale 0.1).
    - Compare against the ideal estimate (283 / 323), the true battery (246 / 258) and memoryless PPO (23 / 77).
    - Then the closed-loop check: the encoder's error on the PPO policy's own flights.
-   - Done 2026-10-17 with the best GRU encoders (step 4 above): 209 ± 36 at batch 256 (88% of flights completed), against 23 without memory, 246 with the true battery and 283 with the ideal estimate. Batch 1024 is unstable with the GRU (one seed collapsed), and the encoder seed matters. The closed-loop check (done): on PPO's own flights the GRU overestimates the battery after probing (+0.03 to +0.06), which caused the collapse. Next: encoder training on these PPO policies' flights, and the ideal estimator as a teacher. If the shortfall turns out to come from early-flight error, the easy environment is plan B.
-4. **Optional:**
+   - Done 2026-10-17 with the best GRU encoders (step 4 above): 209 ± 36 at batch 256 (88% of flights completed), against 23 without memory, 246 with the true battery and 283 with the ideal estimate. Batch 1024 is unstable with the GRU (one seed collapsed), and the encoder seed matters. The closed-loop check (done): on PPO's own flights the GRU overestimates the battery after probing (+0.03 to +0.06), which caused the collapse. Next: encoder training on these PPO policies' flights, and the ideal estimator as a teacher.
+4. **Joint training (J0–J5, done 2026-10-17):** Contextual PPO with a GRU encoder trained together with the policy. The best rung, J1, scores 114, about the memoryless level, against 209 for the frozen GRU. Only more encoder training helped. Next options: start Contextual PPO from the pretrained GRU, or mix pilot flights into its encoder data. If the shortfall turns out to come from early-flight error, the easy environment is plan B.
+5. **Optional:**
    - Train on the ideal estimator as a teacher (section 3).
    - Freeze A's own encoder under plain PPO (step 2's next steps).
    - Add earlier PPO checkpoints (0.5M / 1M / 1.5M steps) or more seeds as pilots, if the encoder's error is limited by data.
