@@ -102,6 +102,7 @@ cppo:
     validation_fraction: 0.1               # share of episodes kept for validation, never trained on
     seed: null                             # null = training.seed
     nll_beta: 0.0                          # Gaussian head only: beta of the beta-NLL (0 = plain NLL)
+    warmup_gradient_steps: null            # encoder steps per update during the warm-up (null = gradient_steps)
 
   # Context head: embedding -> 128 -> 128 -> 1 -> sigmoid, z_t = b_hat_t in (0, 1).
   context_dim: 1
@@ -118,6 +119,24 @@ cppo:
     enabled: false
     weight: 0.1                            # lambda in [0, 1]
     net_arch: [128, 128]
+
+  # Joint-training options (ENCODER_PLAN.md, config/joint/), off for A-F.
+  # Warm-up: until this many collected steps the PPO epochs are skipped, so the policy keeps its initial, varied
+  # behaviour while the encoder trains on its flights (supervised.warmup_gradient_steps steps per update).
+  policy_warmup_steps: 0
+  # Curiosity about the battery (Gaussian head only): a training-reward bonus of weight x the drop in the head's
+  # entropy, 0.5 log(sigma2), from each observation to the next; the weight falls linearly to 0 at `until` steps.
+  curiosity:
+    weight: 0.0
+    until: null
+
+  # Encoder architecture: xlstm (the block stack below; every A-F experiment) or gru (the joint-training runs of
+  # ENCODER_PLAN.md, config/joint/): a linear projection to gru.hidden_dim, gru.num_layers GRU layers, then the same
+  # context head. The other architecture's settings are ignored.
+  encoder_arch: xlstm
+  gru:
+    hidden_dim: 128
+    num_layers: 2
 
   # xLSTM block stack, width 128: an mLSTM block (matrix memory), then an sLSTM block (scalar memory).
   # Every block keeps its memory across the episode and is reset at episode starts.

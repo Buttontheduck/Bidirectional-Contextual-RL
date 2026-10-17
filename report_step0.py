@@ -11,6 +11,8 @@ env.battery_noise_until (500k), then the true battery; scored like step 0, the f
 1a_sharp ... 1c_linear see the noise early in every flight and the exact battery from flight step 350 (in-flight noise).
 2a_ideal, 2b_ideal (and _std) are step 2's ideal context: plain PPO in hidden mode with the ideal estimator's battery
 estimate (and its std) appended to the observation; each variant in a report of its own.
+J0-J5 are the joint-training rungs (config/joint/): Contextual_PPO with a GRU encoder (cppo.encoder_arch=gru) trained
+together with the policy at the A rerun's settings, each in a report of its own.
 4a_encoder, 4b_encoder are step 4's frozen encoders: plain PPO in hidden mode (0a / 0b's learner) with a learned
 encoder's battery estimate appended to the observation (context.encoder_model); each encoder in a report of its own.
 0a_blind, 0b_blind, 0c_blind are the memoryless controls: 0a, 0b, 0c in hidden mode, without the battery and without
@@ -39,12 +41,14 @@ import torch
 
 from context_wrapper import context_protocol
 import main_battery_plane_contextual_ppo as training
-from contextual_ppo.torch_layers import XLSTMRolloutEncoder
+from contextual_ppo.torch_layers import GRURolloutEncoder, XLSTMRolloutEncoder
 
 
 CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch", "1a_early", "1b_early", "1c_early",
               "1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear", "0a_blind", "0b_blind", "0c_blind",
-              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std", "4a_encoder", "4b_encoder")
+              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std", "4a_encoder", "4b_encoder", "J0", "J1", "J2", "J3", "J4", "J5")
+# Joint training with a GRU encoder: hidden mode, Contextual_PPO's learned encoder, like A but with the GRU
+JOINT = ("J0", "J1", "J2", "J3", "J4", "J5")
 # Memoryless controls: the step 0 run each condition repeats in hidden mode, without the battery and without memory
 BLIND = {"0a_blind": "0a", "0b_blind": "0b", "0c_blind": "0c"}
 # Step 2's ideal context: the step 0 learner each condition uses in hidden mode, with the ideal estimator's estimate
@@ -92,6 +96,8 @@ def run_kind(condition: str) -> str:
         return IDEAL_CONTEXT[condition][0]
     if condition in ENCODER_CONTEXT:
         return ENCODER_CONTEXT[condition]
+    if condition in JOINT:
+        return "J"
     return (NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition)
             or BLIND.get(condition) or condition)
 
@@ -134,7 +140,8 @@ def evaluation_protocol(cfg, condition: str) -> dict:
         raise ValueError(f"{condition} " + ("must continue a saved step 0 model (training.init_model)" if schedule == "switch"
                                             else "must start from scratch (no training.init_model)"))
     # A, the memoryless controls and the ideal context see no battery
-    mode = "hidden" if kind == "A" or condition in BLIND or condition in IDEAL_CONTEXT or condition in ENCODER_CONTEXT else "observed"
+    mode = ("hidden" if kind in ("A", "J") or condition in BLIND or condition in IDEAL_CONTEXT or condition in ENCODER_CONTEXT
+            else "observed")
     if cfg.env.observation_mode != mode:
         raise ValueError(f"Step 0 requires env.observation_mode={mode} for {condition}")
     if not cfg.evaluation.deterministic or int(cfg.evaluation.frequency) != EVAL_FREQUENCY:
@@ -155,15 +162,23 @@ def evaluation_protocol(cfg, condition: str) -> dict:
             raise ValueError(f"{condition} requires four whole-stream minibatches")
     elif kind == "A":
         c = cfg.get("cppo")
-        if (c is None or c.get("context_source", "encoder") != "encoder" or c.encoder_objective != "supervised"
-                or c.context_head != "point" or c.velocity_head.enabled or int(c.n_minibatches) != 4):
-            raise ValueError("A requires CPPO with experiment A's learned point encoder and four whole-stream minibatches")
+        if (c is None or c.get("context_source", "encoder") != "encoder" or c.get("encoder_arch", "xlstm") != "xlstm"
+                or c.encoder_objective != "supervised" or c.context_head != "point" or c.velocity_head.enabled
+                or int(c.n_minibatches) != 4):
+            raise ValueError("A requires CPPO with experiment A's learned point encoder (the xLSTM) and four whole-stream minibatches")
+        training.validate_config(cfg)
+    elif kind == "J":
+        c = cfg.get("cppo")
+        if (c is None or c.get("context_source", "encoder") != "encoder" or c.get("encoder_arch") != "gru"
+                or c.encoder_objective != "supervised" or int(c.n_minibatches) != 4):
+            raise ValueError(f"{condition} requires CPPO with a supervised GRU encoder (cppo.encoder_arch=gru) and four "
+                             "whole-stream minibatches")
         training.validate_config(cfg)
     elif "cppo" in cfg or "ppo" not in cfg:
         raise ValueError(f"{condition} requires plain PPO")
     elif int(cfg.ppo.batch_size) != (256 if kind == "0a" else 1024):
         raise ValueError(f"Unexpected plain-PPO batch size for {condition}")
-    learner = cfg.cppo if kind in ("0c", "A") else cfg.ppo
+    learner = cfg.cppo if kind in ("0c", "A", "J") else cfg.ppo
     if int(learner.n_steps) != 512 or int(learner.n_epochs) != 10:
         raise ValueError("Step 0 requires 512 steps per environment and ten training epochs")
     env = training.bp.BatteryPlaneEnv(observation_mode=mode, **training.env_kwargs_from(cfg))
@@ -282,6 +297,9 @@ def main() -> None:
         elif kind == "A":
             if model.n_minibatches != 4 or not isinstance(model.policy.encoder, XLSTMRolloutEncoder):
                 raise ValueError(f"A checkpoint must use the learned xLSTM encoder and four minibatches: {directory}")
+        elif kind == "J":
+            if model.n_minibatches != 4 or not isinstance(model.policy.encoder, GRURolloutEncoder):
+                raise ValueError(f"{condition} checkpoint must use the learned GRU encoder and four minibatches: {directory}")
         elif model.batch_size != int(cfg.ppo.batch_size):
             raise ValueError(f"Checkpoint batch size does not match the supplied config: {directory}")
         validation = training.evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)

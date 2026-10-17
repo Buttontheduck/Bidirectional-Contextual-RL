@@ -1,0 +1,26 @@
+# @package _global_
+# ENCODER_PLAN.md, joint training: Contextual_PPO with its encoder trained together with the policy (no pilots, no frozen
+# encoder), with a GRU instead of the xLSTM (cppo.encoder_arch=gru), at the A rerun's settings (config/rerun/: hidden
+# mode, discount 0.99, reward scale 0.1, 2M steps). The rungs J0-J5 add one change each (see ENCODER_PLAN.md).
+#
+#   python run_step0.py --conditions J0 J1 J2 J3 --seeds 0 1 2 3 4 --jobs 20 --threads 1
+# J5: J1 + a warm-up on the agent's own flights: for the first 200,000 steps (10% of the run) the PPO epochs are
+# skipped, so the untrained policy keeps flying in varied ways, and the encoder trains on those flights with 128 steps per update.
+experiment_id: J5_gru_budget_warmup
+training:
+  total_timesteps: 2000000
+cppo:
+  gamma: 0.99
+  reward_scale: 0.1
+  encoder_arch: gru
+  policy_warmup_steps: 200000
+  supervised:
+    gradient_steps: 32
+    episode_batch_size: 32
+    capacity: 2100000
+    warmup_gradient_steps: 128
+wandb:
+  study: ""
+  run_name: J5_gru_budget_warmup_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: J5_gru_budget_warmup_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, joint, gru, J5]

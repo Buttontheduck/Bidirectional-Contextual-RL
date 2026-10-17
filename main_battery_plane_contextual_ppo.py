@@ -54,7 +54,7 @@ import contextual_ppo  # noqa: E402
 from battery_plane import iter_eval_resets  # noqa: E402
 from contextual_ppo import ContextualPPO  # noqa: E402
 from contextual_ppo.policies import CONTEXT_VARIANCE_INPUTS  # noqa: E402
-from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS  # noqa: E402
+from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS, ENCODER_ARCHS  # noqa: E402
 from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights, terminal_outcome,
 )
@@ -69,6 +69,13 @@ ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 CONTEXT_SOURCES = ("encoder", "oracle", "none")
 # Policy of each context source; None: cppo.policy with the xLSTM encoder
 CONTEXT_POLICIES = {"encoder": None, "oracle": TrueBatteryPolicy, "none": NoContextPolicy}
+
+
+def encoder_arch_from(cfg: DictConfig) -> tuple[str, int, int]:
+    """The encoder's architecture and the GRU's width and layers; saved configs from before cppo.encoder_arch used the
+    xLSTM."""
+    gru = cfg.cppo.get("gru") or {}
+    return str(cfg.cppo.get("encoder_arch", "xlstm")), int(gru.get("hidden_dim", 128)), int(gru.get("num_layers", 2))
 
 
 def context_source_from(cfg: DictConfig) -> str:
@@ -431,6 +438,35 @@ def validate_config(cfg: DictConfig) -> None:
             "cppo.context_head=gaussian learns the variance from the likelihood of b_t: it needs "
             "cppo.encoder_objective=supervised"
         )
+    arch = cppo.get("encoder_arch", "xlstm")
+    if arch not in ENCODER_ARCHS:
+        raise ValueError(f"cppo.encoder_arch must be one of {ENCODER_ARCHS}")
+    if arch == "gru":
+        for key in ("hidden_dim", "num_layers"):
+            value = cppo.gru.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"cppo.gru.{key} must be an integer >= 1")
+        if context_source != "encoder":
+            raise ValueError("cppo.encoder_arch=gru is a learned encoder: it needs cppo.context_source=encoder")
+    total = int(cfg.training.total_timesteps)
+    warmup = cppo.get("policy_warmup_steps", 0)
+    if isinstance(warmup, bool) or not isinstance(warmup, int) or not 0 <= warmup < total:
+        raise ValueError("cppo.policy_warmup_steps must be an integer in [0, training.total_timesteps)")
+    if warmup > 0 and cppo.encoder_objective != "supervised":
+        raise ValueError("cppo.policy_warmup_steps trains only the encoder at first: it needs cppo.encoder_objective=supervised")
+    warmup_steps = cppo.supervised.get("warmup_gradient_steps")
+    if warmup_steps is not None and (isinstance(warmup_steps, bool) or not isinstance(warmup_steps, int) or warmup_steps < 1):
+        raise ValueError("cppo.supervised.warmup_gradient_steps must be null or an integer >= 1")
+    curiosity = cppo.get("curiosity") or {}
+    weight = curiosity.get("weight", 0.0)
+    until = curiosity.get("until")
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight < 0:
+        raise ValueError("cppo.curiosity.weight must be a number >= 0")
+    if until is not None and (isinstance(until, bool) or not isinstance(until, int) or not 0 < until <= total):
+        raise ValueError("cppo.curiosity.until must be null or a step inside the training budget")
+    if weight > 0 and (cppo.context_head != "gaussian" or cppo.encoder_objective != "supervised" or context_source != "encoder"):
+        raise ValueError("cppo.curiosity rewards the drop in the Gaussian head's entropy: it needs cppo.context_head=gaussian, "
+                         "a learned encoder and cppo.encoder_objective=supervised")
 
 
 def check_episode_alignment(cfg: DictConfig, episode_length: int) -> None:
@@ -476,6 +512,11 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
         supervised_gradient_steps=int(cppo.supervised.gradient_steps),
         validation_fraction=float(cppo.supervised.validation_fraction),
         episode_buffer_seed=None if cppo.supervised.seed is None else int(cppo.supervised.seed),
+        # Joint-training options; saved configs from before them have neither
+        policy_warmup_steps=int(cppo.get("policy_warmup_steps", 0)),
+        supervised_warmup_gradient_steps=cppo.supervised.get("warmup_gradient_steps"),
+        curiosity_weight=float((cppo.get("curiosity") or {}).get("weight", 0.0)),
+        curiosity_until=(cppo.get("curiosity") or {}).get("until"),
         bptt_len=None if cppo.bptt_len is None else int(cppo.bptt_len),
         reset_envs_each_rollout=bool(cppo.reset_envs_each_rollout),
         context_info_keys=None if keys is None else list(OmegaConf.to_container(keys, resolve=True)),
@@ -494,6 +535,7 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
             "auxiliary_dim": 1 if velocity.enabled else None,
             "auxiliary_net_arch": list(velocity.net_arch) if velocity.enabled else None,
             "xlstm_config": OmegaConf.to_container(cppo.xlstm, resolve=True),
+            **dict(zip(("encoder_arch", "gru_hidden_dim", "gru_num_layers"), encoder_arch_from(cfg))),
         },
         seed=int(cfg.training.seed),
         device=cfg.training.device,

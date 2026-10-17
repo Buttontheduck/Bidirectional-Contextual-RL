@@ -194,6 +194,10 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         supervised_gradient_steps: int = 8,
         validation_fraction: float = 0.1,
         episode_buffer_seed: int | None = None,
+        policy_warmup_steps: int = 0,
+        supervised_warmup_gradient_steps: int | None = None,
+        curiosity_weight: float = 0.0,
+        curiosity_until: int | None = None,
         bptt_len: int | None = None,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
@@ -264,6 +268,21 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         for name, value in (("encoder_max_grad_norm", encoder_max_grad_norm), ("target_kl", target_kl)):
             if value is not None and not (math.isfinite(value) and value > 0):
                 raise ValueError(f"{name} must be None or positive, got {value!r}")
+        if isinstance(policy_warmup_steps, bool) or not isinstance(policy_warmup_steps, int) or policy_warmup_steps < 0:
+            raise ValueError(f"policy_warmup_steps must be an integer >= 0, got {policy_warmup_steps!r}")
+        if policy_warmup_steps > 0 and encoder_objective != "supervised":
+            raise ValueError("policy_warmup_steps trains only the encoder at first: it needs encoder_objective='supervised'")
+        if supervised_warmup_gradient_steps is not None and (
+                isinstance(supervised_warmup_gradient_steps, bool) or not isinstance(supervised_warmup_gradient_steps, int)
+                or supervised_warmup_gradient_steps < 1):
+            raise ValueError(f"supervised_warmup_gradient_steps must be None or an integer >= 1, got {supervised_warmup_gradient_steps!r}")
+        if isinstance(curiosity_weight, bool) or not isinstance(curiosity_weight, (int, float)) or not (
+                math.isfinite(curiosity_weight) and curiosity_weight >= 0):
+            raise ValueError(f"curiosity_weight must be finite and >= 0, got {curiosity_weight!r}")
+        if curiosity_until is not None and (isinstance(curiosity_until, bool) or not isinstance(curiosity_until, int) or curiosity_until < 1):
+            raise ValueError(f"curiosity_until must be None or an integer >= 1, got {curiosity_until!r}")
+        if curiosity_weight > 0 and encoder_objective != "supervised":
+            raise ValueError("curiosity_weight rewards the drop in the Gaussian head's variance: it needs encoder_objective='supervised'")
 
         if self.env is not None:
             # Each minibatch holds complete streams
@@ -294,6 +313,14 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         self.supervised_gradient_steps = supervised_gradient_steps
         self.validation_fraction = validation_fraction
         self.episode_buffer_seed = episode_buffer_seed
+        # Warm-up: until this many collected steps the PPO epochs are skipped (the policy keeps its initial, varied
+        # behaviour) and the encoder trains on its flights, with supervised_warmup_gradient_steps steps per update
+        self.policy_warmup_steps = policy_warmup_steps
+        self.supervised_warmup_gradient_steps = supervised_warmup_gradient_steps
+        # Curiosity about the context: a training-reward bonus of weight * (drop in the Gaussian head's entropy), the
+        # weight falling linearly to 0 at curiosity_until collected steps (never, with None); see collect_rollouts
+        self.curiosity_weight = float(curiosity_weight)
+        self.curiosity_until = curiosity_until
         self.bptt_len = bptt_len
         self.target_kl = target_kl
 
@@ -364,6 +391,17 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         clip_range_vf = None
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
+
+        if self.num_timesteps <= getattr(self, "policy_warmup_steps", 0):
+            # Warm-up: the actor and critic don't change; only the encoder trains, on the initial policy's flights
+            steps = self.supervised_warmup_gradient_steps or self.supervised_gradient_steps
+            for key, value in self._train_encoder_supervised(gradient_steps=steps).items():
+                self.logger.record(f"train/{key}", value)
+            self.logger.record("train/policy_warmup", 1)
+            self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+            self.logger.record("time/train_seconds", time.perf_counter() - start_time)
+            return
+        self.logger.record("train/policy_warmup", 0)
 
         groups = self.policy.parameter_groups()
         entropy_losses, pg_losses, value_losses, clip_fractions, losses = [], [], [], [], []
@@ -558,9 +596,9 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
             "n_transitions": n_transitions,
         }
 
-    def _train_encoder_supervised(self) -> dict[str, float]:
+    def _train_encoder_supervised(self, gradient_steps: int | None = None) -> dict[str, float]:
         """
-        ``supervised_gradient_steps`` encoder steps on complete training episodes of the episode buffer, then the
+        ``supervised_gradient_steps`` (or ``gradient_steps``) encoder steps on complete training episodes of the episode buffer, then the
         fit on one batch of validation episodes. Every episode starts from the encoder's initial state and its
         states are recomputed with the current weights. Only the encoder changes.
 
@@ -577,7 +615,7 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         }
         if buffer.n_episodes("train") > 0:
             fits, grad_norms = [], []
-            for _ in range(self.supervised_gradient_steps):
+            for _ in range(gradient_steps or self.supervised_gradient_steps):
                 loss, fit = self._episode_fit(buffer.sample("train"))
                 grads = th.autograd.grad(loss, encoder_params, allow_unused=True)
                 grad_norms.append(self._grad_norm(grads))

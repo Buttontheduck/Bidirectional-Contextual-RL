@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock), the xLSTM given the same time (it learns it too) and the 2 × 2 test of a ConvGRU front-end and dropping `tau` (2026-10-17: neither helps; the plain GRU reaches 0.097), and plain PPO with the frozen GRU (2026-10-17: 209 at batch 256, against 23 without memory, 246 with the true battery and 283 with the ideal estimate), and the closed-loop check (2026-10-17: on PPO's own flights the GRU overestimates the battery after probing, which caused the one collapse; results below); encoder training on PPO-style flights next.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock), the xLSTM given the same time (it learns it too) and the 2 × 2 test of a ConvGRU front-end and dropping `tau` (2026-10-17: neither helps; the plain GRU reaches 0.097), and plain PPO with the frozen GRU (2026-10-17: 209 at batch 256, against 23 without memory, 246 with the true battery and 283 with the ideal estimate), and the closed-loop check (2026-10-17: on PPO's own flights the GRU overestimates the battery after probing, which caused the one collapse; results below), and joint training without pilots or freezing (J0-J5: Contextual PPO with a GRU encoder, 30 runs launched 2026-10-17 14:03 local time; design below).
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -1228,6 +1228,65 @@ python -m unittest checks.step4_checks -v
 Steps 1–5 originally listed 8 conditions × 3 seeds = 24 PPO runs: oracle, three noisy oracles, clock-only, and three frozen encoders (one per mix).
 - **Done:** the oracle (step 0's 0a, 0b and 0c, 8 seeds) and the noisy oracles (step 1, plus its switch, early-noise and in-flight variants). The ideal-estimate runs (step 2) were added; they compared against the 0a / 0b runs from an earlier launch with the same code path, and the swap check backs that comparison.
 - **Still open:** the frozen encoders, and the clock-only control. The clock-only control is less urgent now: the memoryless controls and A's clock-like encoder already sit at the bottom of the range.
+
+### Joint training: Contextual PPO with a GRU encoder, no pilots, no frozen encoder (launched 2026-10-17)
+
+**Question.** Experiment A trained its encoder together with the policy and failed (22). The offline encoders and the frozen-GRU test say a learned encoder can work. What does joint training need to work too?
+
+**Diagnosis of why A failed (the loop):**
+1. **The encoder trained far too little:** about 1,950 supervised steps of 16 episodes over a 1M-step run, against about 4,300–5,200 steps of 32 flights before the offline encoders left their plateau.
+2. **Its data was narrow:** only the current policy's flights. The episode buffer (200,000 steps) drops the oldest episodes, so the varied early flights were soon gone.
+3. **The policy stopped exploring** (`ent_coef` 0).
+4. **The two locked each other in:** the clock-like estimate taught the policy to ignore it, so it flew the same narrow way, so the clock stayed "good enough".
+
+**The ladder.** Each rung adds one change, at the A rerun's settings: hidden mode, gamma 0.99, reward scale 0.1, 2M steps, 5 seeds (0–4). Configs are in `config/joint/`; launcher conditions are `J0`–`J5`.
+
+| Rung | Change | Question |
+|---|---|---|
+| J0 | A's encoder budget (8 supervised steps of 16 episodes per update, newest 200,000 steps kept), with a GRU | does the GRU alone change anything? |
+| J1 | 32 steps of 32 episodes per update (about 15,600 in all, about 3× the offline plateau), every finished episode kept | was the training budget the problem? |
+| J2 | J1 + entropy bonus 0.01 | does keeping exploration help? |
+| J3 | J2 + Gaussian head (beta-NLL, beta 0.5); the policy reads the mean and log variance | does the belief let the policy learn when to probe? |
+| J4 | J3 + curiosity about the battery: a training-reward bonus of 1.0 × the drop in the head's entropy from each observation to the next, falling linearly to 0 at 1M steps | does curiosity add anything? |
+| J5 | J1 + a warm-up: no PPO update for the first 200,000 steps, so the untrained policy keeps flying in varied ways while the encoder trains on those flights (128 steps per update) | does a self-made warm-up help? |
+
+**Compare with:**
+
+| Reference | Score |
+|---|---:|
+| A rerun (xLSTM) | 22 |
+| Memoryless Contextual PPO | 115 |
+| Contextual PPO with the true battery | 282 |
+| Plain PPO with the frozen GRU (batch 256) | 209 |
+| Plain PPO with the ideal estimate | 283 / 323 |
+
+**Code (only the new options; the xLSTM default, A–F and step 0–2 are unchanged):**
+- `contextual_ppo/torch_layers.py`: `GRURolloutEncoder`, with the xLSTM encoder's interface (`step`, `unroll` over episodes or rollout streams with episode starts, the auxiliary head, point and Gaussian heads).
+- `cppo.encoder_arch: xlstm | gru` and `cppo.gru` (128 wide, 2 layers) in the policy (saved with the model) and in the main script.
+- The rollout buffer knows both architectures' state layout.
+- `ContextualPPO(policy_warmup_steps, supervised_warmup_gradient_steps, curiosity_weight, curiosity_until)`, set by `cppo.policy_warmup_steps`, `cppo.supervised.warmup_gradient_steps` and `cppo.curiosity`, all off by default:
+  - **The warm-up** skips the PPO epochs and trains only the encoder.
+  - **The curiosity bonus** goes into the rollout buffer's intrinsic rewards. Stored rewards, episode returns and evaluation stay the environment's.
+- `run_step0.py` / `report_step0.py`: conditions `J0`–`J5`, each in a report of its own, checked to be a supervised GRU encoder. The report's check for A now also refuses a non-xLSTM encoder.
+
+**Checks (`checks.joint_checks`; 89 in the project pass):**
+- **The GRU's paths agree within 1e-5:** a whole sequence, one step at a time, episodes padded at the end (each row's final state included), and episode starts inside a stream.
+- **Re-encoding a rollout during the PPO update reproduces collection exactly:** values, log-probabilities and contexts, for the point (J1) and Gaussian (J3) heads, over several rollouts with episodes ending inside the streams.
+- The model trains, saves and reloads with the GRU; old saved models keep the xLSTM.
+- **Each rung differs from its parent by its one change only.**
+- **The curiosity bonus is exactly weight × entropy drop,** in the intrinsic rewards only, reaching the advantages.
+- **The warm-up leaves the actor and critic untouched** while the encoder trains, and PPO starts afterwards.
+- **Seeds:** the 30 runs use training environment seeds 0–407, never the validation (1000–1002) or final-test (2000–2002) seeds. W&B names are distinct, ending in `_v2`, e.g. `cppo_J1_gru_budget_gamma0.99_rs0.1_v2_s0`.
+
+**A performance bug found and fixed before the real launch:**
+- A first launch at 13:34 used PyTorch's packed sequences for the padded episode batches. Their backward pass is very slow on CPU: 90 s per supervised step under load, against 3.7 s unpacked. J1 would have needed days.
+- Since the padding is at the end and the GRU is causal, one unpacked call gives the same outputs on every real step. The state after each row's last real step comes from a cheap packed pass without gradient. Now 0.51 s per step on an idle machine.
+- **The 20 runs of the first launch were stopped at about 10,000–30,000 steps.** Their W&B runs (names without `_v2`) are leftovers that can be deleted.
+
+```bash
+python run_step0.py --conditions J0 J1 J2 J3 J4 J5 --seeds 0 1 2 3 4 --jobs 30 --threads 1 --study v2 --output runs_step0/joint_v2
+python -m unittest checks.joint_checks -v
+```
 
 ## Next steps
 

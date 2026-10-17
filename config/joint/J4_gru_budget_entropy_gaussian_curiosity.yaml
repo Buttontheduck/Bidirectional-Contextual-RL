@@ -1,0 +1,31 @@
+# @package _global_
+# ENCODER_PLAN.md, joint training: Contextual_PPO with its encoder trained together with the policy (no pilots, no frozen
+# encoder), with a GRU instead of the xLSTM (cppo.encoder_arch=gru), at the A rerun's settings (config/rerun/: hidden
+# mode, discount 0.99, reward scale 0.1, 2M steps). The rungs J0-J5 add one change each (see ENCODER_PLAN.md).
+#
+#   python run_step0.py --conditions J0 J1 J2 J3 --seeds 0 1 2 3 4 --jobs 20 --threads 1
+# J4: J3 + curiosity about the battery: a training-reward bonus of 1.0 x the drop in the Gaussian head's entropy from
+# each observation to the next, falling linearly to 0 at 1M steps (half the run), so the final policy optimizes the task.
+experiment_id: J4_gru_budget_ent_gauss_curious
+training:
+  total_timesteps: 2000000
+cppo:
+  gamma: 0.99
+  reward_scale: 0.1
+  encoder_arch: gru
+  ent_coef: 0.01
+  context_head: gaussian
+  context_variance_input: log_variance
+  curiosity:
+    weight: 1.0
+    until: 1000000
+  supervised:
+    gradient_steps: 32
+    episode_batch_size: 32
+    capacity: 2100000
+    nll_beta: 0.5
+wandb:
+  study: ""
+  run_name: J4_gru_budget_ent_gauss_curious_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: J4_gru_budget_ent_gauss_curious_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, joint, gru, J4]

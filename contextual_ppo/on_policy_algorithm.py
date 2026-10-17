@@ -13,7 +13,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from .buffers import ContextualRolloutBuffer
 from .episode_buffers import SupervisedContextualEpisodeBuffer
 from .policies import ContextualActorCriticPolicy
-from .torch_layers import XLSTMRolloutEncoder
+from .torch_layers import GRURolloutEncoder, XLSTMRolloutEncoder
 from .type_aliases import ContextualPolicyState
 
 
@@ -203,7 +203,8 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
             raise ValueError(f"rollout_buffer_kwargs can't set {conflicts}: the algorithm and the environment set them")
 
         buffer_kwargs = {
-            "recurrent_state_batch_axis": XLSTMRolloutEncoder.STATE_BATCH_AXIS,
+            # The state keys of both encoder architectures (they don't overlap)
+            "recurrent_state_batch_axis": {**XLSTMRolloutEncoder.STATE_BATCH_AXIS, **GRURolloutEncoder.STATE_BATCH_AXIS},
             "seed": self.seed,
             **self.rollout_buffer_kwargs,
         }
@@ -341,6 +342,14 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
             next_obs[i] = terminal_obs
         return next_obs
 
+    def _curiosity_weight(self) -> float:
+        """The curiosity bonus's current weight: ``curiosity_weight``, falling linearly to 0 at ``curiosity_until``."""
+        weight = float(getattr(self, "curiosity_weight", 0.0))
+        until = getattr(self, "curiosity_until", None)
+        if weight <= 0 or until is None:
+            return weight
+        return weight * max(0.0, 1.0 - self.num_timesteps / until)
+
     def collect_rollouts(  # type: ignore[override]
         self,
         env: VecEnv,
@@ -373,6 +382,7 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         n_steps = 0
         rollout_buffer.reset()
         rollout_buffer.set_initial_state(self._last_policy_state.encoder_state)
+        curiosity_bonuses: list[np.ndarray] = []
 
         callback.on_rollout_start()
 
@@ -418,6 +428,24 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
                 with th.no_grad():
                     final_values = self.policy.predict_values(self.policy.obs_to_tensor(next_obs)[0], memory)
                 timeout_bootstrap[truncated] = self.gamma * final_values.cpu().numpy().reshape(-1)[truncated]
+
+            if getattr(self, "curiosity_weight", 0.0) > 0:
+                # Curiosity about the context: the drop in the Gaussian head's entropy, 0.5 * log(sigma2), from o_t to its
+                # real successor (the final observation at an episode end), encoded from the memory after o_t. Over an
+                # episode the drops add up to its start-to-end gain, so the bonus is bounded. It goes into the buffer's
+                # intrinsic rewards (after finalize()): the stored rewards, episode returns and evaluation stay the env's
+                weight = self._curiosity_weight()
+                bonus = np.zeros(env.num_envs, dtype=np.float32)
+                if weight > 0:
+                    with th.no_grad():
+                        next_latents, _ = self.policy.encode(self.policy.obs_to_tensor(next_obs)[0], memory)
+                    _, variance = self.policy.encoder.split_context(latents)
+                    _, next_variance = self.policy.encoder.split_context(next_latents)
+                    if variance is None or next_variance is None:
+                        raise ValueError("curiosity_weight needs the Gaussian context head (context_head='gaussian')")
+                    gain = (0.5 * (th.log(variance) - th.log(next_variance))).sum(dim=-1).cpu().numpy()
+                    bonus = (weight * gain).astype(np.float32)
+                curiosity_bonuses.append(bonus)
 
             optional: dict[str, Any] = {}
             if self.context_info_keys is not None:
@@ -478,6 +506,8 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
             values = self.policy.predict_values(self.policy.obs_to_tensor(new_obs)[0], self._last_policy_state)
 
         rollout_buffer.finalize()
+        if curiosity_bonuses:
+            rollout_buffer.add_intrinsic_rewards(np.stack(curiosity_bonuses), 1.0)
         if self.reset_envs_each_rollout:
             # Every stream started with an episode start: that episode must have ended within the rollout
             unfinished = ~np.any(rollout_buffer.terminated | rollout_buffer.truncated, axis=0)
@@ -487,6 +517,9 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
                     f"the episodes that started with this rollout in envs {np.flatnonzero(unfinished)} are still running"
                 )
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+        if curiosity_bonuses:
+            self.logger.record("rollout/curiosity_weight", self._curiosity_weight())
+            self.logger.record("rollout/curiosity_bonus_mean", float(np.mean(curiosity_bonuses)))
 
         callback.update_locals(locals())
 

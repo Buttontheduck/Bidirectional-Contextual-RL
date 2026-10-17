@@ -23,6 +23,7 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7 \
         --jobs 32 --threads 1                               # step 2: plain PPO with the ideal battery estimate
     python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7   # memoryless controls
+    python run_step0.py --conditions J0 J1 J2 J3 --seeds 0 1 2 3 4 --jobs 20 --threads 1   # joint training with a GRU encoder (also J4, J5)
     python run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models runs_encoder/step4_grid/E1_gru_point_main_s1/encoder.pt \
         --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1      # step 4: plain PPO with a frozen learned encoder, once per model
 
@@ -85,6 +86,12 @@ CONDITIONS = {
     "2b_ideal": ("ppo/main_battery_plane_ppo.py", "+experiment=S2b_ideal_bs1024", "ppo"),
     "2a_ideal_std": ("ppo/main_battery_plane_ppo.py", "+experiment=S2a_ideal_std_bs256", "ppo"),
     "2b_ideal_std": ("ppo/main_battery_plane_ppo.py", "+experiment=S2b_ideal_std_bs1024", "ppo"),
+    "J0": ("main_battery_plane_contextual_ppo.py", "+joint=J0_gru_a_budget", "cppo"),
+    "J1": ("main_battery_plane_contextual_ppo.py", "+joint=J1_gru_budget", "cppo"),
+    "J2": ("main_battery_plane_contextual_ppo.py", "+joint=J2_gru_budget_entropy", "cppo"),
+    "J3": ("main_battery_plane_contextual_ppo.py", "+joint=J3_gru_budget_entropy_gaussian", "cppo"),
+    "J4": ("main_battery_plane_contextual_ppo.py", "+joint=J4_gru_budget_entropy_gaussian_curiosity", "cppo"),
+    "J5": ("main_battery_plane_contextual_ppo.py", "+joint=J5_gru_budget_warmup", "cppo"),
     "4a_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4a_encoder_bs256", "ppo"),
     "4b_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4b_encoder_bs1024", "ppo"),
 }
@@ -101,6 +108,8 @@ BLIND_CONDITIONS = ["0a_blind", "0b_blind", "0c_blind"]
 IDEAL_CONDITIONS = {"2a_ideal": "ideal", "2b_ideal": "ideal", "2a_ideal_std": "ideal_std", "2b_ideal_std": "ideal_std"}
 # Frozen learned encoders (step 4): every run once per --encoder-models file, each encoder in a report of its own
 ENCODER_CONDITIONS = ["4a_encoder", "4b_encoder"]
+# Joint training with a GRU encoder (config/joint/): each rung in a report of its own (their settings differ)
+JOINT_CONDITIONS = [name for name in CONDITIONS if name.startswith("J")]
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -197,6 +206,12 @@ def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bo
         if condition in EARLY_NOISE_CONDITIONS:
             # The switch must fall inside the smoke budget: halfway, before the second evaluation
             command.append("env.battery_noise_until=4096")
+        if condition == "J4":
+            # The curiosity bonus fades out inside the smoke budget
+            command.append("cppo.curiosity.until=8192")
+        if condition == "J5":
+            # The warm-up ends halfway: one update without PPO, then one with it
+            command.append("cppo.policy_warmup_steps=4096")
     return command
 
 
@@ -409,9 +424,11 @@ def report_commands(done: list[dict], scales: list, noises: list, output: Path) 
             return condition.split("_")[1]
         if condition in ENCODER_CONDITIONS:
             return f"encoder_{result['encoder_tag']}"
+        if condition in JOINT_CONDITIONS:
+            return f"joint_{condition}"
         return IDEAL_CONDITIONS.get(condition)
 
-    encoder_variants = sorted({variant(r) for r in done if r["condition"] in ENCODER_CONDITIONS})
+    encoder_variants = sorted({variant(r) for r in done if r["condition"] in ENCODER_CONDITIONS + JOINT_CONDITIONS})
     lines = []
     for scale in scales:
         for noise in noises:
@@ -433,7 +450,8 @@ def report_command(group: list[dict], scale, noise, flight, output: Path) -> str
         suffix += f"_noise{noise:g}"
     if flight is not None:
         labels.append({"ideal": "ideal context", "ideal_std": "ideal context with its std"}.get(
-            flight, f"frozen encoder {flight[len('encoder_'):]}" if flight.startswith("encoder_") else f"{flight} in-flight noise"))
+            flight, f"frozen encoder {flight[len('encoder_'):]}" if flight.startswith("encoder_")
+            else f"joint training {flight[len('joint_'):]}" if flight.startswith("joint_") else f"{flight} in-flight noise"))
         suffix += f"_{flight}"
     label = f" ({', '.join(labels)})" if labels else ""
     report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)

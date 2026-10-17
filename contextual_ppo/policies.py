@@ -13,7 +13,7 @@ from stable_baselines3.common.preprocessing import get_action_dim, get_flattened
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, FlattenExtractor, MlpExtractor
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 
-from .torch_layers import CONTEXT_HEADS, XLSTMRolloutEncoder
+from .torch_layers import CONTEXT_HEADS, ENCODER_ARCHS, GRURolloutEncoder, XLSTMRolloutEncoder
 from .type_aliases import ContextualPolicyState
 
 # How the actor and critic read the Gaussian head's variance: as it is, its logarithm, or not at all (the mean only)
@@ -95,7 +95,7 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
     :param auxiliary_net_arch: Hidden layers of the auxiliary head, linear by default
     """
 
-    encoder: XLSTMRolloutEncoder
+    encoder: XLSTMRolloutEncoder | GRURolloutEncoder
 
     def __init__(
         self,
@@ -124,6 +124,9 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
         context_variance_input: str = "log_variance",
         auxiliary_dim: int | None = None,
         auxiliary_net_arch: list[int] | None = None,
+        encoder_arch: str = "xlstm",
+        gru_hidden_dim: int = 128,
+        gru_num_layers: int = 2,
     ):
         if isinstance(observation_space, spaces.Dict):
             raise NotImplementedError("ContextualActorCriticPolicy doesn't support Dict observation spaces")
@@ -135,6 +138,8 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
             raise ValueError(f"context_head must be one of {CONTEXT_HEADS}, got {context_head!r}")
         if context_variance_input not in CONTEXT_VARIANCE_INPUTS:
             raise ValueError(f"context_variance_input must be one of {CONTEXT_VARIANCE_INPUTS}, got {context_variance_input!r}")
+        if encoder_arch not in ENCODER_ARCHS:
+            raise ValueError(f"encoder_arch must be one of {ENCODER_ARCHS}, got {encoder_arch!r}")
 
         # Read by _build(), which ActorCriticPolicy.__init__() calls
         self.context_dim = context_dim
@@ -146,6 +151,10 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
         self.context_variance_input = context_variance_input
         self.auxiliary_dim = auxiliary_dim
         self.auxiliary_net_arch = auxiliary_net_arch
+        # The encoder's architecture: the xLSTM block stack (xlstm_config) or a GRU (gru_hidden_dim, gru_num_layers)
+        self.encoder_arch = encoder_arch
+        self.gru_hidden_dim = gru_hidden_dim
+        self.gru_num_layers = gru_num_layers
         # Width of z_t, which the actor and critic read
         self.latent_dim = 2 * context_dim if context_head == "gaussian" else context_dim
         # Width of what they read of it
@@ -183,6 +192,9 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
                 context_variance_input=self.context_variance_input,
                 auxiliary_dim=self.auxiliary_dim,
                 auxiliary_net_arch=self.auxiliary_net_arch,
+                encoder_arch=self.encoder_arch,
+                gru_hidden_dim=self.gru_hidden_dim,
+                gru_num_layers=self.gru_num_layers,
             )
         )
         return data
@@ -203,7 +215,21 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
             device=self.device,
         )
 
-    def make_encoder(self) -> XLSTMRolloutEncoder:
+    def make_encoder(self) -> XLSTMRolloutEncoder | GRURolloutEncoder:
+        if self.encoder_arch == "gru":
+            return GRURolloutEncoder(
+                observation_dim=get_flattened_obs_dim(self.observation_space),
+                action_dim=get_action_dim(self.action_space),
+                context_dim=self.context_dim,
+                hidden_dim=self.gru_hidden_dim,
+                num_layers=self.gru_num_layers,
+                projection_net_arch=self.context_net_arch,
+                activation_fn=self.activation_fn,
+                context_activation=self.context_activation,
+                context_head=self.context_head,
+                auxiliary_dim=self.auxiliary_dim,
+                auxiliary_net_arch=self.auxiliary_net_arch,
+            ).to(self.device)
         return XLSTMRolloutEncoder(
             observation_dim=get_flattened_obs_dim(self.observation_space),
             action_dim=get_action_dim(self.action_space),

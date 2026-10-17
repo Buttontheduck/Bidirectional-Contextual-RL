@@ -3,6 +3,7 @@ Recurrent network builders for Contextual_PPO, built on the official xlstm packa
 the xLSTM block stack (``create_xlstm``), the context encoder (``XLSTMContextEncoder``) and its version for rollout
 streams (``XLSTMRolloutEncoder``), with resets inside a sequence, an optional output activation of the context head,
 a Gaussian context head (mean and variance) and an optional auxiliary head trained with supervised targets.
+``GRURolloutEncoder`` is the same encoder with a GRU instead of the xLSTM block stack (``encoder_arch="gru"``).
 The encoder started as a copy of recurrent SAC's; this package does not import ``recurrent_sac``.
 """
 
@@ -28,11 +29,16 @@ __all__ = [
     "CONTEXT_ACTIVATIONS",
     "CONTEXT_HEADS",
     "DEFAULT_XLSTM_CONFIG",
+    "ENCODER_ARCHS",
+    "GRURolloutEncoder",
     "GaussianContextOutput",
     "XLSTMContextEncoder",
     "XLSTMRolloutEncoder",
     "create_xlstm",
 ]
+
+# The context encoder's architecture: the xLSTM block stack (default) or a GRU (``GRURolloutEncoder``)
+ENCODER_ARCHS = ("xlstm", "gru")
 
 # One sLSTM block without causal convolution or feedforward network, so the complete recurrent
 # state is the cell state (h, c, n, m). The vanilla backend is plain PyTorch and runs on CPU, MPS and CUDA.
@@ -476,6 +482,213 @@ class XLSTMRolloutEncoder(XLSTMContextEncoder):
             context, state = self.step(state, observations[:, i], prev_actions[:, i])
             contexts.append(context)
         return th.stack(contexts, dim=1), state
+
+    def forward(
+        self,
+        state: dict[str, Any],
+        observations: th.Tensor,
+        prev_actions: th.Tensor,
+        mask: th.Tensor | None = None,
+        episode_starts: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, dict[str, Any]]:
+        return self.unroll(state, observations, prev_actions, mask, episode_starts)
+
+
+class GRURolloutEncoder(nn.Module):
+    """
+    A GRU context encoder with the interface of ``XLSTMRolloutEncoder`` (``encoder_arch="gru"``): ``[o_t, a_{t-1}]``
+    -> linear input projection to ``hidden_dim`` -> a GRU of ``num_layers`` layers -> the same context head
+    (``projection_net_arch``, ``context_activation``, point or Gaussian) and the same optional auxiliary head.
+
+    The recurrent state is ``{"gru_state": [num_layers, B, hidden_dim]}`` (batch axis 1, ``STATE_BATCH_AXIS``), zero
+    at episode start. ``step`` and ``unroll`` never modify the state passed in.
+
+    ``unroll`` has three paths, which agree within float rounding:
+    - no ``mask`` and no ``episode_starts``: one GRU call over the whole sequence
+    - a ``mask`` whose valid inputs are a prefix of every row (complete episodes padded at the end, the episode
+      buffer's batches): one GRU call (causal, so the padding never reaches a real step); padded steps get zero
+      contexts, and the state returned is each row's after its last valid input, computed without gradient. Any other
+      mask falls back to stepping, where padded steps keep the state.
+    - ``episode_starts`` (rollout streams holding several episodes): step by step, resetting the rows where an
+      episode starts, as during collection
+
+    :param observation_dim: Dimension of the flattened observation
+    :param action_dim: Dimension of the action
+    :param context_dim: Dimension of the context (with the Gaussian head: of its mean and of its variance)
+    :param hidden_dim: Width of the input projection and of every GRU layer
+    :param num_layers: Number of GRU layers
+    :param projection_net_arch: Hidden layers of the context head, linear by default
+    :param activation_fn: Activation function of the hidden layers of the heads
+    :param context_activation: Output activation of the context head (a key of ``CONTEXT_ACTIVATIONS``), None for a
+        linear output; with the Gaussian head, the activation of the mean only
+    :param context_head: ``"point"`` or ``"gaussian"``, see ``CONTEXT_HEADS``
+    :param auxiliary_dim: Size of the auxiliary head's output, None for no auxiliary head
+    :param auxiliary_net_arch: Hidden layers of the auxiliary head, linear by default
+    """
+
+    STATE_BATCH_AXIS: dict[str, int] = {"gru_state": 1}
+    uses_cuda_backend = False
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        context_dim: int = 8,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        projection_net_arch: list[int] | None = None,
+        activation_fn: type[nn.Module] = nn.ReLU,
+        context_activation: str | None = None,
+        context_head: str = "point",
+        auxiliary_dim: int | None = None,
+        auxiliary_net_arch: list[int] | None = None,
+    ) -> None:
+        if context_activation is not None and context_activation not in CONTEXT_ACTIVATIONS:
+            raise ValueError(f"context_activation must be None or one of {sorted(CONTEXT_ACTIVATIONS)}, got {context_activation!r}")
+        if context_head not in CONTEXT_HEADS:
+            raise ValueError(f"context_head must be one of {CONTEXT_HEADS}, got {context_head!r}")
+        if auxiliary_dim is not None and (isinstance(auxiliary_dim, bool) or not isinstance(auxiliary_dim, int) or auxiliary_dim < 1):
+            raise ValueError(f"auxiliary_dim must be None or an integer >= 1, got {auxiliary_dim!r}")
+        for name, value in (("hidden_dim", hidden_dim), ("num_layers", num_layers)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+        super().__init__()
+        self.observation_dim, self.action_dim = observation_dim, action_dim
+        self.context_dim = context_dim
+        self.output_dim = 2 * context_dim if context_head == "gaussian" else context_dim
+        self.context_activation, self.context_head = context_activation, context_head
+        self.embedding_dim, self.num_layers = hidden_dim, num_layers
+        self.input_projection = nn.Linear(observation_dim + action_dim, hidden_dim)
+        self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.context_projection = nn.Sequential(
+            *create_mlp(hidden_dim, self.output_dim, projection_net_arch or [], activation_fn)
+        )
+        if context_head == "gaussian":
+            self.context_projection.append(GaussianContextOutput(context_dim, context_activation))
+        elif context_activation is not None:
+            self.context_projection.append(CONTEXT_ACTIVATIONS[context_activation]())
+        self.auxiliary_dim, self.auxiliary_net_arch = auxiliary_dim, auxiliary_net_arch
+        self.auxiliary_projection = (
+            None if auxiliary_dim is None
+            else nn.Sequential(*create_mlp(hidden_dim, auxiliary_dim, auxiliary_net_arch or [], activation_fn))
+        )
+
+    def initial_state(self, batch_size: int) -> dict[str, Any]:
+        param = next(self.parameters())
+        return {"gru_state": param.new_zeros(self.num_layers, batch_size, self.embedding_dim)}
+
+    def reset_state(self, state: dict[str, Any], reset_mask: th.Tensor | np.ndarray) -> dict[str, Any]:
+        return self._select_state(reset_mask, self._zeros_like_state(state), state)
+
+    def embed_step(self, state: dict[str, Any], observations: th.Tensor, prev_actions: th.Tensor) -> tuple[th.Tensor, dict[str, Any]]:
+        """The GRU's output (the heads' input) for one input ``[obs_t, action_{t-1}]`` per row, and the new state."""
+        x = self.input_projection(th.cat([observations.flatten(start_dim=1), prev_actions.flatten(start_dim=1)], dim=-1))
+        output, hidden = self.gru(x.unsqueeze(1), state["gru_state"])
+        return output.squeeze(1), {"gru_state": hidden}
+
+    def step(self, state: dict[str, Any], observations: th.Tensor, prev_actions: th.Tensor) -> tuple[th.Tensor, dict[str, Any]]:
+        embedding, new_state = self.embed_step(state, observations, prev_actions)
+        return self.context_projection(embedding), new_state
+
+    def _embed(self, state: dict[str, Any], observations: th.Tensor, prev_actions: th.Tensor,
+               mask: th.Tensor | None) -> tuple[th.Tensor, dict[str, Any], th.Tensor | None]:
+        """
+        Embeddings [B, L, hidden_dim] of whole sequences without resets, the state after each row's last valid input,
+        and the validity [B, L] (None without a mask). Padded embeddings are zero.
+        """
+        batch_size, seq_len = observations.shape[:2]
+        x = self.input_projection(th.cat([observations.reshape(batch_size, seq_len, -1), prev_actions], dim=-1))
+        if mask is None:
+            output, hidden = self.gru(x, state["gru_state"])
+            return output, {"gru_state": hidden}, None
+        valid = mask.bool()
+        lengths = valid.sum(dim=1)
+        prefix = th.arange(seq_len, device=valid.device).unsqueeze(0) < lengths.unsqueeze(1)
+        if bool((lengths > 0).all()) and bool(th.equal(valid, prefix)):
+            # One unpacked call: the GRU is causal, so the padding at the end never reaches a real step (packed
+            # sequences give the same outputs, but their backward pass is tens of times slower on CPU)
+            output, _ = self.gru(x, state["gru_state"])
+            # Each row's state after its last valid input, from a packed pass without gradient (cheap): the outputs
+            # carry the gradient, this state doesn't
+            with th.no_grad():
+                packed = nn.utils.rnn.pack_padded_sequence(x.detach(), lengths.cpu(), batch_first=True, enforce_sorted=False)
+                _, hidden = self.gru(packed, state["gru_state"].detach())
+            return th.where(valid.unsqueeze(-1), output, th.zeros_like(output)), {"gru_state": hidden}, valid
+        # Not a prefix (or an empty row): step by step, the padded steps keeping the state
+        outputs = []
+        for i in range(seq_len):
+            output, hidden = self.gru(x[:, i : i + 1], state["gru_state"])
+            new_state = {"gru_state": hidden}
+            state = self._select_state(valid[:, i], new_state, state)
+            outputs.append(th.where(valid[:, i : i + 1], output.squeeze(1), th.zeros_like(output.squeeze(1))))
+        return th.stack(outputs, dim=1), state, valid
+
+    def unroll(
+        self,
+        state: dict[str, Any],
+        observations: th.Tensor,
+        prev_actions: th.Tensor,
+        mask: th.Tensor | None = None,
+        episode_starts: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, dict[str, Any]]:
+        """
+        The contexts [B, L, output_dim] of a sequence and the final state, see the class docstring.
+
+        :param state: State before the first input
+        :param observations: [B, L, *obs_shape]
+        :param prev_actions: [B, L, action_dim], zero where an episode starts
+        :param mask: [B, L] bool padding mask, only without ``episode_starts``
+        :param episode_starts: [B, L] bool, reset the row before input ``i``
+        """
+        batch_size, seq_len = observations.shape[:2]
+        if seq_len == 0:
+            return observations.new_zeros(batch_size, 0, self.output_dim), state
+        if episode_starts is None:
+            embeddings, final_state, valid = self._embed(state, observations, prev_actions, mask)
+            contexts = self.context_projection(embeddings)
+            if valid is not None:
+                contexts = th.where(valid.unsqueeze(-1), contexts, th.zeros_like(contexts))
+            return contexts, final_state
+        if mask is not None:
+            raise ValueError("episode_starts and a padding mask can't be combined: rollout streams have no padding")
+        if tuple(episode_starts.shape) != (batch_size, seq_len):
+            raise ValueError(f"episode_starts must have shape {(batch_size, seq_len)}, got {tuple(episode_starts.shape)}")
+        episode_starts = episode_starts.bool()
+        contexts = []
+        for i in range(seq_len):
+            if episode_starts[:, i].any():
+                state = self.reset_state(state, episode_starts[:, i])
+            context, state = self.step(state, observations[:, i], prev_actions[:, i])
+            contexts.append(context)
+        return th.stack(contexts, dim=1), state
+
+    def unroll_with_auxiliary(
+        self,
+        state: dict[str, Any],
+        observations: th.Tensor,
+        prev_actions: th.Tensor,
+        mask: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor, dict[str, Any]]:
+        """``unroll`` without ``episode_starts``, which also runs the auxiliary head (zero where ``mask`` is False)."""
+        if self.auxiliary_projection is None:
+            raise ValueError("unroll_with_auxiliary needs an auxiliary head: set auxiliary_dim")
+        batch_size, seq_len = observations.shape[:2]
+        if seq_len == 0:
+            return (observations.new_zeros(batch_size, 0, self.output_dim),
+                    observations.new_zeros(batch_size, 0, self.auxiliary_dim), state)
+        embeddings, final_state, valid = self._embed(state, observations, prev_actions, mask)
+        contexts, auxiliaries = self.context_projection(embeddings), self.auxiliary_projection(embeddings)
+        if valid is not None:
+            contexts = th.where(valid.unsqueeze(-1), contexts, th.zeros_like(contexts))
+            auxiliaries = th.where(valid.unsqueeze(-1), auxiliaries, th.zeros_like(auxiliaries))
+        return contexts, auxiliaries, final_state
+
+    # The xLSTM encoder's helpers, bound to this class (so they read its STATE_BATCH_AXIS)
+    split_context = XLSTMRolloutEncoder.split_context
+    _select_state = classmethod(XLSTMContextEncoder._select_state.__func__)
+    _batch_axis = classmethod(XLSTMContextEncoder._batch_axis.__func__)
+    _clone_state = staticmethod(XLSTMContextEncoder._clone_state)
+    _zeros_like_state = staticmethod(XLSTMContextEncoder._zeros_like_state)
 
     def forward(
         self,
