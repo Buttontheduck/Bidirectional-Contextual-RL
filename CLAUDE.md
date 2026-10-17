@@ -51,6 +51,7 @@ python train_encoder.py --finalize runs_encoder/step4/<run>   # a run stopped by
 python train_encoder.py --design E1 --arch convgru --drop-tau --seed 0 --patience 8 --max-epochs 40 --output-root runs_encoder/step4_grid   # step 4's 2 x 2 plan: --arch gru | convgru (recurrent_encoders.py), saves encoder.pt
 python recurrent_encoders.py --export-probe runs_encoder/step4_probes/probe_gru_battery_main_s1 --output <run dir>/encoder.pt   # a probe GRU as an encoder.pt for the context wrapper
 python step4_floor.py --output runs_encoder/step4/floor_v2_main --jobs 16   # the floor: ideal estimator on the encoders' validation/test flights, ~4 min
+python step4_closed_loop.py --reports <frozen-encoder report_step0 reports> --output runs_step0/closed_loop_frozen_gru.json   # step 4's closed-loop check: a frozen encoder's estimate on its PPO policies' own validation flights, next to the ideal estimate, ~1 min
 python step4_probes.py --arch gru --task battery --seed 0     # step 4 diagnostics: tasks count (thrust used so far), find (b0, full-throttle flights), battery; archs xlstm, gru, lstm (GRU ~4 min per epoch); another --data adds its folder to the W&B names
 python pilots.py --output runs_encoder/pilot_flights/ft20k --styles full_throttle --flights 20000 --jobs 12   # 20,000 full-throttle flights for the find probe (first 2,000 = v2's), ~1 min
 python -m unittest checks.step4_checks -v          # train_encoder.py: split by flight seed, inputs, padding, reproducible, loads in the context wrapper; step4_floor.py; step4_probes.py
