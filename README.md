@@ -220,8 +220,9 @@ Stable-Baselines3 PPO with a recurrent context encoder. It doesn't depend on Bat
 - **Backpropagation through time:** `cppo.bptt_len` cuts the PPO re-encoding into segments; the default is the whole 512-step stream.
 - **Controls:** `cppo.context_source=oracle` replaces the encoder with the true battery, `z_t = b_t`, read from an observed-mode observation (`step0_oracle.py`). `cppo.context_source=none` removes it altogether (`z_t = 0`, hidden mode): Contextual PPO without memory, the matched memoryless control for experiment A. `step1_controls.py` adds noise of a chosen size or schedule to that battery. These separate "can the policy use a battery estimate?" from "can the encoder produce one?".
 - **Experiment grid A–F** (`GRID_PLAN.md`): point vs. Gaussian estimate, beta-NLL, whether the variance is an input, and the speed head. Three seeds each.
+- **A frozen encoder trained offline** (`ENCODER_PLAN.md`, step 4): `train_encoder.py` trains an encoder on the pilot flights of `pilots.py`. It can be experiment A's xLSTM or a GRU / ConvGRU from `recurrent_encoders.py`. `context_wrapper.py` then appends its frozen battery estimate to plain PPO's observation (`run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models ...`).
 
-## 6. Where things stand (2026-10-14)
+## 6. Where things stand (2026-10-17)
 
 Details, tables and W&B groups are in `ENCODER_PLAN.md`. Scores are mean validation returns over the last quarter of training (1.5M–2M steps) unless noted.
 
@@ -233,15 +234,38 @@ Details, tables and W&B groups are in `ENCODER_PLAN.md`. Scores are mean validat
 | Contextual PPO with the true battery | Yes | Oracle | 282 | 86% |
 | Contextual PPO with its learned encoder (experiment A rerun, 3 seeds) | No, inferred | xLSTM | 22 | 17% |
 | Plain PPO with the ideal estimate (batch 256 / 1024) | No, estimated perfectly | Frozen ideal estimator | 283 / 323 | 88% / 92% |
+| **Plain PPO with a frozen GRU trained offline** (batch 256 / 1024) | No, inferred | Frozen GRU | **209** / 164 | **88%** / 73% |
 
 All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0–2), the same 18 validation flights.
+- **The frozen-GRU row** uses the GRU seed with the best validation error.
+- **At batch 256** all 8 seeds score 167–261.
+- **At batch 1024** one seed collapsed (−294), so the median, 218, is the fairer summary.
+- **Other GRU seeds at batch 1024** score 179 and 120.
+
+**Battery estimates on held-out pilot flights** (error in battery units, 1,900 test flights of 11 pilot styles):
+
+| Estimate | Error | Share of the gap from clock to ideal |
+|---|---:|---:|
+| Clock only (the mean battery at each flight step) | 0.144 | 0% |
+| A's xLSTM trained offline, stopped by impatient early stopping | 0.129 | 26% |
+| A's xLSTM trained offline, given enough passes (6 runs) | 0.101–0.107 (mean 0.103) | about 70% |
+| GRU trained offline (5 seeds) | 0.097 | 80% |
+| Ideal estimator (exact physics, the same inputs) | 0.085 | 100% |
 
 **What this shows so far:**
 
 - **The environment side holds for memoryless agents.** With every learner, knowing the battery is worth 170–220 points (246 vs 23, 258 vs 77, 282 vs 115), and completion rises from 15–26% to 86–88%.
 - **The memory agent's machinery works.** Given the true battery, Contextual PPO matches or beats plain PPO with the battery.
 - **A perfect battery estimate is enough.** Plain PPO reading the ideal estimator's estimate (the best estimate possible from the same inputs) scores 283 / 323, above plain PPO with the true battery (246 / 258). Flown with the true battery instead, the same policies score 280 / 310, so they are simply better pilots. The bottleneck is the learned encoder.
-- **The learned encoder doesn't yet deliver.** Experiment A scores 22, below Contextual PPO with no context at all (115, all 8 seeds between 90 and 139). Its planes fly like blind agents, fast until the battery runs out, even though its battery estimate is fairly accurate on average (R² 0.80).
+- **The encoder learned inside Contextual PPO doesn't deliver.** Experiment A scores 22, below Contextual PPO with no context at all (115, all 8 seeds between 90 and 139). Its planes fly like blind agents, fast until the battery runs out, even though its battery estimate is fairly accurate on average (R² 0.80).
+- **Trained offline on varied flights, an encoder does learn the battery.** A GRU gets 80% of the way from a clock-only guess to the ideal estimator, and A's xLSTM gets about as far when given enough training (about 15 times slower).
+  - Both sit at the clock for 9–11 passes over the data, then suddenly "click".
+  - A filter front-end and dropping the time-left input don't help.
+- **A frozen learned encoder works in the loop.** Plain PPO with the frozen GRU scores 209 at batch 256 against 23 without memory, and completes 88% of flights, as with the true battery. That is about 72% of the way to the ideal estimate (283).
+- **How a policy flies decides what can be known about its battery.** Measured on PPO's own flights (the closed-loop check):
+  - Policies that never fly at the cap hide the battery from everyone, the ideal estimator included.
+  - Policies that probe reveal it. There the GRU lags the ideal estimate and overestimates the battery after about 5 s, which caused the one collapsed run.
+- **A likely reason A failed, not tested directly:** inside Contextual PPO the encoder got about 1,950 supervised steps of 16 episodes (A–F, 1M steps), or 3,900 (the A rerun, 2M). It trained on its own clock-like flights. That is less training, on narrower data, than the offline encoders needed before their click (about 4,300–5,200 steps of 32 varied flights).
 
 **Why, from the step 1 controls**, which replace the encoder with the true battery plus controlled noise:
 
@@ -256,13 +280,18 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0
 
 This is the autogenic difficulty from section 1 showing up in practice. The agent's behaviour decides what its encoder can learn about the battery, and the encoder's estimate decides whether the agent learns to behave differently.
 
+**Done since 2026-10-14:**
+- the ideal estimator as a target at every flight step
+- offline encoder training on varied pilot flights (`pilots.py`, `train_encoder.py`)
+- plain PPO with the frozen encoder, and its closed-loop check
+
 **Next steps** (`ENCODER_PLAN.md`):
 
-1. Compute the best possible estimate at each flight step (an ideal estimator), as a target.
-2. Train the encoder offline on varied flights from many pilots, gentle and hard, so it learns to read the battery rather than the clock.
-3. Freeze it and train PPO on top, against the oracle and noisy-oracle controls.
+1. Train the encoder also on flights of the frozen-GRU PPO policies (probe-then-glide flights, and the collapsed run's), where it overestimates the battery.
+2. Train it on the ideal estimator's estimate as a teacher, a target that is unbiased given what can be seen.
+3. Return to Contextual PPO with a pretrained encoder, or with much more encoder training per update.
 
-**An easy alternative environment** (`EASY_ENV_WARMUP.md`, not implemented yet): a 5-second autopilot take-off at full throttle before the agent takes control reveals the battery to the encoder, while the battery at hand-over stays uniform on 0.2–0.7. It removes the hardest autogenic step (deciding to spend battery to learn the battery), so the current environment stays the main, hard version.
+**An easy alternative environment** (`EASY_ENV_WARMUP.md`, not implemented): a 5-second autopilot take-off at full throttle before the agent takes control reveals the battery to the encoder, while the battery at hand-over stays uniform on 0.2–0.7. It removes the hardest autogenic step (deciding to spend battery to learn the battery), so the current environment stays the main, hard version. Reconsidered on 2026-10-17 and kept as plan B.
 
 ## 7. Repository map
 
@@ -273,12 +302,15 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 | `main_battery_plane_contextual_ppo.py`, `config/` | Contextual PPO training (Hydra). `config/cppo.yaml` is experiment A; `config/experiment/` holds A–F; `config/step0/`, `config/step1/` and `config/rerun/` hold the controls |
 | `ppo/` | Plain SB3 PPO baselines (hidden and observed mode) |
 | `step0_oracle.py`, `step1_controls.py` | The true-battery and noisy-battery controls |
-| `context_wrapper.py` | A frozen battery estimate (the ideal estimator or a saved encoder) appended to plain PPO's observations |
+| `context_wrapper.py` | A frozen battery estimate (the ideal estimator, a saved xLSTM, or a GRU / ConvGRU `encoder.pt`) appended to plain PPO's observations |
 | `pilots.py` | Pilot flights in many styles for training a battery encoder offline |
+| `train_encoder.py`, `recurrent_encoders.py` | Offline encoder training (A's xLSTM, GRU, ConvGRU; resume and finalize) and the standalone GRU / ConvGRU encoders |
+| `step1_ideal_estimator.py`, `step4_floor.py` | The ideal estimator (exact physics, the encoder's inputs) and the floor it sets on the pilot flights |
+| `step4_probes.py`, `step4_closed_loop.py` | Encoder diagnostics: the counting and finding tasks, GRU / LSTM vs xLSTM, and the encoder on PPO's own flights |
 | `flight_logging.py` | Flight diagnostics shared by both learners (validation, rollouts, gradient norms, final validation) |
 | `run_grid.py`, `run_step0.py`, `report_step0.py`, `evaluate_final_test.py` | Launchers, reports and the one-time final test |
-| `step1_fly_with_noise.py`, `step1_encoder_error.py` | Step 1 analyses |
-| `checks/` | `unittest` checks: configs, seeds, logging, controls |
+| `step1_fly_with_noise.py`, `step1_encoder_error.py`, `step2_swap_battery.py` | Step 1 and step 2 analyses |
+| `checks/` | `unittest` checks: configs, seeds, logging, controls, the context wrapper, the pilots, and encoder training (`step0`–`step4_checks`) |
 | `GRID_PLAN.md`, `ENCODER_PLAN.md` | The A–F grid; the encoder-versus-policy plan with all results so far |
 | `EASY_ENV_WARMUP.md`, `warmup_information.py` | The easy alternative environment (forced take-off) and its measurement |
 | `CLAUDE.md` | Working notes: commands, architecture, protocol rules |
@@ -294,7 +326,9 @@ python battery_plane.py                                    # environment design 
 python main_battery_plane_contextual_ppo.py training.seed=0 wandb.mode=disabled            # experiment A, one seed
 python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0 wandb.mode=disabled   # with the true battery
 python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0        # plain PPO, observed mode
-python -m unittest checks.grid_checks checks.step0_checks checks.step1_checks checks.logging_checks
+python train_encoder.py --design E1 --arch gru --seed 0 --smoke                            # offline encoder training, tiny run
+python -m unittest checks.grid_checks checks.step0_checks checks.step1_checks checks.step2_checks checks.step3_checks \
+    checks.step4_checks checks.logging_checks
 ```
 
 `CLAUDE.md` lists the launchers that run many seeds in parallel.

@@ -5,6 +5,15 @@
 **Project name:** `Contextual_PPO`. Suggested Python class: `ContextualPPO`.  
 **Status:** implementation specification. Implemented so far: the encoder adapter (`torch_layers.py`, tested by `test_torch_layers.py`), the rollout buffer (`buffers.py`, tested by `test_buffer.py`), the recurrent collector (`on_policy_algorithm.py`, tested by `test_on_policy_algorithm.py`) the policy (`policies.py`, tested by `test_policies.py`) and the PPO learner (`contextual_ppo.py`, tested by `test_contextual_ppo.py`, which includes a small memory task the agent must learn). The project integration (Stage 6) is in `Env_BatteryPlane/ppo/`: `main_battery_plane_contextual_ppo.py`, `configs/battery_plane_contextual_ppo.yaml`, `configs/experiment/c01_hidden_contextual.yaml`, tested by `tests/test_contextual_ppo_entry.py`. Nothing has been validated experimentally on BatteryPlane yet.
 
+**Status update (2026-10-17).** The integration now lives in this repository (`main_battery_plane_contextual_ppo.py`, `config/`; see `CLAUDE.md`), not in `Env_BatteryPlane/ppo/`. The experiments are the A–F grid (`GRID_PLAN.md`) and the encoder investigation (`ENCODER_PLAN.md`), and every experiment so far trains the encoder supervised on the true battery (`encoder_objective: supervised`).
+- **The machinery works:** with the true battery as context, Contextual PPO scores 282, matching plain PPO with the battery.
+- **The learned encoder did not deliver inside the loop:** experiment A scores 22.
+- **Offline, a GRU or the same xLSTM learns the battery,** but only after a long plateau: about 4,300–5,200 steps of 32 varied flights.
+- **The in-loop budget is smaller and narrower:** 8 supervised steps of 16 episodes per update, about 1,950 per 1M-step run, on the policy's own flights.
+- **For future versions of this design:**
+  - pretrain the encoder offline, or give it far more supervised steps per update, on more varied data
+  - a GRU encoder is as accurate as the xLSTM here and about 15 times faster to train
+
 ## 1. Objective and authoritative design
 
 Extend Stable-Baselines3's vanilla PPO so that it can use interaction history in a partially observed environment such as BatteryPlane. A shared xLSTM encoder processes the current observation and the previous executed action, maintains memory across the episode, and produces a compact inferred context. Both the actor and the critic receive this context together with the current observation.

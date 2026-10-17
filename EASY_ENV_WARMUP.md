@@ -2,6 +2,11 @@
 
 **Status:** idea with first measurements (2026-10-14). Nothing is implemented in the environment or the learner yet. The current environment stays the main (hard) version.
 
+**Update (2026-10-17): kept as plan B.** In the hard version, a GRU encoder trained offline on varied pilot flights now makes plain PPO score 209 at batch 256: 23 without memory, 246 with the true battery and 283 with the ideal estimate (ENCODER_PLAN.md, step 4).
+- **The closed-loop check** found that the best of these policies probe by themselves: they fly at full throttle for a while, so the battery shows.
+- **Still, the forced take-off would probably help the encoder.** It is the full-throttle "find" situation, which the GRU handles well (about 0.06–0.07 after 5 s, near the best possible).
+- **When to switch to the easy version:** if the remaining gap to the ideal estimate turns out to come from early-flight error.
+
 **In one paragraph.** Every flight starts with a short take-off flown by an autopilot at full throttle, which the agent does not control. Full throttle is the only way the battery shows in the plane's behaviour, so this stretch reveals the battery to anyone watching. The agent's memory, the encoder, watches it and can know the battery before the agent makes its first decision. The starting battery is raised by exactly what the take-off uses, so when the agent takes over, its battery is still uniform on 0.2–0.7, as in the current environment. The measurements below say the take-off must last about **5 seconds** (100 steps); 2 seconds reveals almost nothing.
 
 ## 1. Why: what the experiments so far showed

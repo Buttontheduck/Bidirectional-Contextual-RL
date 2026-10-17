@@ -230,3 +230,14 @@ The scripted policies in `python battery_plane.py` start from a fixed position (
   - D_s0 (every episode a ground crash) and F_s0 (67% ground crashes) collapsed.
 - **Three seeds can't separate the experiments.** C's seeds are the top 3 when ranked against A's (one-sided permutation p = 0.05). C against E gives p ≈ 0.10. The speed head shows no consistent effect.
 - **Encoder R² overstates the battery estimate.** A clock-only estimate already gets pooled R² 0.45 on the collapsed runs' flights. Those runs' encoders reach 0.83–0.87 in closed loop, about 70–77% of the way from the clock to a perfect estimate. C_s0, C_s2, D_s0 and F_s0 have negative closed-loop R². The follow-up experiment is in `ENCODER_PLAN.md`.
+
+## Follow-up (ENCODER_PLAN.md, 2026-10-12 to 2026-10-17)
+
+The grid's question, why the context didn't help, was followed up in `ENCODER_PLAN.md`.
+- **Experiment A, rerun with tuned settings** (discount 0.99, reward scale 0.1, 2M steps), still scores 22. Contextual PPO without any context scores 115.
+- **The encoder learned a clock** (the battery as "starting guess minus a fixed amount per step") instead of reading the battery from how the plane responds.
+- **A perfect battery estimate is enough:** plain PPO reading the ideal estimate scores 283 / 323 (batch 256 / 1024).
+- **Trained offline on varied pilot flights,** a GRU (and, given time, A's xLSTM) learns the battery to 0.097 on held-out flights (the clock gets 0.144, the ideal 0.085). It gets there only after a long plateau at the clock.
+- **Plain PPO with that GRU frozen scores 209** at batch 256.
+- **A likely reason the grid's encoders stayed at the clock, not tested directly:** each run gave the encoder about 1,950 supervised steps of 16 episodes (8 per update × 244 updates over 1M steps), on the policy's own flights. The offline encoders needed about 4,300–5,200 steps of 32 varied flights before leaving the plateau.
+
