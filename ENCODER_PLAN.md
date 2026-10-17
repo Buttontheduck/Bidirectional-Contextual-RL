@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock), the xLSTM given the same time (it learns it too) and the 2 × 2 test of a ConvGRU front-end and dropping `tau` (2026-10-17: neither helps; the plain GRU reaches 0.097, results below); plain PPO with the frozen GRU prepared and next.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock), the xLSTM given the same time (it learns it too) and the 2 × 2 test of a ConvGRU front-end and dropping `tau` (2026-10-17: neither helps; the plain GRU reaches 0.097), and plain PPO with the frozen GRU (2026-10-17: 209 at batch 256, against 23 without memory, 246 with the true battery and 283 with the ideal estimate; results below); the closed-loop check of the encoder on PPO's own flights next.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -1119,6 +1119,52 @@ nohup python run_step0.py --conditions 4b_encoder --encoder-models $G/E1_gru_poi
   --seeds 0 1 2 3 4 5 6 7 --jobs 16 --threads 1 --output runs_step0/frozen_gru_b > run_frozen_gru_b.log 2>&1 &
 ```
 
+**Results: plain PPO with the frozen GRU (launched 2026-10-17 08:01 UTC).**
+- **All 32 runs finished,** in 26–28 minutes each.
+- **Reports:**
+  - `runs_step0/frozen_gru_a/step0_report_encoder_E1_gru_point_main_s1.json`
+  - `runs_step0/frozen_gru_b/step0_report_encoder_E1_gru_point_main_s0.json`
+  - `runs_step0/frozen_gru_b/step0_report_encoder_E1_gru_point_main_s4.json`
+- **Late score:** the mean validation return over 1.5M–2M steps, 8 PPO seeds each. The final validation is of the final checkpoint.
+
+| Battery estimate | Batch | Late score (range) | Median | Final | Completed | Battery empty | Crashed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| None (memoryless) | 256 | 23 ± 42 (−14–111) | | 28 | 26% | 74% | 0% |
+| None (memoryless) | 1024 | 77 ± 32 (42–136) | | 79 | 15% | 85% | 0% |
+| **Frozen GRU s1** | **256** | **209 ± 36 (167–261)** | 210 | 204 | **88%** | 12% | 0% |
+| Frozen GRU s1 | 1024 | 164 ± 184 (−294–330) | 218 | 157 | 73% | 22% | 5% |
+| Frozen GRU s0 | 1024 | 179 ± 64 (69–277) | 192 | 204 | 77% | 16% | 7% |
+| Frozen GRU s4 | 1024 | 120 ± 104 (−7–296) | 101 | 125 | 43% | 52% | 5% |
+| True battery | 256 | 246 ± 52 (185–349) | 232 | 251 | 88% | 6% | 6% |
+| True battery | 1024 | 258 ± 30 (212–304) | 261 | 236 | 86% | 5% | 9% |
+| Ideal estimate | 256 | 283 ± 40 (222–355) | 285 | 265 | 88% | 10% | 2% |
+| Ideal estimate | 1024 | 323 ± 22 (270–344) | 326 | 308 | 92% | 2% | 6% |
+
+**Late score per PPO seed (seeds 0–7):**
+- **GRU s1:**
+  - batch 256: 168, 203, 255, 169, 216, 231, 167, 261
+  - batch 1024: 330, 177, 123, 280, 262, 249, **−294**, 187
+- **GRU s0, batch 1024:** 196, 145, 69, 277, 109, 221, 227, 187
+- **GRU s4, batch 1024:** 57, −7, 244, 26, 296, 165, 146, 32
+
+**What it shows:**
+1. **Inferring the battery from the history helps a lot.** With the frozen GRU, plain PPO at batch 256 goes from 23 to **209** on all 8 seeds (167–261), and completes **88%** of the validation flights against 26% without memory. That is the same completion rate as with the true battery or the ideal estimate. This is the project's second goal shown with a learned encoder: an agent that must infer its hidden battery from its own history does far better than one that can't.
+2. **Not yet as good as perfect inference.**
+   - At batch 256, the GRU gets about 72% of the way from memoryless (23) to the ideal estimate (283), and about 83% of the way to the true battery (246).
+   - It completes flights as often but earns less on the way.
+   - The learner, settings and validation flights are identical, so the remaining gap is the encoder's.
+3. **Batch 256 is reliable; batch 1024 is not.**
+   - With GRU s1 at batch 1024, one seed collapsed (−294, no flight completed) and one reached only 123. The other six reached 177–330, up to the ideal estimate's level.
+   - With the ideal estimate, batch 1024 was the better setting (323 against 283). The GRU's extra error seems to make the larger batch unstable.
+4. **The encoder seed matters more than its error on the pilot flights suggests.**
+   - GRU s0 and s4 had almost the same validation error (0.0967 and 0.0969), but very different PPO results: 179 against 120, and 77% against 43% completed.
+   - The likely reason is that PPO's own flights differ from the pilot flights, so an encoder's error on them can differ even when its pilot-flight error doesn't.
+
+**Next:**
+1. **The closed-loop check:** each GRU's error on the PPO policies' own validation flights, against the ideal estimator on the same flights. It should explain the s4 / s0 / s1 differences and the batch-1024 collapses.
+2. **Train the encoder on PPO-style flights:** add flights flown by these frozen-GRU PPO policies (as pilots, replayed or direct) to the encoder's data and retrain, closing the gap between the flights it learns from and the flights PPO flies.
+3. **A cleaner target:** the ideal estimator as a teacher (section 3), against the steady extra error of about 0.045.
+
 ```bash
 python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4      # E3: --design E3
 python step4_floor.py --output runs_encoder/step4/floor_v2_main --jobs 16           # about 3 minutes
@@ -1156,7 +1202,7 @@ Steps 1–5 originally listed 8 conditions × 3 seeds = 24 PPO runs: oracle, thr
 3. **Freeze it under plain PPO**, with `context.source=encoder` and `context.encoder_model=...`. Use 8 seeds at step 0's settings (gamma 0.99, reward scale 0.1).
    - Compare against the ideal estimate (283 / 323), the true battery (246 / 258) and memoryless PPO (23 / 77).
    - Then the closed-loop check: the encoder's error on the PPO policy's own flights.
-   - Prepared 2026-10-17 with the best GRU encoders (step 4 above, "Plain PPO with the frozen GRU"). If it falls well short because of early-flight error, the easy environment is plan B.
+   - Done 2026-10-17 with the best GRU encoders (step 4 above): 209 ± 36 at batch 256 (88% of flights completed), against 23 without memory, 246 with the true battery and 283 with the ideal estimate. Batch 1024 is unstable with the GRU (one seed collapsed), and the encoder seed matters. Next: the closed-loop check, then encoder data from PPO-style flights. If the shortfall turns out to come from early-flight error, the easy environment is plan B.
 4. **Optional:**
    - Train on the ideal estimator as a teacher (section 3).
    - Freeze A's own encoder under plain PPO (step 2's next steps).
