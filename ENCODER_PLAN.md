@@ -1,6 +1,6 @@
 # Planned experiment: pretrained frozen encoder vs. policy
 
-**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock; results below); a patient GRU rerun, the xLSTM given the same time, then freezing the encoder under plain PPO, next.
+**Status:** step 0 and step 1's noisy oracle, fly-with-noise, late-switch, early-noise and in-flight-noise tests done, and the A rerun's encoder error measured over a flight (2026-10-13), the memoryless controls at step 0's settings, the ideal estimator on the validation flights, the context wrapper, and plain PPO with the ideal estimate (2026-10-14; results below), the pilots and their flights (step 3: dataset v2 with style switching, 2026-10-15), and offline training of the encoder on those flights (step 4: E1 and E3 running since 2026-10-15) with its floor measured, and diagnostic probes (2026-10-16: a GRU encoder learns the task, 0.100 against a floor of 0.085 and 0.144 for the clock), the xLSTM given the same time (it learns it too) and the 2 × 2 test of a ConvGRU front-end and dropping `tau` (2026-10-17: neither helps; the plain GRU reaches 0.097, results below); plain PPO with the frozen GRU prepared and next.
 
 **Question:** in hidden mode, is the bottleneck the context encoder or the policy?
 
@@ -1047,6 +1047,78 @@ The `find` floor is the ideal estimator's posterior mean of b0 on the first 200 
 - **Timing:** with 20 runs at once (1 thread each), about 9–14 minutes per pass, against about 3.5 minutes alone. The grid should take about 5–7 hours, and at most about 10.
 - **Planned launch:** 4 cells × 5 seeds, E1's target, patience 8, up to 40 passes, `--output-root runs_encoder/step4_grid`. Names: `E1_gru_point_main`, `E1_gru_notau_point_main`, `E1_convgru_point_main`, `E1_convgru_notau_point_main` (`_s0` to `_s4`).
 
+**The 2 × 2 results (launched 2026-10-16 21:00 UTC, all 20 runs done by 2026-10-17 07:09 UTC).**
+- **Timing:** 20 runs at once, 1 thread each, about 9–10 minutes per pass for the GRU cells and 12 for the ConvGRU cells.
+- **Run lengths:** 7 of the 20 runs used all 40 passes: three ConvGRU without `tau`, two ConvGRU, and seed 1 of both GRU cells. The others stopped after 24–32.
+
+| Cell (5 seeds) | Test error, mean (range) | Click at pass* | Gap closed** |
+|---|---:|---:|---:|
+| **GRU** (with `tau`) | **0.0972** (0.0955–0.0989) | 10–12 | **80%** |
+| GRU, no `tau` | 0.0974 (0.0954–0.0986) | 9–13 | 79% |
+| ConvGRU (with `tau`) | 0.0990 (0.0980–0.1001) | 13–19 | 77% |
+| ConvGRU, no `tau` | 0.0986 (0.0977–0.1005) | 14–16 | 77% |
+| Clock-only / floor (ideal estimator) | 0.144 / 0.085 | | 0% / 100% |
+
+\*First pass with validation below 0.115. \*\*(clock − encoder) / (clock − floor), on the test flights.
+
+**By the decision rules set before running:**
+- **Dropping `tau` makes no difference,** neither in the final error (0.0972 against 0.0974; 0.0990 against 0.0986) nor in when the click comes. So `tau` was not what made the clock shortcut "sticky": the network builds its own clock by counting steps.
+- **The ConvGRU front-end does not help:**
+  - The click comes later in every seed (pass 13–19 against 9–13).
+  - The final error is about 0.0015 higher, but the seed ranges overlap.
+  - The filter and MLP add more to learn before the click and nothing after it.
+- **No interaction:** both changes together don't help either.
+- **Patience helps a little:** the patient GRU reaches 0.097, against 0.100 for the earlier impatient GRU probes. The longest-trained seed (seed 1, 40 passes) reaches 0.0955.
+
+**Against the ideal estimator (test flights, mean of 5 seeds):**
+
+| | 0–1 s | 1–5 s | 5–10 s | 10–20 s | 20–35 s | Whole flight |
+|---|---:|---:|---:|---:|---:|---:|
+| GRU minus ideal estimate (RMS) | 0.034 | 0.042 | 0.046 | 0.047 | 0.043 | **0.045** |
+| ConvGRU minus ideal estimate | 0.038 | 0.047 | 0.050 | 0.050 | 0.045 | 0.048 |
+
+- **Error at 1 / 5 / 20 s:** GRU 0.142–0.143 / 0.105–0.107 / 0.084–0.089, against 0.136 / 0.096 / 0.072 for the ideal estimator.
+- **Per style, GRU against ideal:** `probe_hold` 0.081 / 0.068, `endurance` 0.064 / 0.055, `replay_good` 0.078 / 0.069, `cruise` 0.135 / 0.122, `steady_below` 0.147 / 0.144.
+- **The GRU's error is about 14% above the floor.** Its own extra error shrank from about 0.05 (the probes) to 0.045. It stays roughly constant through the flight, while the ideal estimator's error keeps shrinking.
+- **Conclusion:** better input processing is not the missing piece. The plain GRU is the best learned encoder. The remaining gap more likely needs a cleaner training signal (the ideal estimator as a teacher), more training or more data.
+
+**The easy environment (EASY_ENV_WARMUP.md), considered 2026-10-17 and kept as plan B.**
+- **It would probably help the encoder:** the forced 5-second full-throttle take-off is the `find` situation, which the GRU handles well (about 0.06–0.07 after 5 s, near the floor).
+- **Why not now:**
+  - PPO already did best with the ideal estimate, whose error early in each flight is just as large, so early uncertainty doesn't seem to block PPO.
+  - The easy version needs the environment, the learner, new pilot flights and all baselines redone.
+  - It weakens the autogenic claim.
+- **When to switch:** if PPO with the frozen GRU falls well short of the ideal estimate, and the shortfall comes from early in each flight.
+
+**Plain PPO with the frozen GRU (prepared 2026-10-17).** This tests whether a learned encoder is enough. It is step 2's test with the GRU's estimate in place of the ideal estimator's.
+- **Conditions:** `4a_encoder` / `4b_encoder` (`ppo/configs/experiment/S4a_encoder_bs256.yaml`, `S4b_encoder_bs1024.yaml`): the memoryless 0a / 0b learners in hidden mode, with the frozen encoder's battery estimate appended (`context.source=encoder`, `context.encoder_model`, `context.encoder_tag`).
+- **What else is the same:** a check confirms that everything except the context matches the memoryless runs and step 2's ideal-estimate runs: PPO settings, 2M steps, gamma 0.99, reward scale 0.1, 8 environments and the validation grid.
+- **W&B names carry the encoder,** e.g. `S4b_encoder_bs1024_E1_gru_point_main_s1_gamma0.99_rs0.1_s0`.
+- **Encoders, chosen by validation (not test):** the GRU cell's three best seeds, s1 (0.0945), s0 (0.0967) and s4 (0.0969).
+- **Design (32 runs at once, 1 thread each):**
+  - GRU s1 under both batch sizes, PPO seeds 0–7 (16 runs)
+  - GRU s0 and s4 under batch 1024, seeds 0–7 (16 runs), to see how much the encoder seed matters
+- **Seeds kept apart:**
+  - The encoders trained only on pilot flights with seeds 100,000–12,102,999 (their training, validation and test splits).
+  - The PPO runs use environment seeds 0–707 for training and 1000–1002 for validation. No flight is shared.
+  - The final-test seeds 2000–2002 are used nowhere.
+  - Some pilot flights were flown by PPO policies from earlier runs (seeds 0–7), but on their own environment seeds.
+- **Code:**
+  - `run_step0.py --encoder-models` runs each condition once per encoder file and puts each encoder in a report of its own.
+  - `report_step0.py` scores `4a_encoder` / `4b_encoder` like step 0: the late mean over 1.5M–2M and a final validation that reloads the frozen encoder.
+  - An encoder run refuses to start without both the encoder file and its name.
+- **Checks:** 82 in the project pass. A smoke run trained both conditions end to end and recorded the encoder's absolute path, its name, batch 256 / 1024, hidden mode and a policy input of 5 values.
+- **The frozen GRU's cost:** it slows environment stepping from about 24,000 to 16,000 steps per second. The runs should take about 30–60 minutes.
+- **Compare with** (late score, batch 256 / 1024): ideal estimate 283 / 323, true battery 246 / 258, memoryless 23 / 77. Then measure the encoder's error on the PPO policies' own flights.
+
+```bash
+G=runs_encoder/step4_grid
+nohup python run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models $G/E1_gru_point_main_s1/encoder.pt \
+  --seeds 0 1 2 3 4 5 6 7 --jobs 16 --threads 1 --output runs_step0/frozen_gru_a > run_frozen_gru_a.log 2>&1 &
+nohup python run_step0.py --conditions 4b_encoder --encoder-models $G/E1_gru_point_main_s0/encoder.pt $G/E1_gru_point_main_s4/encoder.pt \
+  --seeds 0 1 2 3 4 5 6 7 --jobs 16 --threads 1 --output runs_step0/frozen_gru_b > run_frozen_gru_b.log 2>&1 &
+```
+
 ```bash
 python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4      # E3: --design E3
 python step4_floor.py --output runs_encoder/step4/floor_v2_main --jobs 16           # about 3 minutes
@@ -1077,13 +1149,14 @@ Steps 1–5 originally listed 8 conditions × 3 seeds = 24 PPO runs: oracle, thr
    - Split by whole flights for validation. Keep some styles out entirely for the cross-pilot matrix.
    - Train until the validation loss plateaus. Reuse the enc1 training setup where it fits; its input is `pilots.load_flights` (observations, previous actions, true battery, style).
    - Save it so `FrozenEncoderContext` can load it. Done: each run saves `encoder_model.zip`, a Contextual_PPO model holding the best encoder.
-2. **Measure it before plugging it in** (section 4). The floor is measured (0.084 on validation, step 4 results above); the encoders close only 22–26% of the gap so far. The diagnostic probes (`step4_probes.py`) show that a GRU learns the task, to 0.100–0.101 on the test flights (73–75% of the gap), after a long plateau; next, the GRU with patient early stopping, the same chance for the xLSTM, then freezing the better one under plain PPO. Still to do:
+2. **Measure it before plugging it in** (section 4). The floor is measured (0.084 on validation, step 4 results above); the encoders close only 22–26% of the gap so far. The diagnostic probes (`step4_probes.py`) show that a GRU learns the task, to 0.100–0.101 on the test flights (73–75% of the gap), after a long plateau; the xLSTM learns it too given the same time; the 2 × 2 test (2026-10-17) leaves the plain GRU best at 0.097 on the test flights (80% of the gap). Still to do:
    - Error at 1, 5 and 20 s and over the whole flight, for each style.
    - Compare against the clock-only estimate and the ideal estimator (`step1_ideal_estimator.py`) on the same flights.
    - Run the leak test: test the `main_plus_aware` encoder on battery-blind pilots.
 3. **Freeze it under plain PPO**, with `context.source=encoder` and `context.encoder_model=...`. Use 8 seeds at step 0's settings (gamma 0.99, reward scale 0.1).
    - Compare against the ideal estimate (283 / 323), the true battery (246 / 258) and memoryless PPO (23 / 77).
    - Then the closed-loop check: the encoder's error on the PPO policy's own flights.
+   - Prepared 2026-10-17 with the best GRU encoders (step 4 above, "Plain PPO with the frozen GRU"). If it falls well short because of early-flight error, the easy environment is plan B.
 4. **Optional:**
    - Train on the ideal estimator as a teacher (section 3).
    - Freeze A's own encoder under plain PPO (step 2's next steps).

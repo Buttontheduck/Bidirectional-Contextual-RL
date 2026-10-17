@@ -1,0 +1,19 @@
+# @package _global_
+# ENCODER_PLAN.md, step 4 frozen under plain PPO, run 4a_encoder: the memoryless control 0a_blind (plain PPO in hidden mode,
+# batch 256) with a learned encoder's battery estimate appended to every observation (context_wrapper.py), the encoder
+# trained offline on the pilot flights and frozen: a GRU / ConvGRU encoder.pt (train_encoder.py --arch gru | convgru, or an
+# exported probe GRU) or an xLSTM encoder_model.zip. Compared with step 2's ideal estimate (2a_ideal), the true battery
+# (0a) and no battery (0a_blind), with the same learner and validation flights.
+#
+#   python run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models <encoder.pt ...> --seeds 0 1 2 3 4 5 6 7
+defaults:
+  - /experiment/S0a_blind_bs256
+  - _self_
+context:
+  source: encoder
+  # Required, checked before a run starts (context_wrapper.validate_context): context.encoder_model, the encoder file, and
+  # context.encoder_tag, its name in the W&B names; run_step0.py sets both from --encoder-models
+wandb:
+  run_name: S4a_encoder_bs256_${context.encoder_tag}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: S4a_encoder_bs256_${context.encoder_tag}_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, step4, frozen_encoder]

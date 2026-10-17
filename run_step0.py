@@ -23,6 +23,8 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7 \
         --jobs 32 --threads 1                               # step 2: plain PPO with the ideal battery estimate
     python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 3 4 5 6 7   # memoryless controls
+    python run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models runs_encoder/step4_grid/E1_gru_point_main_s1/encoder.pt \
+        --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1      # step 4: plain PPO with a frozen learned encoder, once per model
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
@@ -83,6 +85,8 @@ CONDITIONS = {
     "2b_ideal": ("ppo/main_battery_plane_ppo.py", "+experiment=S2b_ideal_bs1024", "ppo"),
     "2a_ideal_std": ("ppo/main_battery_plane_ppo.py", "+experiment=S2a_ideal_std_bs256", "ppo"),
     "2b_ideal_std": ("ppo/main_battery_plane_ppo.py", "+experiment=S2b_ideal_std_bs1024", "ppo"),
+    "4a_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4a_encoder_bs256", "ppo"),
+    "4b_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4b_encoder_bs1024", "ppo"),
 }
 # Extra overrides of a condition (the in-flight configs default to the sharp profile)
 CONDITION_OVERRIDES = {name: ["env.battery_noise_flight=linear"] for name in ("1a_linear", "1b_linear", "1c_linear")}
@@ -95,6 +99,8 @@ INFLIGHT_CONDITIONS = ["1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_line
 BLIND_CONDITIONS = ["0a_blind", "0b_blind", "0c_blind"]
 # Ideal context -> its report group: the estimate alone, or with its std (report_step0.py never mixes the two)
 IDEAL_CONDITIONS = {"2a_ideal": "ideal", "2b_ideal": "ideal", "2a_ideal_std": "ideal_std", "2b_ideal_std": "ideal_std"}
+# Frozen learned encoders (step 4): every run once per --encoder-models file, each encoder in a report of its own
+ENCODER_CONDITIONS = ["4a_encoder", "4b_encoder"]
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -115,14 +121,25 @@ def physical_cores() -> int:
     return len(cores)
 
 
-def launch_name(condition: str, seed: int, reward_scale: float | None = None, battery_noise: float | None = None) -> str:
-    """Name of one run's log: 0a_s0, with the reward scale and battery noise the launch sets, e.g. 1c_noise0.06_s0."""
+def launch_name(condition: str, seed: int, reward_scale: float | None = None, battery_noise: float | None = None,
+                encoder: Path | None = None) -> str:
+    """Name of one run's log: 0a_s0, with the reward scale, battery noise and frozen encoder the launch sets, e.g.
+    1c_noise0.06_s0 or 4b_encoder_E1_gru_point_main_s1_s0."""
     parts = [condition]
     if reward_scale is not None:
         parts.append(f"rs{reward_scale:g}")
     if battery_noise is not None:
         parts.append(f"noise{battery_noise:g}")
+    if encoder is not None:
+        parts.append(encoder_tag(encoder))
     return "_".join([*parts, f"s{seed}"])
+
+
+def encoder_tag(path: Path) -> str:
+    """An encoder file's name in run names: its run directory's name for encoder.pt / encoder_model.zip, else its stem."""
+    path = Path(path)
+    name = path.parent.name if path.name in ("encoder.pt", "encoder_model.zip", "final_model.zip") else path.stem
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", name)
 
 
 def switch_sources(runs_files: list[Path], reward_scale: float) -> dict[tuple[str, int], Path]:
@@ -152,14 +169,17 @@ def switch_sources(runs_files: list[Path], reward_scale: float) -> dict[tuple[st
 
 def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bool = False,
                 reward_scale: float | None = None, study: str | None = None,
-                battery_noise: float | None = None, init_model: Path | None = None) -> list[str]:
+                battery_noise: float | None = None, init_model: Path | None = None, encoder: Path | None = None) -> list[str]:
     script, experiment, learner = CONDITIONS[condition]
     command = [
         sys.executable, str(ROOT / script), experiment, f"training.seed={seed}",
         *CONDITION_OVERRIDES.get(condition, []), f"training.num_threads={threads}", "training.num_interop_threads=1",
         # Hydra's job log; the training scripts never change directory
-        f"hydra.run.dir={json.dumps(str(output / 'hydra' / launch_name(condition, seed, reward_scale, battery_noise)))}",
+        f"hydra.run.dir={json.dumps(str(output / 'hydra' / launch_name(condition, seed, reward_scale, battery_noise, encoder)))}",
     ]
+    if encoder is not None:
+        # Step 4: the frozen encoder, and its name in the W&B name and group
+        command += [f"context.encoder_model={json.dumps(str(Path(encoder).resolve()))}", f"context.encoder_tag={encoder_tag(encoder)}"]
     if reward_scale is not None:
         # The configs build the W&B name and group from it
         command.append(f"{learner}.reward_scale={reward_scale:g}")
@@ -211,8 +231,10 @@ class Launcher:
                     pass
 
     def run_one(self, condition: str, seed: int, reward_scale: float | None = None,
-                battery_noise: float | None = None) -> dict:
-        name = launch_name(condition, seed, reward_scale, battery_noise)
+                battery_noise: float | None = None, encoder: Path | None = None) -> dict:
+        name = launch_name(condition, seed, reward_scale, battery_noise, encoder)
+        identity = {"encoder_model": None if encoder is None else str(Path(encoder).resolve()),
+                    "encoder_tag": None if encoder is None else encoder_tag(encoder)}
         log = self.args.output / f"{name}.log"
         environment = child_environment(self.args.threads)
         if self.args.smoke or self.args.wandb_mode is not None:
@@ -222,10 +244,10 @@ class Launcher:
             with self.lock:
                 if self.stopping.is_set():
                     return {"condition": condition, "seed": seed, "reward_scale": reward_scale,
-                            "battery_noise": battery_noise, "status": "not started", "log": str(log)}
+                            "battery_noise": battery_noise, **identity, "status": "not started", "log": str(log)}
                 process = subprocess.Popen(
                     command_for(condition, seed, self.args.threads, self.args.output, self.args.smoke, reward_scale,
-                                self.args.study, battery_noise, self.init_model(condition, seed)),
+                                self.args.study, battery_noise, self.init_model(condition, seed), encoder),
                     cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
                 )
                 self.children.add(process)
@@ -242,7 +264,7 @@ class Launcher:
         status = "done" if run_dir else "failed"
         print(f"{status.upper()} {name} | {minutes:.1f} min | "
               + (f"run: {run_dir}" if run_dir else f"exit {code}, see {log}"), flush=True)
-        return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "battery_noise": battery_noise,
+        return {"condition": condition, "seed": seed, "reward_scale": reward_scale, "battery_noise": battery_noise, **identity,
                 "init_model": None if self.init_model(condition, seed) is None else str(self.init_model(condition, seed)),
                 "status": status, "exit_code": code, "minutes": round(minutes, 2),
                 "log": str(log), "run_dir": run_dir}
@@ -261,6 +283,9 @@ def parse_args(argv=None):
                         help="Late switch: runs.json files of the step 0 launches whose final models it continues")
     parser.add_argument("--source-reward-scale", type=float, default=0.1,
                         help="Late switch: the reward scale of the step 0 models to continue (default 0.1)")
+    parser.add_argument("--encoder-models", type=Path, nargs="+", default=None,
+                        help="Step 4's frozen-encoder conditions only: run every condition and seed once per encoder file "
+                             "(an encoder.pt of recurrent_encoders.py or a Contextual_PPO .zip)")
     parser.add_argument("--jobs", type=int, default=physical_cores(), help="Runs at the same time (default: physical cores)")
     parser.add_argument("--threads", type=int, default=2, help="CPU threads per run (default: 2)")
     parser.add_argument("--study", default=None,
@@ -288,6 +313,18 @@ def parse_args(argv=None):
             parser.error(f"--battery-noises applies to the step 1 conditions {step1} only")
         if 0 in noises and not set(args.conditions) <= set(SWITCH_SOURCES):
             parser.error("Battery noise 0 is the late switch's control; the noisy oracle and early noise need noise > 0")
+    encoding = [condition for condition in args.conditions if condition in ENCODER_CONDITIONS]
+    if encoding and not args.encoder_models:
+        parser.error(f"{encoding} need --encoder-models: the frozen encoders to train on top of")
+    if args.encoder_models:
+        if not set(args.conditions) <= set(ENCODER_CONDITIONS):
+            parser.error(f"--encoder-models applies to the frozen-encoder conditions {ENCODER_CONDITIONS} only")
+        for path in args.encoder_models:
+            if not path.is_file() or path.suffix not in (".pt", ".zip"):
+                parser.error(f"--encoder-models: {path} is not an encoder file (.pt or .zip)")
+        tags = [encoder_tag(path) for path in args.encoder_models]
+        if len(set(tags)) != len(tags):
+            parser.error(f"--encoder-models: two encoders would share a run name ({tags})")
     switching = [condition for condition in args.conditions if condition in SWITCH_SOURCES]
     args.sources = {}
     if switching:
@@ -308,21 +345,22 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     # Seeds outer: with fewer job slots than runs, every condition still progresses
-    scales, noises = args.reward_scales or [None], args.battery_noises or [None]
-    runs = [(condition, seed, scale, noise) for scale in scales for noise in noises for seed in args.seeds
-            for condition in args.conditions]
+    scales, noises, encoders = args.reward_scales or [None], args.battery_noises or [None], args.encoder_models or [None]
+    runs = [(condition, seed, scale, noise, encoder) for scale in scales for noise in noises for encoder in encoders
+            for seed in args.seeds for condition in args.conditions]
     at_once = min(args.jobs, len(runs))
     described = "" if args.reward_scales is None else f" x reward scales {[f'{scale:g}' for scale in scales]}"
     described += "" if args.battery_noises is None else f" x battery noises {[f'{noise:g}' for noise in noises]}"
+    described += "" if args.encoder_models is None else f" x encoders {[encoder_tag(e) for e in encoders]}"
     print(f"{len(runs)} runs ({' '.join(args.conditions)} x seeds {args.seeds}{described}): {at_once} at once x "
           f"{args.threads} threads | {physical_cores()} physical cores, {os.cpu_count()} hardware threads", flush=True)
     if at_once * args.threads > os.cpu_count():
         print(f"Note: {at_once * args.threads} threads exceed the {os.cpu_count()} hardware threads", flush=True)
     if args.dry_run:
         launcher = Launcher(args)
-        for condition, seed, scale, noise in runs:
+        for condition, seed, scale, noise, encoder in runs:
             print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke, scale, args.study, noise,
-                                         launcher.init_model(condition, seed))))
+                                         launcher.init_model(condition, seed), encoder)))
         return 0
     args.output.mkdir(parents=True, exist_ok=False)
     print(f"Logs: {args.output}", flush=True)
@@ -334,7 +372,8 @@ def main(argv=None) -> int:
 
     previous = signal.signal(signal.SIGTERM, terminate)
     pool = ThreadPoolExecutor(max_workers=at_once)
-    futures = [pool.submit(launcher.run_one, condition, seed, scale, noise) for condition, seed, scale, noise in runs]
+    futures = [pool.submit(launcher.run_one, condition, seed, scale, noise, encoder)
+               for condition, seed, scale, noise, encoder in runs]
     try:
         results = [future.result() for future in as_completed(futures)]
     except BaseException:
@@ -346,8 +385,8 @@ def main(argv=None) -> int:
         pool.shutdown(wait=True, cancel_futures=True)
         signal.signal(signal.SIGTERM, previous)
 
-    results.sort(key=lambda result: (-(result["reward_scale"] or 0), result["battery_noise"] or 0, result["condition"],
-                                     result["seed"]))
+    results.sort(key=lambda result: (-(result["reward_scale"] or 0), result["battery_noise"] or 0, result["encoder_tag"] or "",
+                                     result["condition"], result["seed"]))
     (args.output / "runs.json").write_text(json.dumps(results, indent=2) + "\n")
     done = [result for result in results if result["status"] == "done"]
     failed = len(results) - len(done)
@@ -364,17 +403,21 @@ def report_commands(done: list[dict], scales: list, noises: list, output: Path) 
     profile and context, e.g. "Report (battery noise 0.06): python report_step0.py --run 1a ... --output
     .../step0_report_noise0.06.json".
     """
-    def variant(condition):
+    def variant(result):
+        condition = result["condition"]
         if condition in INFLIGHT_CONDITIONS:
             return condition.split("_")[1]
+        if condition in ENCODER_CONDITIONS:
+            return f"encoder_{result['encoder_tag']}"
         return IDEAL_CONDITIONS.get(condition)
 
+    encoder_variants = sorted({variant(r) for r in done if r["condition"] in ENCODER_CONDITIONS})
     lines = []
     for scale in scales:
         for noise in noises:
-            for flight in (None, "sharp", "linear", "ideal", "ideal_std"):
+            for flight in (None, "sharp", "linear", "ideal", "ideal_std", *encoder_variants):
                 group = [r for r in done if r["reward_scale"] == scale and r["battery_noise"] == noise
-                         and variant(r["condition"]) == flight]
+                         and variant(r) == flight]
                 if group:
                     lines.append(report_command(group, scale, noise, flight, output))
     return lines
@@ -389,7 +432,8 @@ def report_command(group: list[dict], scale, noise, flight, output: Path) -> str
         labels.append(f"battery noise {noise:g}")
         suffix += f"_noise{noise:g}"
     if flight is not None:
-        labels.append({"ideal": "ideal context", "ideal_std": "ideal context with its std"}.get(flight, f"{flight} in-flight noise"))
+        labels.append({"ideal": "ideal context", "ideal_std": "ideal context with its std"}.get(
+            flight, f"frozen encoder {flight[len('encoder_'):]}" if flight.startswith("encoder_") else f"{flight} in-flight noise"))
         suffix += f"_{flight}"
     label = f" ({', '.join(labels)})" if labels else ""
     report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)

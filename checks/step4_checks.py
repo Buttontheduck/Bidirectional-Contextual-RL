@@ -364,7 +364,8 @@ class Step4Checks(unittest.TestCase):
             path = Path(folder) / "encoder.pt"
             R.save_encoder(self.small_encoder("convgru", True, aux=False), path)
             cfg = plain_ppo_config("+experiment=S0a_blind_bs256", *PLAIN_SMALL, "context.source=encoder",
-                                   f"context.encoder_model={path}", "evaluation.reset_grid.eval_initial_battery=[0.3]")
+                                   f"context.encoder_model={path}", "context.encoder_tag=small",
+                                   "evaluation.reset_grid.eval_initial_battery=[0.3]")
             script.validate_ppo(cfg)
             env = script.make_train_env(cfg)
             self.assertIsInstance(env, ContextVecEnv)
@@ -380,6 +381,72 @@ class Step4Checks(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "encoder_model must be"):
                 script.validate_ppo(plain_ppo_config("+experiment=S0a_blind_bs256", *PLAIN_SMALL, "context.source=encoder",
                                                      f"context.encoder_model={other}"))
+
+    def test_frozen_encoder_runs_differ_from_the_memoryless_and_ideal_runs_only_in_the_context(self):
+        from omegaconf import OmegaConf
+
+        from checks.step0_checks import plain_ppo_config, plain_ppo_script
+        import report_step0
+        import run_step0
+
+        script = plain_ppo_script()
+        with tempfile.TemporaryDirectory() as folder:
+            first, second = Path(folder) / "E1_gru_point_main_s1", Path(folder) / "E1_gru_point_main_s0"
+            for run in (first, second):
+                run.mkdir()
+                R.save_encoder(self.small_encoder("gru", False, aux=False), run / "encoder.pt")
+            model = first / "encoder.pt"
+            for condition, name, blind_name, ideal_name in (("4a_encoder", "S4a_encoder_bs256", "S0a_blind_bs256", "S2a_ideal_bs256"),
+                                                            ("4b_encoder", "S4b_encoder_bs1024", "S0b_blind_bs1024", "S2b_ideal_bs1024")):
+                with self.subTest(condition=condition):
+                    # The launcher's command, composed as the training script composes it
+                    command = run_step0.command_for(condition, 5, 1, Path(folder) / "launch", encoder=model)
+                    cfg = plain_ppo_config(*[item for item in command[2:] if not item.startswith("hydra.")])
+                    blind, ideal = plain_ppo_config(f"+experiment={blind_name}"), plain_ppo_config(f"+experiment={ideal_name}")
+                    script.validate_ppo(cfg)
+                    for section in ("env", "ppo", "training", "evaluation"):
+                        self.assertEqual(OmegaConf.to_container(cfg[section]), OmegaConf.to_container(blind[section]) | (
+                            {"seed": 5, "num_threads": 1, "num_interop_threads": 1} if section == "training" else {}))
+                        if section != "training":
+                            self.assertEqual(cfg[section], ideal[section])
+                    self.assertEqual((cfg.context.source, cfg.context.encoder_model, cfg.context.encoder_tag),
+                                     ("encoder", str(model.resolve()), "E1_gru_point_main_s1"))
+                    self.assertEqual(cfg.wandb.run_name, f"{name}_E1_gru_point_main_s1_gamma0.99_rs0.1_s5")
+                    self.assertEqual(cfg.wandb.group, f"{name}_E1_gru_point_main_s1_gamma0.99_rs0.1")
+                    # Scored like step 0: the memoryless run's protocol plus the frozen encoder
+                    protocol = report_step0.evaluation_protocol(cfg, condition)
+                    blind_protocol = report_step0.evaluation_protocol(blind, blind_name.replace("S0", "0").split("_bs")[0])
+                    self.assertEqual({key for key in protocol if protocol[key] != blind_protocol[key]}, {"context"})
+                    self.assertEqual(protocol["context"], {"source": "encoder", "encoder_model": str(model.resolve())})
+            # The encoder's file and its name must be given
+            with self.assertRaisesRegex(ValueError, "context.encoder_model"):
+                script.validate_ppo(plain_ppo_config("+experiment=S4a_encoder_bs256"))
+            with self.assertRaisesRegex(ValueError, "context.encoder_tag"):
+                script.validate_ppo(plain_ppo_config("+experiment=S4a_encoder_bs256", f"context.encoder_model={model}"))
+            # Mislabeled runs are rejected
+            with self.assertRaisesRegex(ValueError, "context.source=encoder"):
+                report_step0.evaluation_protocol(plain_ppo_config("+experiment=S0a_blind_bs256"), "4a_encoder")
+            with self.assertRaisesRegex(ValueError, "no frozen context"):
+                report_step0.evaluation_protocol(cfg, "0b_blind")
+            # The launcher: every run once per encoder; the encoder conditions need models, and models need them
+            args = run_step0.parse_args(["--conditions", "4a_encoder", "4b_encoder", "--encoder-models", str(model),
+                                         str(second / "encoder.pt"), "--seeds", "0", "1", "--output", str(Path(folder) / "out")])
+            self.assertEqual(len(args.encoder_models), 2)
+            self.assertEqual(run_step0.launch_name("4b_encoder", 3, encoder=model), "4b_encoder_E1_gru_point_main_s1_s3")
+            for argv in (["--conditions", "4a_encoder"], ["--conditions", "0a", "--encoder-models", str(model)],
+                         ["--conditions", "4a_encoder", "--encoder-models", str(Path(folder) / "missing.pt")],
+                         ["--conditions", "4a_encoder", "--encoder-models", str(model), str(model)]):
+                with self.assertRaises(SystemExit, msg=argv):
+                    run_step0.parse_args([*argv, "--output", str(Path(folder) / "refused")])
+            # One report per encoder (report_step0 refuses mixed protocols and repeated condition/seed pairs)
+            runs = [{"condition": c, "seed": s, "reward_scale": None, "battery_noise": None, "encoder_tag": tag,
+                     "run_dir": f"/r/{c}{tag}{s}"} for c in ("4a_encoder", "4b_encoder") for s in (0, 1)
+                    for tag in ("E1_gru_point_main_s1", "E1_gru_point_main_s0")]
+            lines = run_step0.report_commands(runs, [None], [None], Path("/out"))
+            self.assertEqual([line.split(":")[0] for line in lines], ["Report (frozen encoder E1_gru_point_main_s0)",
+                                                                      "Report (frozen encoder E1_gru_point_main_s1)"])
+            self.assertTrue(all(line.count("--run ") == 4 for line in lines))
+            self.assertTrue(lines[1].endswith("step0_report_encoder_E1_gru_point_main_s1.json"))
 
     @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
     def test_probe_gru_exports_exactly_and_new_architectures_train_resume_and_finalize(self):

@@ -11,6 +11,8 @@ env.battery_noise_until (500k), then the true battery; scored like step 0, the f
 1a_sharp ... 1c_linear see the noise early in every flight and the exact battery from flight step 350 (in-flight noise).
 2a_ideal, 2b_ideal (and _std) are step 2's ideal context: plain PPO in hidden mode with the ideal estimator's battery
 estimate (and its std) appended to the observation; each variant in a report of its own.
+4a_encoder, 4b_encoder are step 4's frozen encoders: plain PPO in hidden mode (0a / 0b's learner) with a learned
+encoder's battery estimate appended to the observation (context.encoder_model); each encoder in a report of its own.
 0a_blind, 0b_blind, 0c_blind are the memoryless controls: 0a, 0b, 0c in hidden mode, without the battery and without
 memory (0c_blind: CPPO with no context, cppo.context_source=none). They share A's protocol, so one report can hold A and
 the three of them.
@@ -42,12 +44,14 @@ from contextual_ppo.torch_layers import XLSTMRolloutEncoder
 
 CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch", "1a_early", "1b_early", "1c_early",
               "1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear", "0a_blind", "0b_blind", "0c_blind",
-              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std")
+              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std", "4a_encoder", "4b_encoder")
 # Memoryless controls: the step 0 run each condition repeats in hidden mode, without the battery and without memory
 BLIND = {"0a_blind": "0a", "0b_blind": "0b", "0c_blind": "0c"}
 # Step 2's ideal context: the step 0 learner each condition uses in hidden mode, with the ideal estimator's estimate
 # appended (context_wrapper.py), and whether its std is appended too
 IDEAL_CONTEXT = {"2a_ideal": ("0a", False), "2b_ideal": ("0b", False), "2a_ideal_std": ("0a", True), "2b_ideal_std": ("0b", True)}
+# Step 4's frozen encoders: the step 0 learner each condition uses in hidden mode, with a learned encoder's estimate appended
+ENCODER_CONTEXT = {"4a_encoder": "0a", "4b_encoder": "0b"}
 # Step 1's noisy oracle: the step 0 run each condition repeats with noise on the battery
 NOISY_REPEATS = {"1a": "0a", "1b": "0b", "1c": "0c"}
 # Step 1's late switch: the step 0 run whose final model each condition keeps training
@@ -86,6 +90,8 @@ def run_kind(condition: str) -> str:
         return INFLIGHT_NOISE[condition][0]
     if condition in IDEAL_CONTEXT:
         return IDEAL_CONTEXT[condition][0]
+    if condition in ENCODER_CONTEXT:
+        return ENCODER_CONTEXT[condition]
     return (NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition)
             or BLIND.get(condition) or condition)
 
@@ -113,6 +119,9 @@ def evaluation_protocol(cfg, condition: str) -> dict:
         include_std = IDEAL_CONTEXT[condition][1]
         if context is None or context["source"] != "ideal" or context["include_std"] != include_std:
             raise ValueError(f"{condition} requires context.source=ideal with context.include_std={include_std}")
+    elif condition in ENCODER_CONTEXT:
+        if context is None or context["source"] != "encoder" or not context.get("encoder_model"):
+            raise ValueError(f"{condition} requires context.source=encoder with context.encoder_model")
     elif context is not None:
         raise ValueError(f"{condition} requires no frozen context (context.source=none)")
     if (until is not None) != (condition in EARLY_NOISE):
@@ -125,7 +134,7 @@ def evaluation_protocol(cfg, condition: str) -> dict:
         raise ValueError(f"{condition} " + ("must continue a saved step 0 model (training.init_model)" if schedule == "switch"
                                             else "must start from scratch (no training.init_model)"))
     # A, the memoryless controls and the ideal context see no battery
-    mode = "hidden" if kind == "A" or condition in BLIND or condition in IDEAL_CONTEXT else "observed"
+    mode = "hidden" if kind == "A" or condition in BLIND or condition in IDEAL_CONTEXT or condition in ENCODER_CONTEXT else "observed"
     if cfg.env.observation_mode != mode:
         raise ValueError(f"Step 0 requires env.observation_mode={mode} for {condition}")
     if not cfg.evaluation.deterministic or int(cfg.evaluation.frequency) != EVAL_FREQUENCY:

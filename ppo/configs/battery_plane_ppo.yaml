@@ -114,6 +114,8 @@ context:
   # encoder: a Contextual_PPO final_model.zip / encoder_model.zip (its xLSTM encoder), or an encoder.pt of
   # recurrent_encoders.py (train_encoder.py --arch gru | convgru, or an exported probe GRU), frozen and read by this run
   encoder_model: null
+  # encoder: the encoder's name in the W&B names of the step 4 frozen-encoder runs (S4a/S4b_encoder; run_step0.py sets it)
+  encoder_tag: null
 
 evaluation:
   # In ENVIRONMENT steps, exactly like the SAC config (the script converts it to SB3's

@@ -304,6 +304,9 @@ def validate_context(cfg, env_kwargs: dict) -> None:
         if encoder_model_path(cfg).suffix not in (".zip", ".pt"):
             raise ValueError(f"context.encoder_model must be a .zip (Contextual_PPO) or a .pt (recurrent_encoders.py), "
                              f"got {encoder_model_path(cfg).name}")
+        if not context.get("encoder_tag"):
+            raise ValueError("context.source=encoder needs context.encoder_tag: the encoder's name in the W&B names "
+                             "(run_step0.py sets it from --encoder-models)")
 
 
 def make_context_source(cfg, n_envs: int, env_kwargs: dict) -> ContextSource | None:
