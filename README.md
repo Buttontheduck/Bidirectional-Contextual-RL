@@ -226,27 +226,40 @@ Stable-Baselines3 PPO with a recurrent context encoder. It doesn't depend on Bat
 
 ## 6. Where things stand (2026-10-18)
 
-Details, tables and W&B groups are in `ENCODER_PLAN.md`. Scores are mean validation returns over the last quarter of training (1.5M–2M steps) unless noted.
+Details, tables and W&B groups are in `ENCODER_PLAN.md`.
+- **Validation:** the mean validation return over the last quarter of training (1.5M–2M steps).
+- **Final test:** the final checkpoint on the reserved final-test flights (seeds 2000–2002), used once, after all training and selection (`evaluate_final_test.py --reports`).
+- **Flights completed:** on the final test where there is one, otherwise on validation.
 
-| Agent | Battery | Memory | Return | Flights completed |
-|---|---|---|---:|---:|
-| Plain PPO, hidden mode (batch 256 / 1024) | No | No | 23 / 77 | 26% / 15% |
-| Contextual PPO with no context | No | No | 115 | 25% |
-| Plain PPO, observed mode (batch 256 / 1024) | Yes | No | 246 / 258 | 88% / 86% |
-| Contextual PPO with the true battery | Yes | Oracle | 282 | 86% |
-| Contextual PPO with its learned encoder (experiment A rerun, 3 seeds) | No, inferred | xLSTM | 22 | 17% |
-| Plain PPO with the ideal estimate (batch 256 / 1024) | No, estimated perfectly | Frozen ideal estimator | 283 / 323 | 88% / 92% |
-| Contextual PPO with a GRU encoder trained jointly (best rung, J1, 5 seeds) | No, inferred | GRU | 114 | 23% |
-| Plain PPO with a frozen GRU trained offline on the true battery (batch 256 / 1024) | No, inferred | Frozen GRU | 209 / 164 | 88% / 73% |
-| **Plain PPO with a frozen GRU trained offline on the ideal estimate** (batch 256 / 1024) | No, inferred | Frozen GRU (teacher T1) | **291 / 262** | 81% / 73% |
+| Agent | Battery | Memory | Validation | Final test | Flights completed |
+|---|---|---|---:|---:|---:|
+| Plain PPO, hidden mode (batch 256 / 1024) | No | No | 23 / 77 | 49 / 119 | 25% / 17% |
+| Contextual PPO with no context | No | No | 115 | – | 25% |
+| Plain PPO, observed mode (batch 256 / 1024) | Yes | No | 246 / 258 | 283 / 280 | 90% / 92% |
+| Contextual PPO with the true battery | Yes | Oracle | 282 | – | 86% |
+| Contextual PPO with its learned encoder (experiment A rerun, 3 seeds) | No, inferred | xLSTM | 22 | – | 17% |
+| Plain PPO with the ideal estimate (batch 256 / 1024) | No, estimated perfectly | Frozen ideal estimator | 283 / 323 | 316 / 348 | 97% / 97% |
+| Contextual PPO with a GRU encoder trained jointly (best rung, J1, 5 seeds) | No, inferred | GRU | 114 | – | 23% |
+| Plain PPO with a frozen GRU trained offline on the true battery (batch 256 / 1024) | No, inferred | Frozen GRU | 209 / 164 | 238 / 184 | 92% / 76% |
+| **Plain PPO with a frozen GRU trained offline on the ideal estimate** (batch 256 / 1024) | No, inferred | Frozen GRU (teacher T1) | **291 / 262** | **330 / 319** | 86% / 76% |
 
-All rows: discount 0.99, reward scale 0.1, 2M steps, the same 18 validation flights. Seeds 0–7, except the A rerun (0–2) and joint training (0–4).
+All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. Seeds 0–7, except the A rerun (0–2) and joint training (0–4). The Contextual PPO rows have not been run on the final test (–).
+
+**On the final test:**
+- **The validation ranking and gaps hold.** Every condition scores 20–51 points higher, because these flights are a little easier, but about equally.
+- **The teacher-trained GRU is on a level with the ideal estimate:** 330 against 316 at batch 256, and 319 against 348 at batch 1024. Neither difference is significant at 8 seeds.
+- **It scores above the true battery** (+47 / +38, not significant).
+- **It clearly beats the GRU trained on the true battery at batch 256:** +92, p < 0.001 (Welch's t-test).
+- **The scale from no memory (0%) to the ideal estimate (100%), batch 256 / 1024:**
+  - GRU trained on the true battery: 71% / 53%
+  - teacher-trained GRU: 105% / 87%
+  - true battery: 88% / 71%
 - **The frozen-GRU rows** use the encoder seed with the best validation error.
 - **GRU trained on the true battery:**
-  - At batch 256, all 8 seeds score 167–261.
-  - At batch 1024, one seed collapsed (−294), so the median, 218, is the fairer summary.
-  - Other encoder seeds at batch 1024 score 179 and 120.
-- **GRU trained on the ideal estimate:** all seeds score 216–333 at batch 256 and 189–316 at batch 1024, with no collapse. Only one encoder seed has been tested so far.
+  - At batch 256, all 8 seeds score 167–261 on validation.
+  - At batch 1024, one seed collapsed (−294 on validation, −299 on the final test), so the median, 218, is the fairer summary.
+  - Other encoder seeds at batch 1024 score 179 and 120 on validation, and 240 and 152 on the final test.
+- **GRU trained on the ideal estimate:** all seeds score 216–333 at batch 256 and 189–316 at batch 1024 on validation, with no collapse; on the final test the worst seed scores 250 / 220. Only one encoder seed has been tested so far.
 
 **Battery estimates on held-out pilot flights** (error in battery units, 1,900 test flights of 11 pilot styles):
 
@@ -302,6 +315,7 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 - plain PPO with the frozen encoder, and its closed-loop check
 - joint training of Contextual PPO with a GRU encoder (J0–J5)
 - the ideal estimator as a teacher (T1, T2), and plain PPO with the frozen teacher-trained GRU
+- the final test of the plain-PPO conditions (memoryless, true battery, ideal estimate, both frozen GRUs)
 
 **Next steps** (`ENCODER_PLAN.md`):
 
