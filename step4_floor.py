@@ -8,7 +8,8 @@ with the same inputs and prior can beat it on average, so its error is the floor
 It runs over the validation and test flights of a pilot mix (the split of train_encoder.py, by flight seed; the
 training flights are used only for the clock-only estimate) and reports its error in train_encoder.py's format:
 overall, at 1, 5 and 20 s into the flight, and per style, next to the clock-only estimate. It never reads the battery,
-the starting battery or the speed except as the error's reference.
+the starting battery or the speed except as the error's reference. --splits train validation test adds the training
+flights: the teacher targets of train_encoder.py --target teacher (the clock-only error on them is in-sample).
 
 Outputs (--output, e.g. runs_encoder/step4/floor_v2_main):
     floor.json      errors per split, the estimator's calibration (mean squared error / its own variance, 1 when its
@@ -18,6 +19,7 @@ Outputs (--output, e.g. runs_encoder/step4/floor_v2_main):
                     comparisons with the encoders, and teacher targets (ENCODER_PLAN.md, section 3)
 
     nohup nice -n 10 python step4_floor.py --output runs_encoder/step4/floor_v2_main --jobs 16 > floor.log 2>&1 &   # ~4 min
+    nohup python step4_floor.py --splits train validation test --output runs_encoder/step4/teacher_v2_main --jobs 30 > teacher.log 2>&1 &
 
 No randomness: the estimator is deterministic (its replay planes have a fixed seed and no speed noise), and the script
 opens no environment seeds. It imports neither torch nor W&B.
@@ -42,7 +44,8 @@ import numpy as np
 
 import train_encoder as T
 
-SPLITS = ("validation", "test")
+SPLITS = ("train", "validation", "test")
+DEFAULT_SPLITS = ("validation", "test")
 
 
 def estimate_flights(flights: list[tuple[int, np.ndarray, np.ndarray]], grid: dict, env_kwargs: dict) -> list[dict]:
@@ -116,7 +119,10 @@ def main(argv=None) -> None:
     parser.add_argument("--vx-points", type=int, default=301)
     parser.add_argument("--prune-below", type=float, default=30.0, help="Log weight below the best candidate to drop")
     parser.add_argument("--max-flights", type=int, default=None, help="Only some flights of each split (checks)")
+    parser.add_argument("--splits", nargs="+", choices=SPLITS, default=list(DEFAULT_SPLITS),
+                        help="Flights to estimate; add train for teacher targets")
     args = parser.parse_args(argv)
+    splits = [s for s in SPLITS if s in args.splits]
     if args.output.exists() and any(args.output.iterdir()):
         parser.error(f"{args.output} is not empty: choose another --output")
 
@@ -131,28 +137,28 @@ def main(argv=None) -> None:
     grid = {"b_points": args.b_points, "vx_points": args.vx_points, "prune_below": args.prune_below}
     clock = T.clock_estimate(flights, flights.indices("train"))
 
-    rows = {split: flights.indices(split) for split in SPLITS}
-    estimates = run_estimator(flights, np.concatenate([rows[s] for s in SPLITS]), grid, env_kwargs, args.jobs, args.chunk)
-    result = {"data": str(args.data), "mix": args.mix, "grid": grid, "env_kwargs": env_kwargs, "steps_at": steps_at,
+    rows = {split: flights.indices(split) for split in splits}
+    estimates = run_estimator(flights, np.concatenate([rows[s] for s in splits]), grid, env_kwargs, args.jobs, args.chunk)
+    result = {"data": str(args.data), "mix": args.mix, "splits": splits, "grid": grid, "env_kwargs": env_kwargs, "steps_at": steps_at,
               "split_rule": f"train_encoder.split_of (flight seed % {T.SPLIT_MODULUS})", "max_flights": args.max_flights,
               "data_manifest_sha256": T.sha256(args.data / "manifest.json"),
               "code_sha256": {name: T.sha256(T.PROJECT_ROOT / name)
                               for name in ("step4_floor.py", "step1_ideal_estimator.py", "train_encoder.py", "battery_plane.py")},
               "git": T.git_state(), "created": datetime.now().isoformat(timespec="seconds")}
-    for split in SPLITS:
+    for split in splits:
         result[split] = summarize(flights, rows[split], estimates, steps_at)
         result[f"clock_{split}"] = T.evaluate_clock(clock, flights, rows[split], steps_at)
     result["minutes"] = (time.time() - started) / 60
 
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "floor.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
-    seeds = [int(flights.seeds[i]) for split in SPLITS for i in rows[split]]
+    seeds = [int(flights.seeds[i]) for split in splits for i in rows[split]]
     lengths = [len(estimates[s]["means"]) for s in seeds]
     np.savez_compressed(args.output / "estimates.npz", seeds=np.array(seeds), flight_offsets=np.concatenate([[0], np.cumsum(lengths)]),
                         splits=np.array([T.split_of(s) for s in seeds]),
                         means=np.concatenate([estimates[s]["means"] for s in seeds]),
                         stds=np.concatenate([estimates[s]["stds"] for s in seeds]))
-    for split in SPLITS:
+    for split in splits:
         r, c = result[split], result[f"clock_{split}"]
         print(f"{split}: floor rmse {r['rmse']:.4f} (at 1/5/20 s: " + " / ".join(f"{v:.4f}" for v in r["rmse_at"].values())
               + f"), clock only {c['rmse']:.4f}, calibration {r['calibration']:.2f}", flush=True)

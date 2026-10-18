@@ -35,6 +35,18 @@ def train(output_root: Path, *extra) -> Path:
     return output_root / "E3_point_b0_main_s0"
 
 
+SMALL_GRU = ["--arch", "gru", "--hidden", "16", "--head-arch", "8"]
+
+
+def train_gru(output_root: Path, *extra) -> Path:
+    """A tiny E1 run of a small GRU (8 flights per split, 2 epochs) on dataset v2; its run directory."""
+    T.main(["--design", "E1", *SMALL_GRU, "--seed", "0", "--output-root", str(output_root), "--max-flights", "8",
+            "--max-epochs", "2", "--patience", "5", "--batch-size", "4", "--threads", "1", "--wandb-mode", "disabled",
+            "--log-every", "1000", *extra])
+    (run,) = [path for path in output_root.iterdir() if path.is_dir()]
+    return run
+
+
 class Step4Checks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -497,6 +509,154 @@ class Step4Checks(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 T.main(["--design", "E1", "--seed", "0", "--drop-tau", "--output-root", str(folder / "refused"), "--wandb-mode", "disabled"])
 
+    def test_gaussian_head_gives_the_same_mean_and_variance_both_ways_and_saves(self):
+        rows = [int(i) for i in np.argsort(self.flights.lengths)[[0, -1]]]
+        batch = self.flights.batch(rows)
+        obs, prev, mask = batch["observations"], batch["prev_actions"], batch["mask"]
+        for arch in R.ARCHITECTURES:
+            torch.manual_seed(1)
+            extra = {"conv_channels": 8} if arch == "convgru" else {}
+            encoder = R.build_encoder(arch, hidden=32, head_arch=[16], context_head="gaussian", **extra).eval()
+            with torch.no_grad():
+                mean, variance, aux = encoder.forward_with_variance(obs, prev)
+                estimate, _ = encoder(obs, prev)
+                state, means, variances = encoder.initial_state(len(rows)), [], []
+                for t in range(obs.shape[1]):
+                    m, v, _, state = encoder.step_with_variance(state, obs[:, t], prev[:, t])
+                    means.append(m)
+                    variances.append(v)
+            self.assertIsNone(aux)
+            torch.testing.assert_close(estimate, mean, rtol=0, atol=0)          # forward / step give the mean
+            torch.testing.assert_close(torch.stack(means, 1)[mask], mean[mask], rtol=0, atol=1e-5, msg=arch)
+            torch.testing.assert_close(torch.stack(variances, 1)[mask], variance[mask], rtol=0, atol=1e-5, msg=arch)
+            self.assertTrue(((mean > 0) & (mean < 1)).all() and (variance >= R.MIN_VARIANCE).all())
+            with tempfile.TemporaryDirectory() as folder:
+                R.save_encoder(encoder, Path(folder) / "encoder.pt")
+                loaded = R.load_encoder(Path(folder) / "encoder.pt")
+                self.assertEqual(loaded.context_head, "gaussian")
+                with torch.no_grad():
+                    torch.testing.assert_close(loaded.forward_with_variance(obs, prev)[1], variance, rtol=0, atol=0)
+                # The context wrapper reads the mean only
+                source = StandaloneEncoderContext(1, Path(folder) / "encoder.pt")
+                self.assertEqual(source.dim, 1)
+        # A point head has no variance, and old encoder.pt files (no context_head) build a point head
+        point = self.small_encoder("gru", False, aux=False)
+        self.assertIsNone(point.forward_with_variance(obs, prev)[1])
+        kwargs = dict(point.kwargs)
+        kwargs.pop("context_head")
+        self.assertEqual(R.build_encoder("gru", **kwargs).context_head, "point")
+
+    def test_gaussian_teacher_loss_is_smallest_at_the_teacher_belief(self):
+        torch.manual_seed(0)
+        # float64: at small variances the variance's gradient is the difference of two large terms
+        mu, s2 = torch.rand(3, 50, dtype=torch.float64) * 0.5 + 0.2, torch.rand(3, 50, dtype=torch.float64) * 0.01 + 1e-4
+        mask = torch.rand(3, 50) > 0.2
+        for beta in (0.0, 0.5, 1.0):
+            mean, variance = mu.clone().requires_grad_(), s2.clone().requires_grad_()
+            T.gaussian_nll(mean, variance, mu, s2, mask, beta).backward()
+            torch.testing.assert_close(mean.grad, torch.zeros_like(mu), rtol=0, atol=1e-6)
+            torch.testing.assert_close(variance.grad, torch.zeros_like(s2), rtol=0, atol=1e-6)
+        # beta 1: the mean's gradient is half the squared error's
+        mean, variance = (mu + 0.05).requires_grad_(), (s2 * 3).requires_grad_()
+        T.gaussian_nll(mean, variance, mu, s2, mask, 1.0).backward()
+        mse = (mu + 0.05).requires_grad_()
+        T.masked_mse(mse, mu, mask).backward()
+        torch.testing.assert_close(mean.grad, mse.grad / 2, rtol=1e-5, atol=1e-7)
+        # Without the teacher's spread it is the plain Gaussian likelihood (torch's, up to its constant)
+        variance = s2 * 3
+        expected = torch.nn.functional.gaussian_nll_loss(mu[mask] + 0.05, mu[mask], variance[mask])
+        torch.testing.assert_close(T.gaussian_nll(mu + 0.05, variance, mu, torch.zeros_like(mu), mask, 0.0), expected)
+
+    @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
+    def test_teacher_targets_train_from_training_flights_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            grid = ["--max-flights", "8", "--jobs", "2", "--chunk", "4", "--b-points", "41", "--vx-points", "121"]
+            teacher, floor = folder / "teacher", folder / "floor"
+            F.main(["--output", str(teacher), "--splits", "train", "validation", "test", *grid])
+            F.main(["--output", str(floor), *grid])
+            flights, _ = T.load(V2, "main", 8)
+            with np.load(teacher / "estimates.npz") as arrays:
+                saved = dict(arrays)
+            with np.load(floor / "estimates.npz") as arrays:
+                held_out = dict(arrays)
+            self.assertEqual(sorted(saved["seeds"].tolist()), sorted(int(s) for s in flights.seeds))
+            # Adding the training flights leaves the validation and test estimates as the floor's
+            offsets, index = saved["flight_offsets"], {int(s): k for k, s in enumerate(saved["seeds"])}
+            for k, seed in enumerate(held_out["seeds"]):
+                j = index[int(seed)]
+                np.testing.assert_array_equal(saved["means"][offsets[j]:offsets[j + 1]],
+                                              held_out["means"][held_out["flight_offsets"][k]:held_out["flight_offsets"][k + 1]])
+            order = [int(np.flatnonzero(flights.seeds == seed)[0]) for seed in saved["seeds"]]
+            means = [saved["means"][offsets[k]:offsets[k + 1]] for k in range(len(order))]
+            stds = [saved["stds"][offsets[k]:offsets[k + 1]] for k in range(len(order))]
+
+            def write_teacher(name, means, stds):
+                path = folder / name
+                path.mkdir()
+                shutil.copyfile(teacher / "floor.json", path / "floor.json")
+                np.savez_compressed(path / "estimates.npz", **{**saved, "means": np.concatenate(means), "stds": np.concatenate(stds)})
+                return path
+
+            truth = write_teacher("truth", [flights.batteries[i] for i in order], stds)
+            # The validation and test flights' targets replaced by nonsense
+            bad = write_teacher("bad", [m if flights.splits[i] == "train" else 1 - m for m, i in zip(means, order)],
+                                [s if flights.splits[i] == "train" else s * 7 + 0.1 for s, i in zip(stds, order)])
+            teach = ["--target", "teacher", "--teacher"]
+            weights = lambda run: torch.load(run / "last_encoder.pt", weights_only=False)["state_dict"]
+            metrics = lambda run: [json.loads(line) for line in open(run / "metrics.jsonl")]
+
+            # The true battery as the teacher trains exactly as E1
+            e1, t1_truth = train_gru(folder / "e1"), train_gru(folder / "t1_truth", *teach, str(truth))
+            self.assertEqual(t1_truth.name, "E1_gru_h16l2_head8_teacher_point_main_s0")
+            for key, value in weights(e1).items():
+                torch.testing.assert_close(weights(t1_truth)[key], value, rtol=0, atol=0)
+            self.assertEqual([r["validation"]["rmse"] for r in metrics(e1)], [r["validation"]["rmse"] for r in metrics(t1_truth)])
+            # T1 and T2: the validation and test targets never reach training (the same weights and validation errors
+            # against the battery), only the error against the teacher
+            for head in ("point", "gaussian"):
+                extra = ["--context-head", head]
+                good, nonsense = train_gru(folder / f"{head}_good", *teach, str(teacher), *extra), train_gru(folder / f"{head}_bad", *teach, str(bad), *extra)
+                for key, value in weights(good).items():
+                    torch.testing.assert_close(weights(nonsense)[key], value, rtol=0, atol=0)
+                rows_good, rows_bad = metrics(good), metrics(nonsense)
+                self.assertEqual([r["validation"]["rmse"] for r in rows_good], [r["validation"]["rmse"] for r in rows_bad])
+                self.assertNotEqual(rows_good[-1]["validation"]["teacher_rmse"], rows_bad[-1]["validation"]["teacher_rmse"])
+                self.assertFalse(all(torch.equal(weights(good)[k], v) for k, v in weights(e1).items()))
+            t2 = folder / "gaussian_good" / "E1_gru_h16l2_head8_teacher_gauss_main_s0"
+            settings, result = (json.loads((t2 / name).read_text()) for name in ("config.json", "result.json"))
+            self.assertEqual((settings["target"], settings["context_head"], settings["nll_beta"], settings["teacher_std_floor"]),
+                             ("teacher", "gaussian", 1.0, T.TEACHER_STD_FLOOR))
+            self.assertEqual(settings["data_sha256"]["teacher_estimates.npz"], T.sha256(teacher / "estimates.npz"))
+            self.assertTrue({"calibration", "teacher_rmse", "std_minus_teacher_rms"} <= set(result["test"]))
+            self.assertEqual(R.load_encoder(t2 / "encoder.pt").context_head, "gaussian")
+            # Resume continues T2 exactly, with its teacher
+            first = train_gru(folder / "first", *teach, str(teacher), "--context-head", "gaussian", "--max-epochs", "1")
+            T.main(["--resume", str(first), "--max-epochs", "2", "--patience", "5", "--threads", "1", "--wandb-mode", "disabled",
+                    "--log-every", "1000", "--output-root", str(folder / "resumed")])
+            resumed = folder / "resumed" / "E1_gru_h16l2_head8_teacher_gauss_main_resumed_s0"
+            for key, value in weights(t2).items():
+                torch.testing.assert_close(weights(resumed)[key], value, rtol=0, atol=0)
+            # Finalize reattaches the teacher: the same result as the natural end
+            stopped = folder / "stopped"
+            shutil.copytree(t2, stopped)
+            (stopped / "result.json").unlink()
+            T.main(["--finalize", str(stopped), "--wandb-mode", "disabled", "--threads", "1"])
+            self.assertEqual(json.loads((stopped / "result.json").read_text())["test"], result["test"])
+            # Refused: a teacher without the training flights, or of other flights, and options that don't go together
+            other = write_teacher("other", means, stds)
+            changed = json.loads((other / "floor.json").read_text())
+            changed["data_manifest_sha256"] = "0" * 64
+            (other / "floor.json").write_text(json.dumps(changed))
+            for argv in ([*teach, str(floor)], [*teach, str(other)], ["--target", "teacher"], ["--teacher", str(teacher)],
+                         [*teach, str(teacher), "--design", "E3"], ["--context-head", "gaussian", "--design", "E3"],
+                         [*teach, str(teacher), "--nll-beta", "2"]):
+                with self.assertRaises(SystemExit, msg=argv):
+                    train_gru(folder / "refused", *argv)
+            with self.assertRaises(SystemExit):
+                T.main(["--design", "E1", "--seed", "0", "--context-head", "gaussian", "--output-root", str(folder / "refused_xlstm"),
+                        "--wandb-mode", "disabled"])
+
     @unittest.skipUnless(HAS_V2, "needs dataset v2 (runs_encoder/pilot_flights/v2)")
     def test_finalize_gives_what_a_natural_end_gives(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -559,7 +719,7 @@ class Step4Checks(unittest.TestCase):
             old_style = folder / "old_style"
             shutil.copytree(first, old_style)
             config = json.loads((old_style / "config.json").read_text())
-            for key in T.ARCH_SETTINGS:
+            for key in (*T.ARCH_SETTINGS, *T.TARGET_SETTINGS):
                 config.pop(key)
             config["code_sha256"].pop("recurrent_encoders.py")
             (old_style / "config.json").write_text(json.dumps(config))

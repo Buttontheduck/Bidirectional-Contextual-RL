@@ -1327,6 +1327,133 @@ python -m unittest checks.joint_checks -v
   - Start Contextual PPO from the pretrained GRU (frozen at first, then trained online), testing whether online training keeps or loses what the pilots taught.
   - Mix pilot flights into the joint encoder's training data.
 
+### Teacher targets: T1 and T2 (launched 2026-10-18 00:31 UTC)
+
+**The question:** does the GRU get closer to the floor if it learns the ideal estimator's (the calculator's) belief instead of the true battery? Where the battery can't be known, the true battery is a noisy target; the calculator's mean is the clean version of the best possible guess (section 3's alternative target). It targets the GRU's steady extra error of about 0.045 and its overestimation after probing in closed loop.
+- **T1:** the GRU's point head learns the calculator's mean (squared error).
+- **T2:** a Gaussian head (a mean and a variance) learns the calculator's mean and spread.
+  - Loss: the expected negative log-likelihood under the calculator's belief, 0.5 log v + (s² + (m − μ)²) / (2v), which is smallest at m = μ and v = s².
+  - Beta-NLL with β = 1, so the mean learns as in T1, and T2 differs from T1 only by also learning the spread.
+  - The calculator's std is floored at 0.005, its grid spacing in b0. Below that, the std reflects the grid, not the physics.
+- **Everything else is the 2 × 2 grid's GRU cell** (the baseline, test 0.0972, 0.0955–0.0989):
+  - the same flights and split
+  - batch 32, learning rate 3e-4, patience 8, up to 40 passes, 1 thread
+  - early stopping and every reported error against the true battery
+- **Paired with the baseline:** T1 at seed s starts from the same weights as the baseline GRU at seed s and sees the batches in the same order, so only the target differs. T2's head has one more output, which changes its initial weights.
+- **The catch, stated openly:** the targets bring knowledge of the physics into training (the exact dynamics, the prior and the speed noise).
+
+**Teacher targets:** `step4_floor.py --splits train validation test` ran the calculator over all 19,000 main-mix flights of dataset v2 in 20 minutes with 30 processes (`runs_encoder/step4/teacher_v2_main`).
+- **Validation and test estimates:** bit-identical to the floor's (`floor_v2_main`): validation 0.0841, test 0.0853.
+- **On the training flights:** error 0.0841 against the true battery, bias −0.0006.
+- **Calibration:** 1.09 on the training flights (mean squared error / its own variance).
+
+**Code:**
+- `recurrent_encoders.py`: an optional Gaussian head, `context_head="gaussian"` (mean through the sigmoid; variance softplus + 1e-6, as A's head).
+  - `forward` and `step` still return the mean, so the context wrapper reads the mean.
+  - `forward_with_variance` and `step_with_variance` return the variance too.
+- `train_encoder.py`:
+  - New options: `--target teacher --teacher <dir>`, `--context-head gaussian`, `--nll-beta`, `--teacher-std-floor`.
+  - The validation metrics add the error against the calculator's mean and, for T2, its calibration and how far its std is from the calculator's.
+  - Names: `E1_gru_teacher_point_main_s0` … `_s4` (T1) and `E1_gru_teacher_gauss_main_s0` … `_s4` (T2).
+  - It records the teacher's path and SHA-256.
+  - A teacher computed on other flights, or missing any flight, is refused.
+
+**Checks (92 in the project pass):**
+- With the true battery as the "teacher", training gives exactly E1's weights and validation errors.
+- Replacing the validation and test flights' targets with nonsense changes neither T1's nor T2's weights, nor their validation errors against the battery. Only training flights' targets reach the loss.
+- The Gaussian head's two modes agree within 1e-5, and it saves and loads.
+- The loss is smallest at the calculator's belief, and β = 1 gives the mean half the squared error's gradient.
+- T2 resumes exactly and finalizes as its natural end.
+- Options that don't go together are refused.
+- The old code (commit 71f3ffd) and the new code give bit-identical weights, validation errors and results for the battery-target GRU. The grid's GRU s0 gives its recorded validation error (0.096684) in the new code.
+- A bug found and fixed during the checks: the teacher file was read once per flight (each read decompresses the whole array). It now loads in 0.3 s.
+
+**Seeds:**
+- The flights have seeds from 100,000 up. The environment's validation (1000–1002) and final-test (2000–2002) seeds appear nowhere.
+- The calculator is deterministic and has no seed. Its prior is the environment's reset distribution, not fitted to any flights.
+- The calculator's flag "the plane still flies" at step t rules out an empty battery. That is known at every decision step, because an empty battery ends the flight on that same step. At the last step it is not used.
+
+**Timing:** with 10 runs side by side, extra threads don't help (5.3, 5.2 and 5.8 minutes per pass at 1, 2 and 3 threads each: memory-bound). With validation, about 5.5 minutes per pass. The baseline's runs took 24–40 passes, so expect about 2.2–3.7 hours.
+
+```bash
+R=runs_encoder/step4_teacher; TT=runs_encoder/step4/teacher_v2_main; mkdir -p $R/logs
+for s in 0 1 2 3 4; do
+  nohup python train_encoder.py --design E1 --arch gru --target teacher --teacher $TT --seed $s --patience 8 --max-epochs 40 --threads 1 --output-root $R > $R/logs/teacher_point_s$s.log 2>&1 &
+  nohup python train_encoder.py --design E1 --arch gru --target teacher --teacher $TT --context-head gaussian --seed $s --patience 8 --max-epochs 40 --threads 1 --output-root $R > $R/logs/teacher_gauss_s$s.log 2>&1 &
+done
+```
+
+**Compare (test flights):** the GRU cell 0.0972, the floor 0.0853 and the clock 0.1438, overall, at 1, 5 and 20 s, and per style. Also the RMS of the GRU's estimate minus the calculator's (the baseline's is 0.045). If a teacher encoder clearly beats the baseline, freeze it under plain PPO as in step 4 (209 at batch 256).
+
+**Results (all 10 runs done by 2026-10-18 04:10 UTC, 3.0–3.5 h each).**
+- **Run lengths:** 9 of 10 runs used all 40 passes. T1's best passes were 32–37. T2's were 27–40, and 3 of its seeds were still improving at pass 40.
+- **Scoring:** best checkpoint by validation, test flights, against the true battery.
+
+| Encoder (5 seeds) | Test error, mean (range) | Gap closed* | Minus the calculator** | Bias | At 1 / 5 / 20 s | Click at pass*** |
+|---|---:|---:|---:|---:|---|---:|
+| Clock only | 0.1438 | 0% | | | | |
+| GRU cell (true battery) | 0.0972 (0.0955–0.0989) | 80% | 0.0445 | −0.0064 | 0.142 / 0.106 / 0.086 | 10–12 |
+| **T1** (the calculator's mean) | **0.0933 (0.0928–0.0938)** | **86%** | **0.0349** | −0.0035 | 0.141 / 0.103 / 0.081 | **7–8** |
+| T2 (mean and spread) | 0.0934 (0.0930–0.0942) | 86% | 0.0357 | −0.0059 | 0.141 / 0.103 / 0.082 | 11–14 |
+| Calculator (the floor) | 0.0853 | 100% | 0 | −0.0007 | 0.136 / 0.096 / 0.072 | |
+
+\*(clock − encoder) / (clock − floor). \*\*RMS of the encoder's estimate minus the calculator's, at every step. \*\*\*First pass with validation below 0.115.
+
+**More training doesn't explain it.** Most of the baseline's runs stopped early (24–32 passes) because they had plateaued, while the teacher runs used up to 40. At the same pass, T1 is ahead in all 5 seeds every time (best validation error so far, mean of 5 seeds):
+
+| By pass | 10 | 15 | 20 | 24 | 32 | 40 |
+|---|---:|---:|---:|---:|---:|---:|
+| GRU cell | 0.117 | 0.101 | 0.099 | 0.0975 | 0.0971 | 0.0969 |
+| T1 | 0.100 | 0.096 | 0.0946 | 0.0940 | 0.0930 | 0.0925 |
+| T2 | 0.124 | 0.101 | 0.0962 | 0.0946 | 0.0937 | 0.0930 |
+
+**By flight time (test, RMS):**
+
+| | 0–1 s | 1–5 s | 5–10 s | 10–20 s | 20–35 s |
+|---|---:|---:|---:|---:|---:|
+| GRU cell minus calculator | 0.034 | 0.042 | 0.046 | 0.047 | 0.043 |
+| T1 minus calculator | 0.024 | 0.037 | 0.038 | 0.036 | 0.032 |
+| GRU cell bias | −0.025 | −0.009 | −0.006 | −0.005 | −0.005 |
+| T1 bias | −0.007 | −0.004 | −0.004 | −0.005 | −0.002 |
+
+**By style (test, GRU cell / T1 / calculator):**
+- `probe_hold` 0.081 / 0.075 / 0.068
+- `wavy` 0.127 / 0.118 / 0.112
+- `shaky` 0.118 / 0.111 / 0.097
+- `random_hold` 0.098 / 0.094 / 0.072
+- `switching` 0.086 / 0.081 / 0.068
+- `endurance` 0.064 / 0.060 / 0.055
+- `replay_good` 0.078 / 0.075 / 0.069
+- `hold_speed` 0.061 / 0.058 / 0.054
+- `blind_ppo` 0.059 / 0.057 / 0.049
+- `cruise` 0.135 / 0.133 / 0.122
+- `steady_below` 0.147 / 0.144 / 0.144
+
+**T2's uncertainty (test):**
+- **Calibrated:** squared error / its variance averages 0.91–1.02 (1 is perfect), median about 0.5.
+- **It follows the calculator's std:** correlation 0.91–0.93.
+- **It is a little wider** (mean std 0.081, against the calculator's 0.068), as it should be, since its errors are larger than the calculator's.
+- **It predicts its own error** (correlation of std with the error's size 0.64–0.66) a little better than the calculator's std does (0.59–0.61).
+
+**What it shows:**
+- **The cleaner target helps,** consistently but modestly:
+  - 0.0972 → 0.0933, and the seed ranges don't overlap (T1's worst seed beats the baseline's best).
+  - A third of the remaining gap to the floor is closed (0.0119 → 0.0080).
+  - The distance to the calculator falls by about 22% (0.045 → 0.035).
+- **T1 finds the battery sooner** (the click at pass 7–8 against 10–12), keeps improving longer, and is better in every time window and every style. The largest gains are on the probing and changing flights.
+- **The early-flight bias almost disappears** (−0.025 → −0.007 in the first second).
+- **T2's mean is as good as T1's,** so learning the spread costs nothing in accuracy, and its uncertainty is calibrated. It clicks later, but has caught up by pass 20.
+- **What is left:** the gap to the calculator stays about 0.03–0.037 through the flight. The calculator keeps sharpening late in the flight (0.072 after 20 s); T1 less so (0.081). The largest gaps are on `random_hold`, `switching` and `shaky`.
+- **Caveats:**
+  - These are pilot flights, open loop. The test that counts is plain PPO with the frozen encoder.
+  - The closed-loop overestimation after probing has to be measured again on PPO's own flights.
+  - The targets bring the physics into training.
+- **Next:** freeze T1 under plain PPO (below). The encoder is chosen by validation: T1 seed 3, 0.0918. The validation errors were:
+  - T1: s0 0.0925, s1 0.0928, s2 0.0925, s3 0.0918, s4 0.0927
+  - T2: 0.0923–0.0941
+  - GRU cell: 0.0945–0.0990
+- **Later option:** T2 makes a second PPO test possible, with the policy also reading the encoder's uncertainty (the context wrapper would need to pass on the variance).
+
 ## Next steps
 
 **Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).
@@ -1346,7 +1473,7 @@ python -m unittest checks.joint_checks -v
    - Done 2026-10-17 with the best GRU encoders (step 4 above): 209 ± 36 at batch 256 (88% of flights completed), against 23 without memory, 246 with the true battery and 283 with the ideal estimate. Batch 1024 is unstable with the GRU (one seed collapsed), and the encoder seed matters. The closed-loop check (done): on PPO's own flights the GRU overestimates the battery after probing (+0.03 to +0.06), which caused the collapse. Next: encoder training on these PPO policies' flights, and the ideal estimator as a teacher.
 4. **Joint training (J0–J5, done 2026-10-17):** Contextual PPO with a GRU encoder trained together with the policy. The best rung, J1, scores 114, about the memoryless level, against 209 for the frozen GRU. Only more encoder training helped. Next options: start Contextual PPO from the pretrained GRU, or mix pilot flights into its encoder data. If the shortfall turns out to come from early-flight error, the easy environment is plan B.
 5. **Optional:**
-   - Train on the ideal estimator as a teacher (section 3).
+   - Train on the ideal estimator as a teacher (section 3). Done 2026-10-18 (T1 and T2, 5 seeds each, above): test 0.0933, against 0.0972 for the GRU cell and the 0.0853 floor; T2 matches T1 and its uncertainty is calibrated. Next: T1 frozen under plain PPO.
    - Freeze A's own encoder under plain PPO (step 2's next steps).
    - Add earlier PPO checkpoints (0.5M / 1M / 1.5M steps) or more seeds as pilots, if the encoder's error is limited by data.
    - Start from the pretrained encoder and keep training it online, as CPPO does (section 5).

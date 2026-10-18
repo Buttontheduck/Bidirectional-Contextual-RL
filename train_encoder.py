@@ -13,6 +13,22 @@ of recurrent_encoders.py, gru or convgru, with --drop-tau (the encoder ignores t
 read by the context wrapper) instead of encoder_model.zip, and their names carry the architecture, e.g.
 E1_convgru_notau_point_main_s0; the xLSTM's names are unchanged.
 
+Teacher targets (ENCODER_PLAN.md, section 3; E1 only): --target teacher --teacher <step4_floor.py output with
+--splits train validation test> trains on the ideal estimator's belief instead of the true battery. The ideal
+estimator reads only the inputs the encoder reads (it is causal: o_0 .. o_t and the executed actions), so its mean is the
+best estimate possible from them, without the noise of the true battery where the battery cannot be known.
+    T1  the point head, squared error on the teacher's mean                       (E1_gru_teacher_point_main_s0)
+    T2  --context-head gaussian (gru / convgru): the head outputs a mean and a variance, trained on the teacher's
+        mean and std by the expected negative log-likelihood under the teacher's belief, 0.5 log v + (s^2 + (m - mu)^2)
+        / (2 v), smallest at m = mu, v = s^2. The teacher's std is floored at --teacher-std-floor (0.005, the spacing of
+        its grid of starting batteries: below it the std is the grid's, not the physics'). --nll-beta weights each
+        step by v ** beta without gradient (beta-NLL); the default 1 makes the mean learn as with squared error, so T2
+        differs from T1 only by also learning the spread.                     (E1_gru_teacher_gauss_main_s0)
+--context-head gaussian with the true battery (s = 0) is the plain Gaussian likelihood (C/D's head). Early stopping, the
+best checkpoint and every reported error stay against the true battery, as for the other designs; the validation
+metrics add the error against the teacher's mean and, for the Gaussian head, its calibration (mean squared error /
+variance, 1 when its variance matches its errors). Only training flights' targets enter the loss.
+
 Flights are split by their seed, the same way for every design and training seed: seed % 10 == 8 is validation (early
 stopping and the best checkpoint), seed % 10 == 9 is test (scored once, at the end, with the best checkpoint), the rest
 is training. The training seed sets only the encoder's initial weights and the order of the batches.
@@ -38,6 +54,8 @@ metrics.jsonl starts with the original run's epochs, and its best checkpoint sta
 
     python train_encoder.py --design E1 --seed 0 --output-root runs_encoder/step4
     python train_encoder.py --design E3 --seed 0 --smoke        # tiny correctness run, W&B disabled
+    python train_encoder.py --design E1 --arch gru --target teacher --teacher runs_encoder/step4/teacher_v2_main \
+        --context-head gaussian --seed 0 --patience 8 --max-epochs 40 --output-root runs_encoder/step4_teacher      # T2
     python train_encoder.py --resume runs_encoder/step4/E1_point_main_s2 --patience 8 --max-epochs 40
     python train_encoder.py --finalize runs_encoder/step4/E3_point_b0_main_s1     # a run stopped by hand
 
@@ -70,11 +88,16 @@ WANDB_PROJECT = "battery-encoder"
 HASHED_CODE = ("train_encoder.py", "pilots.py", "main_battery_plane_contextual_ppo.py", "config/cppo.yaml",
                "contextual_ppo/torch_layers.py", "contextual_ppo/policies.py", "battery_plane.py", "recurrent_encoders.py")
 ARCHS = ("xlstm", "gru", "convgru")
-# The architecture settings a run records; runs from before --arch were A's xLSTM
-ARCH_SETTINGS = ("arch", "drop_tau", "hidden", "layers", "head_arch", "conv_channels", "conv_window")
+# The architecture settings a run records; runs from before --arch were A's xLSTM, runs from before --context-head point
+ARCH_SETTINGS = ("arch", "drop_tau", "hidden", "layers", "head_arch", "conv_channels", "conv_window", "context_head")
 XLSTM_ARCH = {"arch": "xlstm", "drop_tau": False, "hidden": None, "layers": None, "head_arch": None, "conv_channels": None,
-              "conv_window": None}
+              "conv_window": None, "context_head": "point"}
 ARCH_DEFAULTS = {"hidden": 128, "layers": 2, "head_arch": [128, 128], "conv_channels": 32, "conv_window": 16}
+CONTEXT_HEADS = ("point", "gaussian")
+# The training target a run records; runs from before --target trained on the true battery
+TARGETS = ("battery", "teacher")
+TARGET_SETTINGS = ("target", "teacher", "teacher_std_floor", "nll_beta")
+TEACHER_STD_FLOOR = 0.005         # the teacher's grid spacing in b0: (0.7 - 0.2) / 100
 
 
 def split_of(seed: int) -> str:
@@ -131,6 +154,14 @@ class Flights:
         self.splits = np.array([split_of(seed) for seed in self.seeds])
         if len(set(self.seeds)) != len(self.seeds):
             raise ValueError("Flight seeds repeat: the split would put copies of a flight on both sides")
+        self.teacher_means = self.teacher_stds = None      # attach_teacher
+        self.teacher_std_floor = 0.0
+
+    def attach_teacher(self, means: list[np.ndarray], stds: list[np.ndarray], std_floor: float) -> None:
+        """The ideal estimator's mean and std at every step of every flight (load_teacher)."""
+        if [len(m) for m in means] != list(self.lengths) or [len(s) for s in stds] != list(self.lengths):
+            raise ValueError("Teacher targets don't match the flights' lengths")
+        self.teacher_means, self.teacher_stds, self.teacher_std_floor = means, stds, float(std_floor)
 
     def indices(self, split: str) -> np.ndarray:
         return np.flatnonzero(self.splits == split)
@@ -146,8 +177,17 @@ class Flights:
             n = self.lengths[i]
             obs[j, :n], prev[j, :n], labels[j, :n], mask[j, :n] = self.observations[i], self.prev_actions[i], self.batteries[i], True
         b0 = np.array([self.batteries[i][0] for i in rows], np.float32)
-        return {"observations": th.from_numpy(obs), "prev_actions": th.from_numpy(prev), "labels": th.from_numpy(labels),
-                "b0": th.from_numpy(b0), "mask": th.from_numpy(mask)}
+        out = {"observations": th.from_numpy(obs), "prev_actions": th.from_numpy(prev), "labels": th.from_numpy(labels),
+               "b0": th.from_numpy(b0), "mask": th.from_numpy(mask)}
+        if self.teacher_means is not None:
+            # The teacher's belief: its mean, and its variance with the std floored (padding: zero, masked)
+            means, variances = np.zeros((len(rows), length), np.float32), np.zeros((len(rows), length), np.float32)
+            for j, i in enumerate(rows):
+                n = self.lengths[i]
+                means[j, :n] = self.teacher_means[i]
+                variances[j, :n] = np.maximum(self.teacher_stds[i], self.teacher_std_floor) ** 2
+            out.update(teacher_means=th.from_numpy(means), teacher_variances=th.from_numpy(variances))
+        return out
 
 
 def load(directory: Path, mix: str, max_flights: int | None = None) -> tuple[Flights, dict]:
@@ -168,6 +208,36 @@ def load(directory: Path, mix: str, max_flights: int | None = None) -> tuple[Fli
             keep += sorted({rows[int(j)] for j in np.linspace(0, len(rows) - 1, min(max_flights, len(rows)))})
         data = {key: [values[i] for i in sorted(keep)] for key, values in data.items()}
     return Flights(data), manifest
+
+
+def load_teacher(directory: Path, flights: Flights, data: Path, mix: str, std_floor: float) -> dict:
+    """Attach a step4_floor.py output's estimates (floor.json, estimates.npz) to the flights as teacher targets, after
+    checking that they were computed on these flights (same dataset manifest, mix and flight lengths, every flight
+    covered); returns what the run records about the teacher."""
+    floor = json.loads((directory / "floor.json").read_text())
+    if floor["data_manifest_sha256"] != sha256(data / "manifest.json") or floor["mix"] != mix:
+        raise ValueError(f"{directory} was computed on other flights (mix {floor['mix']}, data {floor['data']})")
+    # Each read of an .npz entry decompresses the whole array again: read every array once
+    with np.load(directory / "estimates.npz") as saved:
+        seeds, offsets, all_means, all_stds = (saved[key] for key in ("seeds", "flight_offsets", "means", "stds"))
+    where = {int(seed): k for k, seed in enumerate(seeds)}
+    missing = [int(seed) for seed in flights.seeds if int(seed) not in where]
+    if missing:
+        raise ValueError(f"{directory} has no estimates for {len(missing)} flights (e.g. seed {missing[0]}): "
+                         "run step4_floor.py with --splits train validation test")
+    rows = [where[int(seed)] for seed in flights.seeds]
+    means = [all_means[offsets[k]:offsets[k + 1]].astype(np.float32) for k in rows]
+    stds = [all_stds[offsets[k]:offsets[k + 1]].astype(np.float32) for k in rows]
+    flights.attach_teacher(means, stds, std_floor)
+    return {"teacher_grid": floor["grid"], "teacher_sha256": {"floor.json": sha256(directory / "floor.json"),
+                                                              "estimates.npz": sha256(directory / "estimates.npz")}}
+
+
+def target_settings(settings: dict) -> dict:
+    """The training target of a run (its config.json or the parsed options); the true battery for runs from before
+    --target."""
+    return {"target": settings.get("target") or "battery", "teacher": settings.get("teacher"),
+            "teacher_std_floor": settings.get("teacher_std_floor"), "nll_beta": settings.get("nll_beta")}
 
 
 def length_batches(rows: np.ndarray, lengths: np.ndarray, batch_size: int, rng: np.random.Generator) -> list[np.ndarray]:
@@ -196,9 +266,30 @@ def predict(encoder, batch: dict, b0_head: bool):
     return contexts[..., 0], None
 
 
+def predict_with_variance(encoder, batch: dict, b0_head: bool):
+    """predict, plus the variances [B, L] of a Gaussian head (None for a point head)."""
+    if getattr(encoder, "context_head", "point") != "gaussian":
+        estimates, b0 = predict(encoder, batch, b0_head)
+        return estimates, None, b0
+    estimates, variances, b0 = encoder.forward_with_variance(batch["observations"], batch["prev_actions"])
+    return estimates, variances, b0 if b0_head else None
+
+
 def masked_mse(prediction, target, mask):
     mask = mask.to(prediction.dtype)
     return ((prediction - target) ** 2 * mask).sum() / mask.sum()
+
+
+def gaussian_nll(mean, variance, target_mean, target_variance, mask, beta: float):
+    """The expected negative log-likelihood of the head's Gaussian N(mean, variance) under the target belief
+    N(target_mean, target_variance), without its constant: 0.5 log v + (s^2 + (m - mu)^2) / (2 v), smallest at m = mu and
+    v = s^2 (target_variance 0: the plain likelihood of target_mean). beta-NLL: each step weighted by v ** beta without
+    gradient; beta 1 gives the mean the gradient of half the squared error."""
+    nll = 0.5 * variance.log() + (target_variance + (mean - target_mean) ** 2) / (2 * variance)
+    if beta > 0:
+        nll = nll * variance.detach() ** beta
+    mask = mask.to(nll.dtype)
+    return (nll * mask).sum() / mask.sum()
 
 
 def clock_estimate(flights: Flights, rows: np.ndarray) -> np.ndarray:
@@ -250,23 +341,45 @@ class ErrorTally:
 
 
 def evaluate(encoder, flights: Flights, rows: np.ndarray, b0_head: bool, steps_at: dict[str, int], batch_size: int = 256) -> dict:
-    """Errors of the encoder on the given flights (no gradient)."""
+    """Errors of the encoder on the given flights (no gradient), against the true battery; with teacher targets
+    attached, also the error against the teacher's mean; with a Gaussian head, its calibration (squared error / variance:
+    mean and median) and how far its std is from the teacher's."""
     import torch as th
 
     encoder.eval()
     tally = ErrorTally(steps_at)
+    teacher_sq, z2, std_sum, std_gap_sq = 0.0, [], 0.0, 0.0
     order = rows[np.argsort(flights.lengths[rows], kind="stable")]
     with th.no_grad():
         for start in range(0, len(order), batch_size):
             part = order[start:start + batch_size]
             batch = flights.batch(part)
-            estimates, b0 = predict(encoder, batch, b0_head)
+            estimates, variances, b0 = predict_with_variance(encoder, batch, b0_head)
             for j, i in enumerate(part):
                 n = flights.lengths[i]
                 b0_errors = None if b0 is None else b0[j, :n].numpy() - flights.batteries[i][0]
-                tally.add(estimates[j, :n].numpy() - flights.batteries[i], flights.styles[i], b0_errors)
+                # float32 differences, as before teacher targets: the battery errors stay bit-identical
+                estimate = estimates[j, :n].numpy()
+                errors = estimate - flights.batteries[i]
+                tally.add(errors, flights.styles[i], b0_errors)
+                if flights.teacher_means is not None:
+                    teacher_sq += ((estimate - flights.teacher_means[i]).astype(np.float64) ** 2).sum()
+                if variances is not None:
+                    variance = variances[j, :n].numpy().astype(np.float64)
+                    z2.append(errors.astype(np.float64) ** 2 / variance)
+                    std_sum += np.sqrt(variance).sum()
+                    if flights.teacher_stds is not None:
+                        std_gap_sq += ((np.sqrt(variance) - flights.teacher_stds[i]) ** 2).sum()
     encoder.train()
-    return tally.summary(with_b0=b0_head)
+    out = tally.summary(with_b0=b0_head)
+    if flights.teacher_means is not None:
+        out["teacher_rmse"] = float(np.sqrt(teacher_sq / tally.count))
+    if variances is not None:
+        z2 = np.concatenate(z2)
+        out.update(calibration=float(z2.mean()), calibration_median=float(np.median(z2)), std_mean=float(std_sum / tally.count))
+        if flights.teacher_stds is not None:
+            out["std_minus_teacher_rms"] = float(np.sqrt(std_gap_sq / tally.count))
+    return out
 
 
 def evaluate_clock(clock: np.ndarray, flights: Flights, rows: np.ndarray, steps_at: dict[str, int]) -> dict:
@@ -298,26 +411,27 @@ def arch_tag(arch: dict) -> str:
 
 
 def make_model(cfg, arch: dict, b0_head: bool):
-    """A's xLSTM (make_encoder), or a GRU / ConvGRU of recurrent_encoders.py with a b0 head for E3."""
+    """A's xLSTM (make_encoder), or a GRU / ConvGRU of recurrent_encoders.py with a b0 head for E3 and a point or
+    Gaussian head."""
     if arch["arch"] == "xlstm":
         return make_encoder(cfg, b0_head)
     from recurrent_encoders import build_encoder
 
     kwargs = {"drop_tau": arch["drop_tau"], "hidden": arch["hidden"], "layers": arch["layers"],
-              "head_arch": list(arch["head_arch"]), "aux_dim": 1 if b0_head else None}
+              "head_arch": list(arch["head_arch"]), "aux_dim": 1 if b0_head else None, "context_head": arch["context_head"]}
     if arch["arch"] == "convgru":
         kwargs.update(conv_channels=arch["conv_channels"], window=arch["conv_window"])
     return build_encoder(arch["arch"], **kwargs)
 
 
-def save_trained(cfg, encoder, arch: dict, run_dir: Path, name: str) -> None:
+def save_trained(cfg, encoder, arch: dict, run_dir: Path, name: str, target: str = "battery") -> None:
     """The best encoder for PPO: encoder_model.zip (a Contextual_PPO model) for the xLSTM, encoder.pt otherwise."""
     if arch["arch"] == "xlstm":
         save_policy_model(cfg, encoder, run_dir / "encoder_model.zip")
     else:
         from recurrent_encoders import save_encoder
 
-        save_encoder(encoder, run_dir / "encoder.pt", {"name": name})
+        save_encoder(encoder, run_dir / "encoder.pt", {"name": name, "target": target})
 
 
 def save_policy_model(cfg, encoder, path: Path) -> None:
@@ -343,12 +457,17 @@ def epoch_log(row: dict, b0_head: bool) -> dict:
            **{f"validation/by_style/{k}": v for k, v in validation["rmse_by_style"].items()}}
     if b0_head:
         log["validation/b0_rmse"] = validation["b0_rmse"]
+    for key in ("teacher_rmse", "calibration", "calibration_median", "std_mean", "std_minus_teacher_rms"):
+        if key in validation:
+            log[f"validation/{key}"] = validation[key]
+    if "train_loss" in row:
+        log["train/epoch_loss"] = row["train_loss"]
     return log
 
 
 # Settings a resumed run takes from the original run (they define the training it continues)
 RESUMED_SETTINGS = ("design", "seed", "data", "mix", "batch_size", "learning_rate", "max_grad_norm", "b0_weight", "max_flights",
-                    *ARCH_SETTINGS)
+                    *ARCH_SETTINGS, *TARGET_SETTINGS)
 # Code a resumed run must share with the original (train_encoder.py itself may have gained options since)
 RESUME_SAME_CODE = tuple(path for path in HASHED_CODE if path != "train_encoder.py")
 
@@ -402,6 +521,9 @@ def finalize_run(run_dir: Path, wandb_mode: str | None = None) -> dict:
     settings, rows, best_row, last, best = stopped_run_state(run_dir, "last_encoder.pt", "best_encoder.pt")
     cfg = encoder_config([f"training.seed={settings['seed']}"])
     flights, _ = load(Path(settings["data"]), settings["mix"], settings["max_flights"])
+    target = target_settings(settings)
+    if target["target"] == "teacher":
+        load_teacher(Path(target["teacher"]), flights, Path(settings["data"]), settings["mix"], target["teacher_std_floor"])
     rows_split = {split: flights.indices(split) for split in ("train", "validation", "test")}
     clock = clock_estimate(flights, rows_split["train"])
     steps_at, b0_head = settings["steps_at"], settings["b0_head"]
@@ -424,7 +546,7 @@ def finalize_run(run_dir: Path, wandb_mode: str | None = None) -> dict:
         "stopped_by_hand": True, "finalized": datetime.now().isoformat(timespec="seconds"),
     }
     (run_dir / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
-    save_trained(cfg, encoder, arch, run_dir, settings["name"])
+    save_trained(cfg, encoder, arch, run_dir, settings["name"], target["target"])
     result["wandb"] = finish_wandb_run(settings["name"], {
         "best_epoch": result["best_epoch"], "test/b_rmse": result["test"]["rmse"], "stopped_by_hand": True,
         **{f"test/b_rmse_at_{k}": v for k, v in result["test"]["rmse_at"].items()},
@@ -459,6 +581,13 @@ def main(argv=None) -> None:
     parser.add_argument("--head-arch", type=int, nargs="+", default=ARCH_DEFAULTS["head_arch"], help="gru / convgru: head layers")
     parser.add_argument("--conv-channels", type=int, default=ARCH_DEFAULTS["conv_channels"], help="convgru: filter channels")
     parser.add_argument("--conv-window", type=int, default=ARCH_DEFAULTS["conv_window"], help="convgru: filter window (frames)")
+    parser.add_argument("--context-head", choices=CONTEXT_HEADS, default="point",
+                        help="gru / convgru, E1: point, or gaussian (a mean and a variance, see above)")
+    parser.add_argument("--target", choices=TARGETS, default="battery", help="E1: the true battery, or the teacher's belief")
+    parser.add_argument("--teacher", type=Path, default=None,
+                        help="--target teacher: a step4_floor.py output with --splits train validation test")
+    parser.add_argument("--teacher-std-floor", type=float, default=TEACHER_STD_FLOOR, help="--target teacher: least teacher std")
+    parser.add_argument("--nll-beta", type=float, default=1.0, help="--context-head gaussian: beta of the beta-NLL, in [0, 1]")
     parser.add_argument("--log-every", type=int, default=50, help="Gradient steps between training-loss logs")
     parser.add_argument("--max-flights", type=int, default=None, help="Only the first flights of each split")
     parser.add_argument("--wandb-mode", default=None, help="online, offline or disabled (default: WANDB_MODE)")
@@ -485,15 +614,18 @@ def main(argv=None) -> None:
             parser.error(f"{args.resume} has not finished (no result.json): wait for it, or it failed")
         previous = json.loads((args.resume / "config.json").read_text())
         history = [json.loads(line) for line in open(args.resume / "metrics.jsonl")]
-        previous_values = {**{key: previous.get(key) for key in RESUMED_SETTINGS}, **arch_settings(previous)}
+        previous_values = {**{key: previous.get(key) for key in RESUMED_SETTINGS}, **arch_settings(previous),
+                           **target_settings(previous)}
         for key in RESUMED_SETTINGS:
             option = key.replace("_", "-")
             value, before = getattr(args, key), previous_values[key]
             if value is not None and value != parser.get_default(key) and str(value) != str(before):
                 parser.error(f"--{option} {value}: --resume continues with the original run's --{option} ({before})")
-            setattr(args, key, Path(before) if key == "data" else before)
-        if args.b0_weight is None:
-            args.b0_weight = parser.get_default("b0_weight")
+            setattr(args, key, Path(before) if key in ("data", "teacher") and before is not None else before)
+        # Recorded as null where they don't apply
+        for key in ("b0_weight", "teacher_std_floor", "nll_beta"):
+            if getattr(args, key) is None:
+                setattr(args, key, parser.get_default(key))
         if args.max_epochs <= len(history):
             parser.error(f"--max-epochs {args.max_epochs}: the run already did {len(history)} epochs")
         best_row = min(history, key=lambda r: r["validation"]["mse"])
@@ -502,9 +634,16 @@ def main(argv=None) -> None:
                          f"of {len(history)}): give more patience")
     elif args.design is None or args.seed is None:
         parser.error("--design and --seed are required unless --resume")
-    sizes = ("hidden", "layers", "head_arch", "conv_channels", "conv_window")
+    sizes = ("hidden", "layers", "head_arch", "conv_channels", "conv_window", "context_head")
     if args.arch == "xlstm" and (args.drop_tau or any(getattr(args, k) not in (None, parser.get_default(k)) for k in sizes)):
-        parser.error("--drop-tau, --hidden, --layers, --head-arch and --conv-* are for --arch gru / convgru (the xLSTM is A's)")
+        parser.error("--drop-tau, --hidden, --layers, --head-arch, --conv-* and --context-head are for --arch gru / convgru "
+                     "(the xLSTM is A's)")
+    if (args.target == "teacher" or args.context_head == "gaussian") and args.design != "E1":
+        parser.error("--target teacher and --context-head gaussian are for --design E1")
+    if (args.target == "teacher") != (args.teacher is not None):
+        parser.error("--target teacher needs --teacher, and --teacher is for --target teacher")
+    if not 0.0 <= args.nll_beta <= 1.0 or not args.teacher_std_floor > 0:
+        parser.error("--nll-beta must be in [0, 1] and --teacher-std-floor positive")
     if args.arch != "xlstm" and min([args.hidden, args.layers, *args.head_arch]) < 1:
         parser.error("--hidden, --layers and --head-arch must be at least 1")
     if args.arch == "convgru" and (args.conv_channels < 1 or args.conv_window < 2):
@@ -533,7 +672,11 @@ def main(argv=None) -> None:
         th.set_num_interop_threads(1)     # only once per process, before any parallel work
     design = DESIGNS[args.design]
     b0_head = design["b0_head"]
-    group = f"{args.design}{arch_tag(arch)}_{design['label']}_{args.mix}" + ("_resumed" if previous else "")
+    gaussian, teacher = arch["context_head"] == "gaussian", args.target == "teacher"
+    # e.g. E1_gru_teacher_gauss_main: the target after the architecture, the head in place of the design's label
+    target_tag = "_teacher" + (f"_floor{args.teacher_std_floor:g}" if args.teacher_std_floor != TEACHER_STD_FLOOR else "") if teacher else ""
+    label = "gauss" + (f"_beta{args.nll_beta:g}" if args.nll_beta != 1.0 else "") if gaussian else design["label"]
+    group = f"{args.design}{arch_tag(arch)}{target_tag}_{label}_{args.mix}" + ("_resumed" if previous else "")
     name = f"{group}_s{args.seed}"
     run_dir = args.output_root / name
     if run_dir.exists() and any(run_dir.iterdir()):
@@ -541,6 +684,12 @@ def main(argv=None) -> None:
 
     cfg = encoder_config([f"training.seed={args.seed}"])
     flights, manifest = load(args.data, args.mix, args.max_flights)
+    teacher_info = {}
+    if teacher:
+        try:
+            teacher_info = load_teacher(args.teacher, flights, args.data, args.mix, args.teacher_std_floor)
+        except ValueError as error:
+            parser.error(str(error))
     env_kwargs = training.env_kwargs_from(cfg)
     if dict(manifest["env_kwargs"]) != env_kwargs:
         parser.error(f"The flights were recorded with env kwargs {manifest['env_kwargs']}, A's config uses {env_kwargs}")
@@ -564,7 +713,9 @@ def main(argv=None) -> None:
         "styles": list(pilots.MIXES[args.mix]), "leaking_styles": leaking, "data": str(args.data),
         "batch_size": args.batch_size, "learning_rate": args.learning_rate, "max_grad_norm": args.max_grad_norm,
         "max_epochs": args.max_epochs, "patience": args.patience, "b0_weight": args.b0_weight if b0_head else None,
-        "threads": args.threads, "max_flights": args.max_flights, "steps_at": steps_at,
+        "threads": args.threads, "max_flights": args.max_flights, "steps_at": steps_at, "target": args.target,
+        "teacher": str(args.teacher) if teacher else None, "teacher_std_floor": args.teacher_std_floor if teacher else None,
+        "nll_beta": args.nll_beta if gaussian else None, **teacher_info,
         "split": {"rule": f"flight seed % {SPLIT_MODULUS}: {VALIDATION_REMAINDER} validation, {TEST_REMAINDER} test, rest train",
                   "flights": {k: int(len(v)) for k, v in rows.items()},
                   "steps": {k: int(flights.lengths[v].sum()) for k, v in rows.items()}},
@@ -576,7 +727,8 @@ def main(argv=None) -> None:
                    | {"parameters": int(sum(p.numel() for p in encoder.parameters()))},
         "code_sha256": {path: sha256(PROJECT_ROOT / path) for path in HASHED_CODE},
         "data_sha256": {"manifest.json": sha256(args.data / "manifest.json"),
-                        **{f"{s}.npz": sha256(args.data / f"{s}.npz") for s in pilots.MIXES[args.mix]}},
+                        **{f"{s}.npz": sha256(args.data / f"{s}.npz") for s in pilots.MIXES[args.mix]},
+                        **({"teacher_estimates.npz": teacher_info["teacher_sha256"]["estimates.npz"]} if teacher else {})},
         "git": git_state(), "versions": {pkg: version(pkg) for pkg in ("torch", "xlstm", "numpy", "stable-baselines3")},
         "started": datetime.now().isoformat(timespec="seconds"),
     }
@@ -591,7 +743,7 @@ def main(argv=None) -> None:
                                     "hours": json.loads((args.resume / "result.json").read_text())["hours"],
                                     "code_sha256": previous["code_sha256"]}
     (run_dir / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
-    run = wandb.init(project=WANDB_PROJECT, name=name, group=group, tags=["step4", args.design, args.mix, arch["arch"]] + (["notau"] if arch["drop_tau"] else []) + (["resumed"] if previous else []),
+    run = wandb.init(project=WANDB_PROJECT, name=name, group=group, tags=["step4", args.design, args.mix, arch["arch"]] + (["notau"] if arch["drop_tau"] else []) + (["teacher"] if teacher else []) + (["gaussian"] if gaussian else []) + (["resumed"] if previous else []),
                      config=json.loads((run_dir / "config.json").read_text()), mode=args.wandb_mode, dir=str(PROJECT_ROOT))
     print(f"{name}: {settings['split']['flights']} flights, {settings['encoder']['parameters']:,} parameters, "
           f"run directory {run_dir}", flush=True)
@@ -619,25 +771,33 @@ def main(argv=None) -> None:
         for row in history or []:
             metrics.write(json.dumps(row) + "\n")
         for epoch in range(first_epoch, args.max_epochs + 1):
-            epoch_start, losses = time.time(), []
+            epoch_start, losses, objectives = time.time(), [], []
             for rows_batch in length_batches(rows["train"], flights.lengths, args.batch_size, rng):
                 batch = flights.batch(rows_batch)
-                estimates, b0 = predict(encoder, batch, b0_head)
-                b_loss = masked_mse(estimates, batch["labels"], batch["mask"])
-                loss = b_loss
+                estimates, variances, b0 = predict_with_variance(encoder, batch, b0_head)
+                # Training flights only (rows["train"]): the target is the true battery or the teacher's belief
+                target = batch["teacher_means"] if teacher else batch["labels"]
+                if gaussian:
+                    target_variances = batch["teacher_variances"] if teacher else th.zeros_like(target)
+                    loss = gaussian_nll(estimates, variances, target, target_variances, batch["mask"], args.nll_beta)
+                else:
+                    loss = masked_mse(estimates, target, batch["mask"])
+                # The error against the true battery, logged for every design (the loss itself for E1)
+                b_loss = loss if not (gaussian or teacher) else masked_mse(estimates.detach(), batch["labels"], batch["mask"])
                 if b0_head:
                     b0_loss = masked_mse(b0, batch["b0"][:, None].expand_as(b0), batch["mask"])
-                    loss = b_loss + args.b0_weight * b0_loss
+                    loss = loss + args.b0_weight * b0_loss
                 optimizer.zero_grad()
                 loss.backward()
                 grad_norm = float(th.nn.utils.clip_grad_norm_(encoder.parameters(), args.max_grad_norm))
                 optimizer.step()
                 step += 1
                 losses.append(b_loss.item())
+                objectives.append(loss.item())
                 if not np.isfinite(loss.item()):
                     raise FloatingPointError(f"Non-finite loss at step {step}")
                 if step % args.log_every == 0:
-                    log = {"train/b_mse": losses[-1], "train/grad_norm": grad_norm, "train/epoch": epoch}
+                    log = {"train/b_mse": losses[-1], "train/loss": objectives[-1], "train/grad_norm": grad_norm, "train/epoch": epoch}
                     if b0_head:
                         log["train/b0_mse"] = b0_loss.item()
                     run.log(log, step=step)
@@ -651,14 +811,16 @@ def main(argv=None) -> None:
                 stale += 1
             th.save({"state_dict": encoder.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "step": step},
                     run_dir / "last_encoder.pt")
-            row = {"epoch": epoch, "step": step, "train_b_mse": float(np.mean(losses)), "validation": validation,
-                   "best_epoch": best_epoch, "epoch_seconds": time.time() - epoch_start}
+            row = {"epoch": epoch, "step": step, "train_b_mse": float(np.mean(losses)), "train_loss": float(np.mean(objectives)),
+                   "validation": validation, "best_epoch": best_epoch, "epoch_seconds": time.time() - epoch_start}
             metrics.write(json.dumps(row) + "\n")
             metrics.flush()
             run.log(epoch_log(row, b0_head), step=step)
             print(f"epoch {epoch}: validation b_t rmse {validation['rmse']:.4f} (at 1/5/20 s: "
-                  + " / ".join(f"{v:.4f}" for v in validation["rmse_at"].values())
-                  + f"){' best' if improved else ''}, {row['epoch_seconds'] / 60:.1f} min", flush=True)
+                  + " / ".join(f"{v:.4f}" for v in validation["rmse_at"].values()) + ")"
+                  + (f", against the teacher {validation['teacher_rmse']:.4f}" if "teacher_rmse" in validation else "")
+                  + (f", calibration {validation['calibration']:.2f}" if "calibration" in validation else "")
+                  + f"{' best' if improved else ''}, {row['epoch_seconds'] / 60:.1f} min", flush=True)
             if stale >= args.patience:
                 print(f"No better validation error for {args.patience} epochs: stopping", flush=True)
                 break
@@ -675,7 +837,7 @@ def main(argv=None) -> None:
         "test_seeds": [int(flights.seeds[i]) for i in rows["test"]],
     }
     (run_dir / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
-    save_trained(cfg, encoder, arch, run_dir, name)
+    save_trained(cfg, encoder, arch, run_dir, name, args.target)
     run.summary.update({"best_epoch": best_epoch, "test/b_rmse": result["test"]["rmse"],
                         **{f"test/b_rmse_at_{k}": v for k, v in result["test"]["rmse_at"].items()},
                         "clock_test/b_rmse": result["clock_test"]["rmse"]})

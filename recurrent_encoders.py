@@ -9,6 +9,9 @@ b_hat_t in (0, 1), plus an optional auxiliary output (E3's b0 head). It runs two
                                                padding at the end of shorter flights never changes the real steps.
     step(state, observations, prev_actions)    one frame per row, the memory carried in state, for the context wrapper
 drop_tau removes tau (o_t[3], time left) inside the encoder, so the encoder sees only y, v_x + noise, v_y and the action.
+context_head="gaussian" (teacher T2 of ENCODER_PLAN.md) makes the head's last layer output two values, the estimate
+(the mean, through the sigmoid) and its variance (softplus + 1e-6, as A's Gaussian head). forward and step still return
+the estimate; forward_with_variance and step_with_variance return the variance too.
 
     GRUEncoder      input projection (in -> hidden), a GRU (layers x hidden), head (hidden -> head_arch -> 1, tanh,
                     sigmoid). With tau and A's head (128, 128) it is step4_probes.py's GRU, parameter names included,
@@ -36,15 +39,17 @@ from torch.nn import functional as F
 OBSERVATION_DIM, ACTION_DIM = 4, 2
 TAU_INDEX = 3
 DEFAULT_HEAD_ARCH = (128, 128)        # A's context head (config/cppo.yaml cppo.context_net_arch), tanh
+CONTEXT_HEADS = ("point", "gaussian")
+MIN_VARIANCE = 1e-6                   # A's Gaussian head (contextual_ppo.torch_layers.MIN_CONTEXT_VARIANCE)
 
 
-def mlp_head(width: int, head_arch, sigmoid: bool) -> nn.Sequential:
-    """width -> head_arch -> 1 with tanh between layers (stable_baselines3's create_mlp layout), then a sigmoid."""
+def mlp_head(width: int, head_arch, sigmoid: bool, outputs: int = 1) -> nn.Sequential:
+    """width -> head_arch -> outputs with tanh between layers (stable_baselines3's create_mlp layout), then a sigmoid."""
     layers, last = [], width
     for size in head_arch:
         layers += [nn.Linear(last, size), nn.Tanh()]
         last = size
-    layers.append(nn.Linear(last, 1))
+    layers.append(nn.Linear(last, outputs))
     if sigmoid:
         layers.append(nn.Sigmoid())
     return nn.Sequential(*layers)
@@ -56,18 +61,23 @@ class RecurrentBatteryEncoder(nn.Module):
     ARCH = ""
 
     def __init__(self, drop_tau: bool = False, hidden: int = 128, layers: int = 2, head_arch=DEFAULT_HEAD_ARCH,
-                 aux_dim: int | None = None) -> None:
+                 aux_dim: int | None = None, context_head: str = "point") -> None:
         super().__init__()
         if aux_dim not in (None, 1):
             raise ValueError("aux_dim must be None or 1")
+        if context_head not in CONTEXT_HEADS:
+            raise ValueError(f"context_head must be one of {CONTEXT_HEADS}, got {context_head!r}")
         self.observation_dim, self.action_dim = OBSERVATION_DIM, ACTION_DIM
         self.drop_tau, self.hidden, self.layers = bool(drop_tau), int(hidden), int(layers)
         self.input_dim = OBSERVATION_DIM - int(self.drop_tau) + ACTION_DIM
+        self.context_head = context_head
         self.rnn = nn.GRU(self.hidden, self.hidden, num_layers=self.layers, batch_first=True)
-        self.head = mlp_head(self.hidden, head_arch, sigmoid=True)
+        # Gaussian: the last layer outputs the mean and the variance, each through its own activation (heads)
+        self.head = (mlp_head(self.hidden, head_arch, sigmoid=True) if context_head == "point"
+                     else mlp_head(self.hidden, head_arch, sigmoid=False, outputs=2))
         self.aux_head = None if aux_dim is None else mlp_head(self.hidden, head_arch, sigmoid=False)
         self.kwargs = {"drop_tau": self.drop_tau, "hidden": self.hidden, "layers": self.layers,
-                       "head_arch": [int(x) for x in head_arch], "aux_dim": aux_dim}
+                       "head_arch": [int(x) for x in head_arch], "aux_dim": aux_dim, "context_head": context_head}
 
     def inputs(self, observations: th.Tensor, prev_actions: th.Tensor) -> th.Tensor:
         """[..., 4] and [..., 2] -> [..., input_dim]: tau dropped if drop_tau."""
@@ -78,20 +88,45 @@ class RecurrentBatteryEncoder(nn.Module):
             observations = observations[..., :TAU_INDEX]
         return th.cat([observations, prev_actions], dim=-1)
 
+    def heads(self, memory: th.Tensor) -> tuple[th.Tensor, th.Tensor | None, th.Tensor | None]:
+        """The estimate, its variance (Gaussian head; else None) and the auxiliary output (else None)."""
+        out = self.head(memory)
+        if self.context_head == "point":
+            estimate, variance = out[..., 0], None
+        else:
+            estimate, variance = th.sigmoid(out[..., 0]), F.softplus(out[..., 1]) + MIN_VARIANCE
+        return estimate, variance, None if self.aux_head is None else self.aux_head(memory)[..., 0]
+
     def outputs(self, memory: th.Tensor) -> tuple[th.Tensor, th.Tensor | None]:
-        estimate = self.head(memory)[..., 0]
-        return estimate, None if self.aux_head is None else self.aux_head(memory)[..., 0]
+        estimate, _, aux = self.heads(memory)
+        return estimate, aux
+
+    def sequence_memory(self, observations: th.Tensor, prev_actions: th.Tensor) -> th.Tensor:
+        memory, _ = self.rnn(self.sequence_features(self.inputs(observations, prev_actions)))
+        return memory
+
+    def step_memory(self, state: dict, observations: th.Tensor, prev_actions: th.Tensor) -> tuple[th.Tensor, dict]:
+        features, new_state = self.step_features(state, self.inputs(observations, prev_actions))
+        memory, h = self.rnn(features[:, None, :], state["h"])
+        return memory[:, 0], {**new_state, "h": h}
 
     def forward(self, observations: th.Tensor, prev_actions: th.Tensor) -> tuple[th.Tensor, th.Tensor | None]:
         """Whole flights from their first step: [B, L, 4], [B, L, 2] -> estimates [B, L] and auxiliary outputs [B, L]."""
-        memory, _ = self.rnn(self.sequence_features(self.inputs(observations, prev_actions)))
-        return self.outputs(memory)
+        return self.outputs(self.sequence_memory(observations, prev_actions))
+
+    def forward_with_variance(self, observations: th.Tensor, prev_actions: th.Tensor):
+        """As forward, plus the variance [B, L] (None with the point head): estimates, variances, auxiliary outputs."""
+        return self.heads(self.sequence_memory(observations, prev_actions))
 
     def step(self, state: dict, observations: th.Tensor, prev_actions: th.Tensor) -> tuple[th.Tensor, th.Tensor | None, dict]:
         """One frame per row: [B, 4], [B, 2] -> estimates [B], auxiliary outputs [B] and the new state."""
-        features, new_state = self.step_features(state, self.inputs(observations, prev_actions))
-        memory, h = self.rnn(features[:, None, :], state["h"])
-        return (*self.outputs(memory[:, 0]), {**new_state, "h": h})
+        memory, new_state = self.step_memory(state, observations, prev_actions)
+        return (*self.outputs(memory), new_state)
+
+    def step_with_variance(self, state: dict, observations: th.Tensor, prev_actions: th.Tensor):
+        """As step, plus the variance [B] (None with the point head): estimates, variances, auxiliary outputs, state."""
+        memory, new_state = self.step_memory(state, observations, prev_actions)
+        return (*self.heads(memory), new_state)
 
     def initial_state(self, batch: int) -> dict:
         param = next(self.parameters())
@@ -124,8 +159,8 @@ class GRUEncoder(RecurrentBatteryEncoder):
     ARCH = "gru"
 
     def __init__(self, drop_tau: bool = False, hidden: int = 128, layers: int = 2, head_arch=DEFAULT_HEAD_ARCH,
-                 aux_dim: int | None = None) -> None:
-        super().__init__(drop_tau, hidden, layers, head_arch, aux_dim)
+                 aux_dim: int | None = None, context_head: str = "point") -> None:
+        super().__init__(drop_tau, hidden, layers, head_arch, aux_dim, context_head)
         self.input_projection = nn.Linear(self.input_dim, self.hidden)
 
     def sequence_features(self, x: th.Tensor) -> th.Tensor:
@@ -139,8 +174,8 @@ class ConvGRUEncoder(RecurrentBatteryEncoder):
     ARCH = "convgru"
 
     def __init__(self, drop_tau: bool = False, hidden: int = 128, layers: int = 2, head_arch=DEFAULT_HEAD_ARCH,
-                 aux_dim: int | None = None, conv_channels: int = 32, window: int = 16) -> None:
-        super().__init__(drop_tau, hidden, layers, head_arch, aux_dim)
+                 aux_dim: int | None = None, conv_channels: int = 32, window: int = 16, context_head: str = "point") -> None:
+        super().__init__(drop_tau, hidden, layers, head_arch, aux_dim, context_head)
         if window < 2:
             raise ValueError("window must be at least 2")
         self.window, self.channels = int(window), self.input_dim + 1           # + the valid channel
