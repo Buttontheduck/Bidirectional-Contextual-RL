@@ -20,6 +20,8 @@ python run_grid.py --dry-run
 python run_grid.py --smoke --jobs 2 --threads 1          # tiny correctness check, W&B disabled, runs_cppo/grid_smoke/
 python run_grid.py --jobs 4 --threads 4                  # production; --stage screen|followup to split
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 python evaluate_final_test.py --grid runs_cppo/grid
+python evaluate_final_test.py --reports <report_step0 reports> --conditions 0a 0b 2a_ideal 4a_encoder ... --output runs_step0/final_test_all.json --jobs 16   # final test of step 0-4 runs (seeds 2000-2002): validation reproduced first, then each run's grid with the reserved seeds; final_test.json per run, reused
+python -m unittest checks.final_test_checks -v
 
 # Config/grid checks (tracked in git)
 python -m unittest checks.grid_checks -v

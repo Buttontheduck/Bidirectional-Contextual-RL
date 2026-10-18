@@ -1511,6 +1511,96 @@ python step4_closed_loop.py --reports runs_step0/frozen_teacher_t1/step0_report_
   - The encoder-seed check: T1 seeds 0 and 2 (the next best by validation, 0.0925) under batch 1024, PPO seeds 0–7 (16 runs, about 12 minutes).
   - Optionally, T2 with the policy also reading the encoder's uncertainty.
 
+### The final test (2026-10-18)
+
+The reserved final-test flights (seeds 2000–2002), used once, after all training and selection, on the frozen final checkpoints of the plain-PPO conditions:
+- memoryless PPO (`0a_blind` / `0b_blind`)
+- the true battery (`0a` / `0b`)
+- the ideal estimate (`2a_ideal` / `2b_ideal`)
+- the frozen GRU trained on true-battery labels (`4a_encoder` / `4b_encoder`: s1 at both batch sizes, s0 and s4 at batch 1024)
+- the frozen GRU trained on the ideal estimate (T1 s3, both batch sizes)
+
+That is 96 runs, 8 PPO seeds each.
+
+**How:** `evaluate_final_test.py --reports` (new; its A–F `--grid` mode is unchanged).
+- **Validation first:** every run is scored again on the validation flights, and must reproduce its report's final validation exactly. All 96 did, so these are the models that were reported.
+- **Then the final test:** each run's own validation grid with only the seeds replaced by the reserved ones. For a Contextual PPO config that is its `final_test` grid. The grid is refused if those seeds overlap the run's validation or training seeds.
+- **Once only:** each run keeps its result in its directory (`final_test.json`), which is reused, never overwritten.
+- **Checks:** `checks.final_test_checks`.
+- **A bug fixed on the way:** the first launch didn't limit numpy's BLAS threads in the workers, and the ideal estimator oversubscribed the server (load about 450). The script now gives every worker one thread, as `run_step0.py` does. That changed only the speed; the 17 runs finished before the fix had reproduced their validation.
+- **Summary:** `runs_step0/final_test_all.json`.
+
+```bash
+python evaluate_final_test.py --reports runs_step0/20261014-020124/report_blind_and_A.json \
+  runs_step0/20261013-042940/step0_report_rs0.1_seeds0-7.json runs_step0/20261014-044145/step0_report_ideal.json \
+  runs_step0/frozen_gru_a/step0_report_encoder_E1_gru_point_main_s1.json runs_step0/frozen_gru_b/step0_report_encoder_E1_gru_point_main_s0.json \
+  runs_step0/frozen_gru_b/step0_report_encoder_E1_gru_point_main_s4.json \
+  runs_step0/frozen_teacher_t1/step0_report_encoder_E1_gru_teacher_point_main_s3.json \
+  --conditions 0a_blind 0b_blind 0a 0b 2a_ideal 2b_ideal 4a_encoder 4b_encoder --output runs_step0/final_test_all.json --jobs 16
+```
+
+**Final test** (18 flights per run, mean ± std across 8 PPO seeds; the last column is the same checkpoints on the validation flights):
+
+| Battery input | Batch | Final test (median) | Worst seed | Completed | Battery empty | Crashed | Validation |
+|---|---|---:|---:|---:|---:|---:|---:|
+| None (memoryless) | 256 | 49 ± 45 (28) | 5 | 25% | 75% | 0% | 28 |
+| True battery | 256 | 283 ± 66 (278) | 209 | 90% | 4% | 6% | 251 |
+| Ideal estimate | 256 | 316 ± 39 (320) | 262 | 97% | 3% | 0% | 265 |
+| Frozen GRU, true-battery labels (s1) | 256 | 238 ± 40 (246) | 184 | 92% | 8% | 0% | 204 |
+| **Frozen GRU, ideal estimate as teacher (T1 s3)** | 256 | **330 ± 46 (338)** | 250 | 86% | 10% | 3% | 294 |
+| None (memoryless) | 1024 | 119 ± 65 (129) | −31 | 17% | 83% | 0% | 79 |
+| True battery | 1024 | 280 ± 36 (288) | 225 | 92% | 1% | 7% | 236 |
+| Ideal estimate | 1024 | 348 ± 12 (351) | 331 | 97% | 1% | 1% | 308 |
+| Frozen GRU, true-battery labels (s1) | 1024 | 184 ± 206 (217) | −299 | 76% | 17% | 7% | 157 |
+| Frozen GRU, true-battery labels (s0 / s4) | 1024 | 240 ± 86 / 152 ± 116 | 98 / 19 | 81% / 45% | 15% / 51% | 4% / 4% | 204 / 125 |
+| **Frozen GRU, ideal estimate as teacher (T1 s3)** | 1024 | **319 ± 56 (326)** | 220 | 76% | 18% | 6% | 286 |
+
+**Differences** (Welch's t-test and Mann–Whitney U, 8 seeds against 8):
+
+| Comparison | Batch 256 | Batch 1024 |
+|---|---|---|
+| T1 − GRU on labels | +92 (p 0.0008 / 0.003), against s1 | +79 (p 0.05 / 0.07), against s0; +135 against s1 (p 0.11, its collapsed seed) |
+| T1 − true battery | +47 (p 0.12 / 0.08) | +38 (p 0.13 / 0.13) |
+| T1 − ideal estimate | +14 (p 0.53 / 0.44) | −29 (p 0.19 / 0.38) |
+| GRU on labels − true battery | −45 (p 0.12), s1 | −40 (p 0.25), s0 |
+| Ideal estimate − true battery | +33 (p 0.25) | +68 (p 0.001) |
+| Frozen encoder − memoryless | GRU on labels +189, T1 +281 (both p < 0.001) | T1 +200 (p < 0.001); GRU on labels s0 +122 (p 0.007), s1 +65 (p 0.42), s4 +33 (p 0.50) |
+| True battery − memoryless | +235 (p < 0.001) | +162 (p < 0.001) |
+
+**Share of the gap from memoryless to the ideal estimate, final test:**
+- batch 256: GRU on labels 71%, T1 105%, true battery 88%
+- batch 1024: GRU on labels 53% (s0), T1 87%, true battery 71%
+
+**By starting battery** (final test, mean return, completed in brackets):
+
+| | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 |
+|---|---:|---:|---:|---:|---:|---:|
+| Memoryless, 256 | −186 (0%) | −118 (0%) | −34 (4%) | 55 (12%) | 185 (38%) | 390 (96%) |
+| True battery, 256 | −100 (42%) | 199 (100%) | 266 (100%) | 348 (100%) | 442 (100%) | 544 (100%) |
+| Ideal estimate, 256 | 83 (79%) | 202 (100%) | 269 (100%) | 349 (100%) | 446 (100%) | 548 (100%) |
+| GRU on labels s1, 256 | 55 (54%) | 231 (100%) | 243 (100%) | 266 (100%) | 303 (100%) | 330 (100%) |
+| T1, 256 | −4 (38%) | 193 (79%) | 322 (100%) | 400 (100%) | 488 (100%) | 582 (100%) |
+| Ideal estimate, 1024 | 149 (88%) | 213 (96%) | 288 (100%) | 370 (100%) | 476 (100%) | 590 (100%) |
+| T1, 1024 | −125 (4%) | 160 (67%) | 303 (88%) | 425 (100%) | 525 (100%) | 625 (100%) |
+
+**What it shows:**
+- **The ranking and the gaps hold on unseen flights.** Every condition scores 20–51 points higher than on validation (the starting heights and speeds are drawn per seed, and these flights are a little easier), but about equally, so the differences carry over. T1 minus GRU at batch 256 is +90 on validation and +92 on the final test.
+- **T1 is on a level with the ideal estimate:**
+  - At batch 256: 330 against 316. That is 105% of the gap from memoryless to the ideal estimate.
+  - At batch 1024: 319 against 348, 87%. The difference is not significant at 8 seeds.
+  - T1 scores above the true battery at both batch sizes (+47 / +38), but not significantly.
+- **T1 clearly beats the GRU trained on labels at batch 256** (+92, p < 0.001). At batch 1024 the gain is +79 to +135, with p 0.05–0.11.
+- **The GRU trained on labels collapses again on new flights:** s1's collapsed seed scores −299. T1's worst seed is 220.
+- **Different pilots, by starting battery:**
+  - **The ideal-estimate and true-battery policies agree from 0.3 up.** The ideal-estimate policies save most of the 0.2 flights (79–88% completed, against 42–50% with the true battery), which is where their lead over the true battery comes from.
+  - **T1's policies earn the most at high batteries** (582 / 625 at 0.7) but lose most of the lowest-battery flights.
+  - **The GRU on labels' policies fly one careful style:** nearly all flights completed, little extra on high batteries (330 at 0.7).
+  - **T1's encoder is the better one,** but its policies haven't learned the low-battery end as well as the ideal estimate's.
+- **What the paper can claim from the final test:**
+  - The environment is valid: knowing the battery is worth +162 to +235.
+  - At batch 1024, two of the three GRU-on-labels encoders (s1, s4) are not significantly better than memoryless.
+  - A memory agent whose encoder is trained offline (on true-battery labels, or better, on the ideal estimate) and then frozen gets 53–71% of the way to the ideal estimate with labels, and 87–105% with the teacher.
+
 ## Next steps
 
 **Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).
@@ -1532,6 +1622,14 @@ python step4_closed_loop.py --reports runs_step0/frozen_teacher_t1/step0_report_
 4. **Joint training (J0–J5, done 2026-10-17):** Contextual PPO with a GRU encoder trained together with the policy. The best rung, J1, scores 114, about the memoryless level, against 209 for the frozen GRU. Only more encoder training helped. Next options: start Contextual PPO from the pretrained GRU, or mix pilot flights into its encoder data. If the shortfall turns out to come from early-flight error, the easy environment is plan B.
 5. **Optional:**
    - Train on the ideal estimator as a teacher (section 3). Done 2026-10-18 (T1 and T2, 5 seeds each, above): test 0.0933, against 0.0972 for the GRU cell and the 0.0853 floor; T2 matches T1 and its uncertainty is calibrated. T1 frozen under plain PPO (done 2026-10-18): 291 at batch 256 and 262 at batch 1024, against 209 / 164 for the working GRU, the true battery's 246 / 258 and the ideal estimate's 283 / 323; on its policies' own flights it is 0.012–0.016 from the ideal estimator, with no overestimation. Next: the encoder-seed check (T1 seeds 0 and 2 under batch 1024).
+   - The final test (seeds 2000–2002, done 2026-10-18, above), batch 256 / 1024:
+     - memoryless 49 / 119
+     - true battery 283 / 280
+     - ideal estimate 316 / 348
+     - GRU on labels 238 / 184 (s0 240)
+     - T1 330 / 319
+
+     The ranking and gaps of the validation flights hold.
    - Freeze A's own encoder under plain PPO (step 2's next steps).
    - Add earlier PPO checkpoints (0.5M / 1M / 1.5M steps) or more seeds as pilots, if the encoder's error is limited by data.
    - Start from the pretrained encoder and keep training it online, as CPPO does (section 5).
