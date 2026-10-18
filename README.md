@@ -221,8 +221,10 @@ Stable-Baselines3 PPO with a recurrent context encoder. It doesn't depend on Bat
 - **Controls:** `cppo.context_source=oracle` replaces the encoder with the true battery, `z_t = b_t`, read from an observed-mode observation (`step0_oracle.py`). `cppo.context_source=none` removes it altogether (`z_t = 0`, hidden mode): Contextual PPO without memory, the matched memoryless control for experiment A. `step1_controls.py` adds noise of a chosen size or schedule to that battery. These separate "can the policy use a battery estimate?" from "can the encoder produce one?".
 - **Experiment grid A–F** (`GRID_PLAN.md`): point vs. Gaussian estimate, beta-NLL, whether the variance is an input, and the speed head. Three seeds each.
 - **A frozen encoder trained offline** (`ENCODER_PLAN.md`, step 4): `train_encoder.py` trains an encoder on the pilot flights of `pilots.py`. It can be experiment A's xLSTM or a GRU / ConvGRU from `recurrent_encoders.py`. `context_wrapper.py` then appends its frozen battery estimate to plain PPO's observation (`run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models ...`).
+- **The ideal estimator as a teacher:** `train_encoder.py --target teacher` trains the GRU on the ideal estimator's estimate instead of the true battery. The targets come from `step4_floor.py --splits train validation test`. With `--context-head gaussian` the GRU learns the ideal estimator's uncertainty as well.
+- **Joint training with a GRU encoder** (`config/joint/`, J0–J5): `cppo.encoder_arch=gru`, with options for more encoder training per update, a warm-up before PPO starts (`policy_warmup_steps`), and a curiosity bonus for flights that reveal the battery (`cppo.curiosity`).
 
-## 6. Where things stand (2026-10-17)
+## 6. Where things stand (2026-10-18)
 
 Details, tables and W&B groups are in `ENCODER_PLAN.md`. Scores are mean validation returns over the last quarter of training (1.5M–2M steps) unless noted.
 
@@ -234,13 +236,17 @@ Details, tables and W&B groups are in `ENCODER_PLAN.md`. Scores are mean validat
 | Contextual PPO with the true battery | Yes | Oracle | 282 | 86% |
 | Contextual PPO with its learned encoder (experiment A rerun, 3 seeds) | No, inferred | xLSTM | 22 | 17% |
 | Plain PPO with the ideal estimate (batch 256 / 1024) | No, estimated perfectly | Frozen ideal estimator | 283 / 323 | 88% / 92% |
-| **Plain PPO with a frozen GRU trained offline** (batch 256 / 1024) | No, inferred | Frozen GRU | **209** / 164 | **88%** / 73% |
+| Contextual PPO with a GRU encoder trained jointly (best rung, J1, 5 seeds) | No, inferred | GRU | 114 | 23% |
+| Plain PPO with a frozen GRU trained offline on the true battery (batch 256 / 1024) | No, inferred | Frozen GRU | 209 / 164 | 88% / 73% |
+| **Plain PPO with a frozen GRU trained offline on the ideal estimate** (batch 256 / 1024) | No, inferred | Frozen GRU (teacher T1) | **291 / 262** | 81% / 73% |
 
-All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0–2), the same 18 validation flights.
-- **The frozen-GRU row** uses the GRU seed with the best validation error.
-- **At batch 256** all 8 seeds score 167–261.
-- **At batch 1024** one seed collapsed (−294), so the median, 218, is the fairer summary.
-- **Other GRU seeds at batch 1024** score 179 and 120.
+All rows: discount 0.99, reward scale 0.1, 2M steps, the same 18 validation flights. Seeds 0–7, except the A rerun (0–2) and joint training (0–4).
+- **The frozen-GRU rows** use the encoder seed with the best validation error.
+- **GRU trained on the true battery:**
+  - At batch 256, all 8 seeds score 167–261.
+  - At batch 1024, one seed collapsed (−294), so the median, 218, is the fairer summary.
+  - Other encoder seeds at batch 1024 score 179 and 120.
+- **GRU trained on the ideal estimate:** all seeds score 216–333 at batch 256 and 189–316 at batch 1024, with no collapse. Only one encoder seed has been tested so far.
 
 **Battery estimates on held-out pilot flights** (error in battery units, 1,900 test flights of 11 pilot styles):
 
@@ -249,7 +255,9 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0
 | Clock only (the mean battery at each flight step) | 0.144 | 0% |
 | A's xLSTM trained offline, stopped by impatient early stopping | 0.129 | 26% |
 | A's xLSTM trained offline, given enough passes (6 runs) | 0.101–0.107 (mean 0.103) | about 70% |
-| GRU trained offline (5 seeds) | 0.097 | 80% |
+| GRU trained offline on the true battery (5 seeds) | 0.097 | 80% |
+| GRU trained offline on the ideal estimate, T1 (5 seeds) | 0.093 | 86% |
+| GRU trained on the ideal estimate and its uncertainty, T2 (5 seeds) | 0.093 | 86% |
 | Ideal estimator (exact physics, the same inputs) | 0.085 | 100% |
 
 **What this shows so far:**
@@ -265,6 +273,14 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, seeds 0–7 (the A rerun: 0
 - **How a policy flies decides what can be known about its battery.** Measured on PPO's own flights (the closed-loop check):
   - Policies that never fly at the cap hide the battery from everyone, the ideal estimator included.
   - Policies that probe reveal it. There the GRU lags the ideal estimate and overestimates the battery after about 5 s, which caused the one collapsed run.
+- **Training the encoder on the ideal estimate instead of the true battery closes most of what was left.**
+  - **Offline the gain is small:** 0.097 → 0.093 on the test flights, a third of the remaining gap to the ideal estimator. T1 is ahead of the GRU trained on the true battery at every pass, in every seed, so it isn't just longer training.
+  - **Inside PPO it is large:** 291 at batch 256 (above the true battery's 246, on a level with the ideal estimate's 283) and 262 at batch 1024 (on a level with the true battery's 258).
+  - **The reason:** on the PPO policies' own flights, the teacher-trained GRU stays within 0.012–0.016 of the ideal estimate, with no overestimation after probing, where the GRU trained on the true battery was 0.03–0.05 off.
+  - **Why the target matters:** where the battery can't be known, the true battery is a noisy label. The ideal estimate is the clean version of the best possible guess.
+  - **The catch:** the teacher knows the exact physics, the prior and the speed noise, so this encoder isn't purely learned from experience.
+  - **Learning the uncertainty as well (T2)** costs no accuracy, and its uncertainty is calibrated (squared error over its variance about 1).
+- **Joint training still fails.** Contextual PPO with a GRU encoder trained alongside the policy reaches 114 at best (J1, 16 times more encoder training), about the memoryless level (115). An entropy bonus, a Gaussian head, a curiosity bonus and a warm-up on random flights didn't help. The policy flies narrowly, so its encoder learns a clock again (R² about 0.8 on its own flights).
 - **A likely reason A failed, not tested directly:** inside Contextual PPO the encoder got about 1,950 supervised steps of 16 episodes (A–F, 1M steps), or 3,900 (the A rerun, 2M). It trained on its own clock-like flights. That is less training, on narrower data, than the offline encoders needed before their click (about 4,300–5,200 steps of 32 varied flights).
 
 **Why, from the step 1 controls**, which replace the encoder with the true battery plus controlled noise:
@@ -284,12 +300,14 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 - the ideal estimator as a target at every flight step
 - offline encoder training on varied pilot flights (`pilots.py`, `train_encoder.py`)
 - plain PPO with the frozen encoder, and its closed-loop check
+- joint training of Contextual PPO with a GRU encoder (J0–J5)
+- the ideal estimator as a teacher (T1, T2), and plain PPO with the frozen teacher-trained GRU
 
 **Next steps** (`ENCODER_PLAN.md`):
 
-1. Train the encoder also on flights of the frozen-GRU PPO policies (probe-then-glide flights, and the collapsed run's), where it overestimates the battery.
-2. Train it on the ideal estimator's estimate as a teacher, a target that is unbiased given what can be seen.
-3. Return to Contextual PPO with a pretrained encoder, or with much more encoder training per update.
+1. Check the encoder seed: T1 seeds 0 and 2 frozen under plain PPO at batch 1024, as was done for the GRU trained on the true battery.
+2. Let the policy also read T2's uncertainty, as the ideal estimate's uncertainty was tested in step 2.
+3. Return to Contextual PPO with the teacher-trained encoder as a starting point, or with the ideal estimate as the joint encoder's target.
 
 **An easy alternative environment** (`EASY_ENV_WARMUP.md`, not implemented): a 5-second autopilot take-off at full throttle before the agent takes control reveals the battery to the encoder, while the battery at hand-over stays uniform on 0.2–0.7. It removes the hardest autogenic step (deciding to spend battery to learn the battery), so the current environment stays the main, hard version. Reconsidered on 2026-10-17 and kept as plan B.
 
@@ -304,13 +322,13 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 | `step0_oracle.py`, `step1_controls.py` | The true-battery and noisy-battery controls |
 | `context_wrapper.py` | A frozen battery estimate (the ideal estimator, a saved xLSTM, or a GRU / ConvGRU `encoder.pt`) appended to plain PPO's observations |
 | `pilots.py` | Pilot flights in many styles for training a battery encoder offline |
-| `train_encoder.py`, `recurrent_encoders.py` | Offline encoder training (A's xLSTM, GRU, ConvGRU; resume and finalize) and the standalone GRU / ConvGRU encoders |
-| `step1_ideal_estimator.py`, `step4_floor.py` | The ideal estimator (exact physics, the encoder's inputs) and the floor it sets on the pilot flights |
+| `train_encoder.py`, `recurrent_encoders.py` | Offline encoder training (A's xLSTM, GRU, ConvGRU; the true battery or the ideal estimate as the target; resume and finalize) and the standalone GRU / ConvGRU encoders, with an optional Gaussian head |
+| `step1_ideal_estimator.py`, `step4_floor.py` | The ideal estimator (exact physics, the encoder's inputs), the floor it sets on the pilot flights, and the teacher targets |
 | `step4_probes.py`, `step4_closed_loop.py` | Encoder diagnostics: the counting and finding tasks, GRU / LSTM vs xLSTM, and the encoder on PPO's own flights |
 | `flight_logging.py` | Flight diagnostics shared by both learners (validation, rollouts, gradient norms, final validation) |
 | `run_grid.py`, `run_step0.py`, `report_step0.py`, `evaluate_final_test.py` | Launchers, reports and the one-time final test |
 | `step1_fly_with_noise.py`, `step1_encoder_error.py`, `step2_swap_battery.py` | Step 1 and step 2 analyses |
-| `checks/` | `unittest` checks: configs, seeds, logging, controls, the context wrapper, the pilots, and encoder training (`step0`–`step4_checks`) |
+| `checks/` | `unittest` checks: configs, seeds, logging, controls, the context wrapper, the pilots, encoder training and joint training (`step0`–`step4_checks`, `joint_checks`) |
 | `GRID_PLAN.md`, `ENCODER_PLAN.md` | The A–F grid; the encoder-versus-policy plan with all results so far |
 | `EASY_ENV_WARMUP.md`, `warmup_information.py` | The easy alternative environment (forced take-off) and its measurement |
 | `CLAUDE.md` | Working notes: commands, architecture, protocol rules |
@@ -328,7 +346,7 @@ python main_battery_plane_contextual_ppo.py +step0=cppo_oracle training.seed=0 w
 python ppo/main_battery_plane_ppo.py +experiment=S0a_observed_bs256 training.seed=0        # plain PPO, observed mode
 python train_encoder.py --design E1 --arch gru --seed 0 --smoke                            # offline encoder training, tiny run
 python -m unittest checks.grid_checks checks.step0_checks checks.step1_checks checks.step2_checks checks.step3_checks \
-    checks.step4_checks checks.logging_checks
+    checks.step4_checks checks.joint_checks checks.logging_checks
 ```
 
 `CLAUDE.md` lists the launchers that run many seeds in parallel.
