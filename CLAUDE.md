@@ -41,7 +41,7 @@ nohup python run_step0.py --conditions 0a_blind 0b_blind 0c_blind --seeds 0 1 2 
 python step1_ideal_estimator.py --a-runs <A rerun dirs> --pilot-runs <0c dirs, same seeds> --output runs_step0/ideal_estimator.json  # best possible battery estimate on the same flights, ~3 min
 python warmup_information.py                         # EASY_ENV_WARMUP.md: what a forced full-throttle take-off reveals, ~2 min
 nohup python run_step0.py --conditions 2a_ideal 2b_ideal 2a_ideal_std 2b_ideal_std --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1 > run_ideal_ppo.log 2>&1 &   # step 2: plain PPO with the ideal estimate, ~3.5 h
-python step2_swap_battery.py --runs runs_step0/<launch>/runs.json --output runs_step0/<launch>/swap_true_battery.json  # the ideal-estimate policies flown with the true battery instead
+python step2_swap_battery.py --runs runs_step0/<launch>/runs.json --output runs_step0/<launch>/swap_true_battery.json  # the ideal-estimate or frozen-encoder policies flown with the true battery instead (several runs.json files)
 python -m unittest checks.step1_checks -v
 python -m unittest checks.step2_checks -v          # context_wrapper.py: frozen battery estimate appended for plain PPO
 python pilots.py --output runs_encoder/pilot_flights/<name> --jobs 30 --policy-reports <report_step0 reports>  # step 3: pilot flights for the offline encoder, ~5 min

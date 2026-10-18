@@ -1601,6 +1601,74 @@ python evaluate_final_test.py --reports runs_step0/20261014-020124/report_blind_
   - At batch 1024, two of the three GRU-on-labels encoders (s1, s4) are not significantly better than memoryless.
   - A memory agent whose encoder is trained offline (on true-battery labels, or better, on the ideal estimate) and then frozen gets 53–71% of the way to the ideal estimate with labels, and 87–105% with the teacher.
 
+### Wrap-up experiments (2026-10-18)
+
+**1. The final test of the Contextual PPO rows.** The same procedure as above (`evaluate_final_test.py --reports`, validation reproduced first, then the reserved seeds) for:
+- Contextual PPO with the true battery (`0c`, 8 seeds)
+- without context (`0c_blind`, 8 seeds)
+- with its learned xLSTM encoder (the A rerun, 3 seeds)
+- with a jointly trained GRU (J1, 5 seeds)
+
+All 24 reproduced their validation.
+
+| Contextual PPO | Final test (median) | Worst seed | Completed | Battery empty | Crashed | Validation late score |
+|---|---:|---:|---:|---:|---:|---:|
+| With the true battery (`0c`) | 286 ± 70 (291) | 187 | 89% | 3% | 8% | 282 |
+| No context (`0c_blind`) | 155 ± 19 (154) | 120 | 27% | 73% | 0% | 115 |
+| Its learned xLSTM encoder (A rerun, 3 seeds) | 42 ± 66 (78) | −33 | 17% | 83% | 0% | 22 |
+| Joint training with a GRU (J1, 5 seeds) | 150 ± 43 (157) | 84 | 30% | 70% | 0% | 114 |
+
+- **Contextual PPO with the true battery matches plain PPO with the true battery** (283 / 280).
+- **Experiment A stays far below the memoryless control,** and J1 stays at the memoryless level, as on validation.
+
+**2. T1's encoder seed.** T1 encoder seeds 0 and 2 (next best by validation, both 0.0925) frozen under plain PPO at batch 1024, PPO seeds 0–7, the design used for the GRU on labels.
+- **Runs:** 16, about 11 minutes each, 16 at once.
+- **Reports:** `runs_step0/frozen_teacher_t1_seeds/step0_report_encoder_E1_gru_teacher_point_main_s{0,2}.json`.
+- **Final test:** the same procedure as above. All 136 final-tested runs are summarized in `runs_step0/final_test_complete_v2.json`, which supersedes `final_test_all.json`.
+
+| Batch 1024, 8 PPO seeds | Validation late score | Final test (median) | Worst seed (final test) | Completed (final test) |
+|---|---:|---:|---:|---:|
+| T1 encoder s0 | 279 | 313 ± 48 (323) | 234 | 85% |
+| T1 encoder s2 | 272 | 331 ± 23 (337) | 295 | 88% |
+| T1 encoder s3 | 262 | 319 ± 56 (326) | 220 | 76% |
+| GRU on labels s0 / s1 / s4 | 179 / 164 / 120 | 240 / 184 / 152 | 98 / −299 / 19 | 81% / 76% / 45% |
+| True battery / ideal estimate | 258 / 323 | 280 / 348 | 225 / 331 | 92% / 97% |
+
+- **The encoder seed hardly matters for T1:** 262–279 on validation and 313–331 on the final test across its three encoders, against 120–179 and 152–240 for the GRU on labels.
+- **The headline result doesn't rest on one encoder.** All three T1 encoders are above the true battery (280) on the final test, below the ideal estimate (348), and none collapses (worst seeds 220–295).
+
+**3. The swap test.** `step2_swap_battery.py`, now also for frozen-encoder runs, flies every frozen-encoder policy over the validation flights twice (never the final test): once with its own encoder, and once with the true battery in its place (`context.source=true_battery`, the same width). The own-encoder flights reproduce the reports' final validation (checked on one run: 301.9). That is 64 runs, in 22 seconds; the results are in `runs_step0/swap_true_battery_frozen.json`.
+
+```bash
+python step2_swap_battery.py --runs runs_step0/frozen_gru_a/runs.json runs_step0/frozen_gru_b/runs.json \
+  runs_step0/frozen_teacher_t1/runs.json runs_step0/frozen_teacher_t1_seeds/runs.json \
+  --output runs_step0/swap_true_battery_frozen.json --jobs 30
+```
+
+| Policies (8 PPO seeds each) | Own encoder | True battery instead | Change | Seeds better / worse | Wilcoxon p |
+|---|---:|---:|---:|---|---:|
+| T1 s3, batch 256 | 294 | 322 | +28 | 7 / 1 | 0.02 |
+| T1 s3, batch 1024 | 286 | 324 | +38 | 7 / 1 | 0.02 |
+| T1 s0, batch 1024 | 282 | 282 | 0 | 5 / 3 | 0.95 |
+| T1 s2, batch 1024 | 288 | 293 | +5 | 4 / 4 | 0.95 |
+| GRU on labels s1, batch 256 | 204 | 170 | −34 | 3 / 5 | 0.25 |
+| GRU on labels s1, batch 1024 | 157 | 114 | −44 | 0 / 7 | 0.02 |
+| GRU on labels s0, batch 1024 | 204 | 187 | −17 | 3 / 5 | 0.38 |
+| GRU on labels s4, batch 1024 | 125 | 142 | +17 | 7 / 0 | 0.02 |
+| **All T1 runs (32)** | | | **+18** | 23 / 9 | **0.008** |
+| **All GRU-on-labels runs (32)** | | | **−20** | 13 / 17 | 0.08 |
+| Step 2: ideal-estimate runs, batch 256 / 1024 | 265 / 308 | 280 / 310 | +15 / +2 | | |
+
+**What it shows:**
+- **The T1 policies are simply better pilots,** as step 2 found for the ideal-estimate policies.
+  - Given the true battery they score as well or better (+18 on average, 23 of 32 runs better).
+  - So their lead over plain PPO trained with the true battery doesn't come from extra information in the estimate. It comes from how they learned to fly.
+  - The small gain with the true battery is what T1's remaining estimation error costs them.
+- **The GRU-on-labels policies learned to read a distorted signal.** Given the true battery, most score worse (−20 on average; s1's policies lose in 7 of 8 seeds at batch 1024).
+  - Their encoder's estimate is biased in a way that depends on the starting battery (the closed-loop check: +0.18 to +0.20 at 0.2, −0.11 to −0.13 at 0.7).
+  - The policies adapted to that bias, so the truth is an unfamiliar input to them.
+- **For the T1 policies, their encoder's estimate and the true battery are interchangeable inputs.** That is the practical sense in which T1 "learned the battery".
+
 ## Next steps
 
 **Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).
