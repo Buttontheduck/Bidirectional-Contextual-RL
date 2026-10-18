@@ -1454,6 +1454,63 @@ done
   - GRU cell: 0.0945–0.0990
 - **Later option:** T2 makes a second PPO test possible, with the policy also reading the encoder's uncertainty (the context wrapper would need to pass on the variance).
 
+**Plain PPO with the frozen T1 encoder (launched 2026-10-18 04:55 UTC, all 16 runs done by 05:07 UTC).**
+- **Design:** step 4's frozen-GRU design with T1 seed 3 (chosen by validation, 0.0918) as the encoder: `4a_encoder` (batch 256) and `4b_encoder` (batch 1024), PPO seeds 0–7, 16 runs at once, 1 thread each, about 12 minutes per run.
+- **Only the encoder differs:** the resolved configs differ from the working GRU's runs only in `context.encoder_model`, `context.encoder_tag` and the W&B names, e.g. `S4a_encoder_bs256_E1_gru_teacher_point_main_s3_gamma0.99_rs0.1_s0`.
+- **Seeds:** the same as the working GRU's runs: environment seeds 0–707 for training and 1000–1002 for validation. The encoder trained only on pilot flights with seeds from 100,000 up. The final-test seeds 2000–2002 are used nowhere.
+- **Report:** `runs_step0/frozen_teacher_t1/step0_report_encoder_E1_gru_teacher_point_main_s3.json`. Closed-loop check: `runs_step0/closed_loop_frozen_t1.json`.
+
+```bash
+nohup python run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models runs_encoder/step4_teacher/E1_gru_teacher_point_main_s3/encoder.pt \
+  --seeds 0 1 2 3 4 5 6 7 --jobs 16 --threads 1 --output runs_step0/frozen_teacher_t1 > run_frozen_teacher_t1.log 2>&1 &
+python step4_closed_loop.py --reports runs_step0/frozen_teacher_t1/step0_report_encoder_E1_gru_teacher_point_main_s3.json \
+  --output runs_step0/closed_loop_frozen_t1.json --jobs 16
+```
+
+| Battery estimate | Batch | Late score ± std (median) | Seeds 0–7 | Final | Completed | Battery empty | Crashed |
+|---|---|---:|---|---:|---:|---:|---:|
+| Working GRU s1 | 256 | 209 ± 39 (210) | 168 203 255 169 216 231 167 261 | 204 | 88% | 12% | 0% |
+| **T1 s3** | **256** | **291 ± 49 (312)** | 270 320 331 216 331 305 333 224 | 294 | 81% | 16% | 3% |
+| Working GRU s1 | 1024 | 164 ± 196 (218) | 330 177 123 280 262 249 −294 187 | 157 | 73% | 22% | 5% |
+| Working GRU s0 | 1024 | 179 ± 68 (192) | 196 145 69 277 109 221 227 187 | 204 | 77% | 16% | 7% |
+| Working GRU s4 | 1024 | 120 ± 111 (101) | 57 −7 244 26 296 165 146 32 | 125 | 43% | 52% | 5% |
+| **T1 s3** | **1024** | **262 ± 45 (270)** | 255 296 216 284 239 189 316 303 | 286 | 73% | 24% | 3% |
+
+**For comparison** (late score, batch 256 / 1024): memoryless 23 / 77, true battery 246 / 258, the ideal estimate 283 / 323.
+
+**The closed-loop check** (T1 on its own PPO policies' validation flights, next to the ideal estimator on the same flights):
+
+| Encoder, batch | Encoder error | Ideal estimator | Encoder minus ideal | Bias | Bias at b0 = 0.2 / 0.7 |
+|---|---:|---:|---:|---:|---|
+| Working GRU s1, 256 | 0.126 | 0.110 | 0.053 | +0.021 | +0.20 / −0.13 |
+| Working GRU s1, 1024 | 0.119 | 0.102 | 0.051 | +0.016 | +0.18 / −0.11 |
+| Working GRU s0, 1024 | 0.106 | 0.092 | 0.043 | −0.011 | +0.15 / −0.12 |
+| Working GRU s4, 1024 | 0.054 | 0.044 | 0.028 | +0.002 | +0.07 / −0.04 |
+| **T1 s3, 256** | **0.051** | 0.046 | **0.016** | **+0.000** | +0.07 / −0.04 |
+| **T1 s3, 1024** | **0.050** | 0.047 | **0.012** | −0.003 | +0.07 / −0.04 |
+
+- **By flight time (T1, batch 256, encoder / ideal):** 0–1 s 0.167 / 0.167; 1–5 s 0.095 / 0.089; 5–10 s 0.034 / 0.028; 10–20 s 0.027 / 0.019; 20–35 s 0.024 / 0.016.
+- **T1's bias after the first second:** between −0.006 and +0.006 in every window, at both batch sizes.
+- **Correlation of a run's encoder error with its late score:** −0.06 over all 16 runs.
+
+**What it shows:**
+- **The teacher-trained encoder lifts PPO to the level of the ideal estimate:**
+  - At batch 256: 209 → 291, about 3.7 standard errors. That is above the true battery (246) and on a level with the ideal estimate (283).
+  - At batch 1024: 262, against 120–179 for the three working-GRU encoders. That is on a level with the true battery (258), still below the ideal estimate (323).
+- **The batch-1024 instability is gone:** no seed collapses (the worst is 189, against −294 with GRU s1).
+- **On PPO's own flights, T1 almost matches the ideal estimator:** 0.012–0.016 from it, against 0.028–0.053 for the working GRU encoders. That is a gap about three times smaller than on the pilot flights (0.035).
+- **The overestimation that caused the collapse is gone.** The bias stays near zero after the first second, where the working GRU s1 overestimated by +0.02 to +0.03.
+- **The policies probe and reveal the battery:** after 5 s the ideal estimator's error on their flights is only 0.013–0.028, and T1 follows it closely.
+- **A small offline gain, a large gain in PPO.** Offline, T1 was only 0.004 better (0.0972 → 0.0933). But the noise-free target taught it to follow the ideal estimate closely right after the battery shows, which is exactly when PPO acts on it. The same GRU trained on the noisy true-battery labels lagged and overestimated there.
+- **Like the ideal estimate in step 2, T1 beats the true battery at batch 256.** A good estimate of what can be known seems to be a better policy input than the exact battery.
+- **Completion is a little lower than with GRU s1** (81% against 88% at batch 256) despite the much higher score. The T1 policies seem to fly more aggressively and earn more per flight.
+- **Caveats:**
+  - Only one T1 encoder (seed 3) was tested. With the working GRU the encoder seed mattered at batch 1024 (120–179).
+  - The teacher brings the physics into training (the dynamics, the prior and the speed noise), so this encoder is not purely learned from experience.
+- **Next:**
+  - The encoder-seed check: T1 seeds 0 and 2 (the next best by validation, 0.0925) under batch 1024, PPO seeds 0–7 (16 runs, about 12 minutes).
+  - Optionally, T2 with the policy also reading the encoder's uncertainty.
+
 ## Next steps
 
 **Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).
@@ -1471,9 +1528,10 @@ done
    - Compare against the ideal estimate (283 / 323), the true battery (246 / 258) and memoryless PPO (23 / 77).
    - Then the closed-loop check: the encoder's error on the PPO policy's own flights.
    - Done 2026-10-17 with the best GRU encoders (step 4 above): 209 ± 36 at batch 256 (88% of flights completed), against 23 without memory, 246 with the true battery and 283 with the ideal estimate. Batch 1024 is unstable with the GRU (one seed collapsed), and the encoder seed matters. The closed-loop check (done): on PPO's own flights the GRU overestimates the battery after probing (+0.03 to +0.06), which caused the collapse. Next: encoder training on these PPO policies' flights, and the ideal estimator as a teacher.
+   - Done 2026-10-18 with the teacher-trained GRU (T1 s3, above): 291 ± 49 at batch 256 and 262 ± 45 at batch 1024, no collapse; on its policies' own flights it stays 0.012–0.016 from the ideal estimator, with no overestimation.
 4. **Joint training (J0–J5, done 2026-10-17):** Contextual PPO with a GRU encoder trained together with the policy. The best rung, J1, scores 114, about the memoryless level, against 209 for the frozen GRU. Only more encoder training helped. Next options: start Contextual PPO from the pretrained GRU, or mix pilot flights into its encoder data. If the shortfall turns out to come from early-flight error, the easy environment is plan B.
 5. **Optional:**
-   - Train on the ideal estimator as a teacher (section 3). Done 2026-10-18 (T1 and T2, 5 seeds each, above): test 0.0933, against 0.0972 for the GRU cell and the 0.0853 floor; T2 matches T1 and its uncertainty is calibrated. Next: T1 frozen under plain PPO.
+   - Train on the ideal estimator as a teacher (section 3). Done 2026-10-18 (T1 and T2, 5 seeds each, above): test 0.0933, against 0.0972 for the GRU cell and the 0.0853 floor; T2 matches T1 and its uncertainty is calibrated. T1 frozen under plain PPO (done 2026-10-18): 291 at batch 256 and 262 at batch 1024, against 209 / 164 for the working GRU, the true battery's 246 / 258 and the ideal estimate's 283 / 323; on its policies' own flights it is 0.012–0.016 from the ideal estimator, with no overestimation. Next: the encoder-seed check (T1 seeds 0 and 2 under batch 1024).
    - Freeze A's own encoder under plain PPO (step 2's next steps).
    - Add earlier PPO checkpoints (0.5M / 1M / 1.5M steps) or more seeds as pilots, if the encoder's error is limited by data.
    - Start from the pretrained encoder and keep training it online, as CPPO does (section 5).
