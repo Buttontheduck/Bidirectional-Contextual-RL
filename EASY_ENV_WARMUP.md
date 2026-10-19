@@ -7,6 +7,26 @@
 - **Still, the forced take-off would probably help the encoder.** It is the full-throttle "find" situation, which the GRU handles well (about 0.06–0.07 after 5 s, near the best possible).
 - **When to switch to the easy version:** if the remaining gap to the ideal estimate turns out to come from early-flight error.
 
+**Update (2026-10-19): left for later work, with a new purpose.**
+- **The hard version doesn't need it any more.** In the hard version, a frozen GRU trained offline on the ideal estimate (teacher T1, ENCODER_PLAN.md) now brings plain PPO to the ideal estimate's level on the final test: 330 / 319 at batch 256 / 1024, against 316 / 348 with the ideal estimate. So the early-flight error isn't what limits the two-stage method.
+- **Its new purpose is a difficulty control for end-to-end learning.** End-to-end Contextual PPO still fails in the hard version (experiment A 42, joint training J1 150, memoryless 155 on the final test). If it closes most of the gap once the take-off reveals the battery for free, that shows the obstacle is the information-gathering loop (deciding to spend battery to learn the battery), not the memory agent.
+- **Code status:** only `warmup_information.py` (section 3) exists. Neither the environment, the learner, the configs nor the checks have been changed yet.
+- **Estimated effort** (this 16-core CPU server):
+
+| Step | Code | Compute |
+|---|---|---|
+| E0: the environment option, its checks, the design report | about 2–3 h | minutes |
+| E1: true-battery agents and memoryless controls | about 30 min | about 20–30 min |
+| E2: PPO with the ideal estimate (the context wrapper runs the calculator over the take-off) | about 1–2 h | about 3.5 h |
+| E3: end-to-end Contextual PPO with prelude support in `contextual_ppo/` (the delicate part) | about 4–6 h plus checks | 4.5 h (A-style xLSTM) to 10 h (J1-style GRU), all seeds at once |
+
+  - E0 + E1, the quick answer to "is the easy version still a fair task?": about half a day.
+  - E0–E3: about two days.
+
+- **On a rented GPU:**
+  - **Offline GRU training with true-battery labels** (`train_encoder.py`) would take about 10–30 min per run, against 2–3.5 h here. That training is whole flights in batches, which suits cuDNN.
+  - **End-to-end Contextual PPO** would gain maybe 1.5–3× per run. It mostly steps the environment and runs the encoder one step at a time for 8 environments; only the encoder's training steps and PPO's re-encoding speed up. Many seeds side by side on this CPU server are about as efficient.
+
 **In one paragraph.** Every flight starts with a short take-off flown by an autopilot at full throttle, which the agent does not control. Full throttle is the only way the battery shows in the plane's behaviour, so this stretch reveals the battery to anyone watching. The agent's memory, the encoder, watches it and can know the battery before the agent makes its first decision. The starting battery is raised by exactly what the take-off uses, so when the agent takes over, its battery is still uniform on 0.2–0.7, as in the current environment. The measurements below say the take-off must last about **5 seconds** (100 steps); 2 seconds reveals almost nothing.
 
 ## 1. Why: what the experiments so far showed

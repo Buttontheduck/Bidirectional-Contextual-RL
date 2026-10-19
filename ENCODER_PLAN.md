@@ -1701,3 +1701,4 @@ python step2_swap_battery.py --runs runs_step0/frozen_gru_a/runs.json runs_step0
    - Freeze A's own encoder under plain PPO (step 2's next steps).
    - Add earlier PPO checkpoints (0.5M / 1M / 1.5M steps) or more seeds as pilots, if the encoder's error is limited by data.
    - Start from the pretrained encoder and keep training it online, as CPPO does (section 5).
+   - Later work (decided 2026-10-19): the easy environment of `EASY_ENV_WARMUP.md` (a 5-second forced take-off), now as a difficulty control for end-to-end learning. Its experiments E0–E4, the decision rules and the effort estimate (about half a day for E0–E1, about two days with end-to-end Contextual PPO) are there. Nothing is implemented yet.
