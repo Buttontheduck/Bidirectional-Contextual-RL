@@ -178,7 +178,8 @@ def switch_sources(runs_files: list[Path], reward_scale: float) -> dict[tuple[st
 
 def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bool = False,
                 reward_scale: float | None = None, study: str | None = None,
-                battery_noise: float | None = None, init_model: Path | None = None, encoder: Path | None = None) -> list[str]:
+                battery_noise: float | None = None, init_model: Path | None = None, encoder: Path | None = None,
+                warmup_steps: int | None = None, transition_steps: int | None = None) -> list[str]:
     script, experiment, learner = CONDITIONS[condition]
     command = [
         sys.executable, str(ROOT / script), experiment, f"training.seed={seed}",
@@ -198,9 +199,17 @@ def command_for(condition: str, seed: int, threads: int, output: Path, smoke: bo
     if init_model is not None:
         # Late switch: the step 0 model this run continues
         command.append(f"training.init_model={json.dumps(str(init_model))}")
-    if study:
-        # Appended to the W&B name and group, e.g. ..._rs0.1_confirm1_s3
-        command.append(f"wandb.study=_{study}")
+    if warmup_steps:
+        # The easy version (EASY_ENV_WARMUP.md): a forced take-off before every flight
+        command.append(f"+env.kwargs.warmup_steps={warmup_steps}")
+    if transition_steps:
+        # ... followed by the flight back to the mission's starting speed
+        command.append(f"+env.kwargs.transition_steps={transition_steps}")
+    # Appended to the W&B name and group, e.g. ..._rs0.1_confirm1_s3, ..._rs0.1_warm100_s3, ..._rs0.1_warm100_trans80_s3
+    suffix = "".join(f"_{part}" for part in ((f"warm{warmup_steps}" if warmup_steps else None),
+                                             (f"trans{transition_steps}" if transition_steps else None), study) if part)
+    if suffix:
+        command.append(f"wandb.study={suffix}")
     if smoke:
         command += [*SMOKE_OVERRIDES, f"paths.output_dir={json.dumps(str(output / 'runs'))}"]
         if condition in EARLY_NOISE_CONDITIONS:
@@ -262,7 +271,8 @@ class Launcher:
                             "battery_noise": battery_noise, **identity, "status": "not started", "log": str(log)}
                 process = subprocess.Popen(
                     command_for(condition, seed, self.args.threads, self.args.output, self.args.smoke, reward_scale,
-                                self.args.study, battery_noise, self.init_model(condition, seed), encoder),
+                                self.args.study, battery_noise, self.init_model(condition, seed), encoder, self.args.warmup_steps,
+                                self.args.transition_steps),
                     cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
                 )
                 self.children.add(process)
@@ -305,6 +315,12 @@ def parse_args(argv=None):
     parser.add_argument("--threads", type=int, default=2, help="CPU threads per run (default: 2)")
     parser.add_argument("--study", default=None,
                         help="Label appended to the W&B names and groups, e.g. confirm1 for more seeds of a screen")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="The easy version (EASY_ENV_WARMUP.md): a forced take-off of this many steps before every flight "
+                             "(env.kwargs.warmup_steps); W&B names and groups end in _warm<steps>")
+    parser.add_argument("--transition-steps", type=int, default=None,
+                        help="With --warmup-steps: after the take-off the autopilot flies back to the mission's starting "
+                             "speed for this many steps (env.kwargs.transition_steps); W&B names and groups add _trans<steps>")
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
     parser.add_argument("--smoke", action="store_true", help="Tiny budget, W&B disabled, run directories in --output")
     parser.add_argument("--output", type=Path, help="Folder for the logs and runs.json (default: runs_step0/<time>)")
@@ -316,6 +332,10 @@ def parse_args(argv=None):
         parser.error("Seeds must be distinct non-negative integers and conditions distinct")
     if args.study is not None and not re.fullmatch(r"[A-Za-z0-9]+", args.study):
         parser.error("--study must be letters and digits, e.g. confirm1")
+    if args.warmup_steps is not None and not 0 < args.warmup_steps < 700:
+        parser.error("--warmup-steps must be between 1 and 699")
+    if args.transition_steps is not None and (args.warmup_steps is None or not 0 < args.transition_steps < 700):
+        parser.error("--transition-steps must be between 1 and 699 and needs --warmup-steps")
     scales = args.reward_scales
     if scales is not None and (min(scales) <= 0 or len({f"{scale:g}" for scale in scales}) != len(scales)):
         parser.error("Reward scales must be distinct and positive")
@@ -375,7 +395,8 @@ def main(argv=None) -> int:
         launcher = Launcher(args)
         for condition, seed, scale, noise, encoder in runs:
             print(shlex.join(command_for(condition, seed, args.threads, args.output, args.smoke, scale, args.study, noise,
-                                         launcher.init_model(condition, seed), encoder)))
+                                         launcher.init_model(condition, seed), encoder, args.warmup_steps,
+                                         args.transition_steps)))
         return 0
     args.output.mkdir(parents=True, exist_ok=False)
     print(f"Logs: {args.output}", flush=True)

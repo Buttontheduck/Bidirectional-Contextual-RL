@@ -49,6 +49,32 @@ Defaults (validated 2026-09-12): T=700 x 0.05 s = 35 s, E=100 hover-s, cap 11.5.
 b0 ~ U[0.2, 0.7], dense_w=1.0, crash_penalty=300. All five rules pass; value of context ~36% of the oracle return.
 (History: E=130 / b0 ~ U[0.2, 1] gave a ~9% gap and no gap at all above b0 = 0.55; E=80 broke the last rule.)
 
+Easy version (EASY_ENV_WARMUP.md), warmup_steps > 0 (default 0: the environment above, unchanged):
+    Every episode starts with a forced take-off: an autopilot flies warmup_steps steps (100 = 5 s) with warmup_action
+    (default (1, 0): full cruise throttle, level flight), the only way b shows in the plane's motion. b0 (sampled
+    U[b0_range] as today, or given by reset options) is the HAND-OVER battery: the starting battery b_start is solved per
+    episode so that the take-off ends exactly at b0, and the agent's first observation is the hand-over state with the
+    whole mission ahead (tau = 1, then T steps). The take-off's physics, drain and speed noise are the normal ones; its
+    rewards are not part of the mission and it never ends a flight (checked). reset() returns the take-off in info:
+    warmup_observations [warmup_steps, obs_dim] (the observation before each autopilot action; tau = 1 throughout) and
+    warmup_actions [warmup_steps, 2] are what the plane showed and may be encoder inputs; warmup_batteries (the true b
+    at those observations) and b_start are privileged. A take-off from b_start = 1 reaches at most about 0.84, so larger
+    hand-over batteries are refused. Only BatteryPlaneEnv flies take-offs: BatteryPlaneVec's own auto-reset refuses
+    them (the design report and simulate() call take_off() themselves). python battery_plane.py --warmup-steps 100
+    prints the design report of the easy version.
+    The take-off alone hands over at a speed set by the battery (a fuller battery accelerates harder), so a memoryless
+    agent reads b from its first observation. transition_steps > 0 (80 = 4 s) adds a transition after the take-off:
+    the same autopilot flies the plane back, level, to the mission's starting speed, so the hand-over state is the
+    reset's (b0, y0, vx0) as in the environment above, with the speed within about 2 m/s, and nothing in it depends
+    on b. The take-off then starts at y0 from a fresh speed U[vx0_range]. The transition autopilot reads only the
+    observations (a filter on the noisy speed: it predicts with its own thrust and the known drag and corrects by each
+    reading) and the target speed, and commands at most h_min, which no cap is below: its actions add nothing about b
+    to the observations, and only the take-off's full throttle shows b. The speed noise of the whole prelude is drawn
+    before it, so the solve for b_start replays the same flight and the hand-over battery stays exact. The record
+    then covers both phases (warmup_steps + transition_steps rows). One second is too short: braking from up to
+    about 50 m/s takes 3 s or more, and a 2 s transition still leaves the battery readable in the hand-over speed.
+    python battery_plane.py --warmup-steps 100 --transition-steps 80 prints its design report.
+
 Evaluation controls (no change to the policy or learning algorithm):
     obs, info = env.reset(seed=0, options={"b0": 0.2, "vx_obs_noise": 2.0, "y0": 100.0, "vx0": 15.0})
     # b0 is the exact starting charge; vx_obs_noise is the speed noise std in m/s; y0/vx0 fix the start state.
@@ -186,6 +212,39 @@ def policy_budgeted(b_stop):
     return pol
 
 
+# ====================================================================================== the easy version's autopilot
+class PreludeAutopilot:
+    """The autopilot of the easy version's prelude (take-off, then transition), one step at a time.
+
+    It reads only the observations it is given (what the agent sees) and the transition's target speeds, which do not
+    depend on the battery: its actions add nothing about b to the observations. Take-off: the core's warmup_action.
+    Transition: level flight (a_y = 0) and a cruise command of at most h_min, below every cap, so the thrust it asks for
+    is the thrust delivered. It tracks the target with a speed estimate that starts from the mean of the last FIRST
+    readings, predicts each step with its own thrust and the drag (the physics' own update) and moves FILTER of the way
+    to each new reading."""
+    GAIN, FILTER, FIRST = 2.0, 0.05, 10     # 1/s; share of each new reading; readings averaged for the first estimate
+
+    def __init__(self, core, target):
+        self.core, self.target = core, np.asarray(target, float)
+        self.k, self.readings, self.v_hat = 0, [], None
+
+    def act(self, obs):
+        """The action after observation obs [n, obs_dim] (float32, as the agent sees it)."""
+        c, n = self.core, len(obs)
+        y, v = obs[:, 0].astype(float) * c.y_ref, obs[:, 1].astype(float) * c.v_ref
+        if self.k < c.warmup_steps:
+            self.readings = (self.readings + [v])[-self.FIRST:]
+            action = np.tile(c.warmup_action, (n, 1))
+        else:
+            self.v_hat = (np.mean((self.readings + [v])[-self.FIRST:], 0) if self.v_hat is None
+                          else self.v_hat + self.FILTER * (v - self.v_hat))
+            ax = np.clip(c.drag(y, self.v_hat) + self.GAIN * (self.target - self.v_hat), -c.h_min, c.h_min)
+            self.v_hat = self.v_hat + c.dt * (ax - c.drag(y, self.v_hat))
+            action = np.stack([ax / c.a_max, np.zeros(n)], 1)
+        self.k += 1
+        return action
+
+
 # ====================================================================================== vectorized core
 class BatteryPlaneVec:
     """Vectorized numpy core (n planes in parallel). The gym wrapper below uses n=1."""
@@ -231,12 +290,18 @@ class BatteryPlaneVec:
         auto_reset: bool = True,        # True: finished planes restart inside step() (vectorized training)
                                         # False: step() returns the final observation (Gymnasium semantics)
         terminal_at_T: bool = True,     # True: t == T is terminated (time-aware agent). False: truncated (v1 behaviour)
+        # easy version (EASY_ENV_WARMUP.md): a forced take-off before the agent takes control. 0 = today's env, unchanged
+        warmup_steps: int = 0,          # steps of the take-off (100 = 5 s); the mission's T steps start after it
+        warmup_action=(1.0, 0.0),       # the autopilot's command during the take-off: full cruise throttle, level flight
+        transition_steps: int = 0,      # steps after the take-off flying back to the mission's starting speed (80 = 4 s);
+                                        # 0 = hand over wherever the take-off ends
     ):
         self._kw = dict(observation_mode=observation_mode, b0_range=b0_range, soc_choices=soc_choices,
                         soc_probs=soc_probs, T=T, dt=dt, g=g, a_max=a_max, c_y=c_y, y_max=y_max, H=H, k_L=k_L,
                         k_D=k_D, h_min=h_min, h_max=h_max, cap_on=cap_on, E_hover_s=E_hover_s, v_min=v_min,
                         v_goal=v_goal, dense_w=dense_w, crash_penalty=crash_penalty, vx_obs_noise=vx_obs_noise,
-                        y_ref=y_ref, v_ref=v_ref, y0_range=y0_range, vx0_range=vx0_range, terminal_at_T=terminal_at_T)
+                        y_ref=y_ref, v_ref=v_ref, y0_range=y0_range, vx0_range=vx0_range, terminal_at_T=terminal_at_T,
+                        warmup_steps=warmup_steps, warmup_action=warmup_action, transition_steps=transition_steps)
         # ---- validation
         if observation_mode not in OBS_MODES:
             raise ValueError(f"observation_mode must be one of {list(OBS_MODES)}, got {observation_mode!r}")
@@ -260,6 +325,18 @@ class BatteryPlaneVec:
             raise ValueError("c_y, dense_w, crash_penalty and vx_obs_noise must be non-negative")
         if not np.isfinite(vx_obs_noise):
             raise ValueError("vx_obs_noise must be finite")
+        if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, (int, np.integer)) or not 0 <= warmup_steps < T:
+            raise ValueError("warmup_steps must be an integer in [0, T)")
+        warmup_action = np.asarray(warmup_action, float)
+        if warmup_action.shape != (2,) or not np.all(np.isfinite(warmup_action)) or np.any(np.abs(warmup_action) > 1):
+            raise ValueError("warmup_action must be two finite values in [-1, 1]")
+        if warmup_steps > 0 and cap_on != "b":
+            raise ValueError("a take-off (warmup_steps > 0) needs cap_on='b'")
+        if (isinstance(transition_steps, bool) or not isinstance(transition_steps, (int, np.integer))
+                or not 0 <= transition_steps < T):
+            raise ValueError("transition_steps must be an integer in [0, T)")
+        if transition_steps > 0 and warmup_steps == 0:
+            raise ValueError("a transition (transition_steps > 0) follows a take-off: it needs warmup_steps > 0")
         if soc_choices is None:
             lo, hi = float(b0_range[0]), float(b0_range[1])
             if not (0.0 < lo <= hi <= 1.0):
@@ -290,6 +367,9 @@ class BatteryPlaneVec:
         self.v_min, self.v_goal, self.dense_w, self.C = v_min, v_goal, dense_w, crash_penalty
         self.y_ref, self.v_ref = y_ref, v_ref
         self.y0_range, self.vx0_range = y0_range, vx0_range
+        self.warmup_steps, self.warmup_action = int(warmup_steps), warmup_action
+        self.transition_steps = int(transition_steps)
+        self.prelude_steps = self.warmup_steps + self.transition_steps
         self.rng = np.random.default_rng(seed)
         self.obs_dim = 5 if self.observe_soc else 4
         z = np.zeros(self.n)
@@ -340,9 +420,13 @@ class BatteryPlaneVec:
         return self.E * self.g ** 2 / slope * (1.0 / self.h_min - 1.0 / self.h_lim(b0))
 
     # ---------------------------------------------------------------- gym plumbing
-    def _obs(self):
+    def _obs(self, noise=None):
+        """Observation of the current state; noise: the speed reading's noise, drawn in advance (the prelude)."""
         tau = 1.0 - self.t / self.T
-        vx_obs = self.vx + self.rng.normal(0.0, self.sigma, size=self.n) if self.sigma > 0 else self.vx
+        if noise is not None:
+            vx_obs = self.vx + noise
+        else:
+            vx_obs = self.vx + self.rng.normal(0.0, self.sigma, size=self.n) if self.sigma > 0 else self.vx
         cols = [self.y / self.y_ref, vx_obs / self.v_ref, self.vy / self.v_ref, tau]
         if self.observe_soc:
             cols.append(self.b)
@@ -443,10 +527,101 @@ class BatteryPlaneVec:
                 "vx": self.vx.copy(), "crashed": failed.copy(), "saturated": saturated,
                 "mission_complete": mission_complete, "final_obs": obs.copy()}
         done = terminated | truncated
+        if self.auto_reset and done.any() and self.warmup_steps > 0:
+            raise RuntimeError("The vectorized auto-reset does not fly the take-off: use auto_reset=False (BatteryPlaneEnv)")
         if self.auto_reset and done.any():
             self._reset_idx(np.where(done)[0])
             obs[done] = self._obs()[done]                   # those planes now report their new episode's first obs
         return obs, r.astype(np.float32), terminated, truncated, info
+
+    # ---------------------------------------------------------------- the forced take-off (easy version)
+    def _fly_prelude(self, sim, target, noise):
+        """Fly the prelude (take-off, then transition) on sim (this core, or a scratch copy for the solve) with the speed
+        readings' noise drawn in advance, noise [n, prelude_steps + 1]: the same noise gives the same flight. Returns the
+        observation before each autopilot action, the actions, the battery at each of those observations, and whether
+        a flight ended during the prelude."""
+        pilot = PreludeAutopilot(self, target)
+        sigma, sim.sigma = sim.sigma, 0.0                   # step() then draws no noise; the readings come from `noise`
+        observations, actions, batteries = [], [], []
+        ended = np.zeros(sim.n, bool)
+        try:
+            obs = sim._obs(noise[:, 0])
+            for k in range(self.prelude_steps):
+                action = pilot.act(obs)
+                observations.append(obs); actions.append(action); batteries.append(sim.b.copy())
+                _, _, term, trunc, _ = sim.step(action)
+                ended |= term | trunc
+                sim.t[:] = 0                                # the mission clock starts at the hand-over (tau = 1)
+                obs = sim._obs(noise[:, k + 1])
+        finally:
+            sim.sigma = sigma
+        return observations, actions, batteries, ended
+
+    def _prelude_end(self, b_start, y0, vx0, target, noise):
+        """Battery at the end of the prelude from each (b_start, y0, vx0) with these target speeds and readings' noise,
+        and whether that flight ended during the prelude."""
+        b_start = np.asarray(b_start, float)
+        sim = BatteryPlaneVec(n_envs=len(b_start), auto_reset=False, seed=0,
+                              **{**self._kw, "observation_mode": "full", "warmup_steps": 0, "transition_steps": 0})
+        sim.reset(b0=b_start, y0=y0, vx0=vx0)
+        *_, ended = self._fly_prelude(sim, target, noise)
+        return sim.b.copy(), ended
+
+    def start_battery_for(self, b_handover, y0, vx0, target=None, noise=None, points=33, rounds=7):
+        """The starting battery whose prelude ends exactly at b_handover, per plane (NaN where even a full battery ends
+        below it). target: the transition's target speeds (needed when transition_steps > 0); noise: the readings'
+        noise [n, prelude_steps + 1] (default none). The prelude is then deterministic and its end battery increases
+        with the start (by about 0.8 to 0.9 per unit), so a grid search refined `rounds` times pins it to about 1e-11."""
+        b_h, y0, vx0 = (np.atleast_1d(np.asarray(v, float)) for v in (b_handover, y0, vx0))
+        m = len(b_h)
+        if target is None:
+            if self.transition_steps > 0:
+                raise ValueError("a transition needs its target speeds")
+            target = np.zeros(m)
+        target = np.broadcast_to(np.asarray(target, float), (m,))
+        noise = np.zeros((m, self.prelude_steps + 1)) if noise is None else np.asarray(noise, float)
+        lo, hi = b_h.copy(), np.minimum(1.0, b_h + 0.4)
+        end_hi, _ = self._prelude_end(hi, y0, vx0, target, noise)
+        reachable = end_hi >= b_h
+        rep = lambda a: np.repeat(a, points, axis=0)
+        for _ in range(rounds):
+            grid = lo[:, None] + (hi - lo)[:, None] * np.linspace(0.0, 1.0, points)[None, :]      # [m, points]
+            ends, _ = self._prelude_end(grid.ravel(), rep(y0), rep(vx0), rep(target), rep(noise))
+            ends = ends.reshape(m, points)
+            k = np.clip((ends < b_h[:, None]).sum(1), 1, points - 1)                  # first grid point at or above
+            lo, hi = grid[np.arange(m), k - 1], grid[np.arange(m), k]
+        return np.where(reachable, 0.5 * (lo + hi), np.nan)
+
+    def take_off(self):
+        """Fly the prelude for every plane. The current battery (set by reset) is the hand-over battery and the start is
+        solved so that the prelude ends there. With a transition, the current speed (set by reset) is the target, and
+        the take-off starts at the same altitude from a fresh speed U[vx0_range]. Returns the hand-over observation
+        (tau = 1, the mission's first) and the record: observations before each autopilot action, the actions, the true
+        battery at each of those observations (privileged), and the starting battery (privileged)."""
+        if self.warmup_steps == 0:
+            raise RuntimeError("take_off() needs warmup_steps > 0")
+        b_h, target = self.b.copy(), self.vx.copy()
+        if self.transition_steps > 0:
+            self.vx[:] = self.rng.uniform(*self.vx0_range, size=self.n)
+        steps = self.prelude_steps
+        noise = (self.rng.normal(0.0, self.sigma, size=(self.n, steps + 1)) if self.sigma > 0
+                 else np.zeros((self.n, steps + 1)))
+        b_s = self.start_battery_for(b_h, self.y, self.vx, target, noise)
+        if np.isnan(b_s).any():
+            raise ValueError(f"Hand-over battery {b_h[np.isnan(b_s)]} is unreachable: even a full battery ends below it")
+        self.b0[:] = b_s
+        self.b[:] = b_s
+        observations, actions, batteries, ended = self._fly_prelude(self, target, noise)
+        if ended.any():
+            raise RuntimeError("A flight ended during the take-off")
+        if np.abs(self.b - b_h).max() > 1e-9:
+            raise RuntimeError(f"The take-off ended {np.abs(self.b - b_h).max():.2e} away from the hand-over battery")
+        self.b[:] = b_h                                     # exact (the solver lands within 1e-9)
+        self.b0[:] = b_h                                    # the mission's starting battery, as reported in info
+        obs = self._obs(noise[:, steps])
+        record = {"observations": np.stack(observations, 1), "actions": np.stack(actions, 1).astype(np.float32),
+                  "batteries": np.stack(batteries, 1), "b_start": b_s}
+        return obs, record
 
     # ---------------------------------------------------------------- scripted rollouts and design check
     def simulate(self, policy, b0s, y0=100.0, vx0=15.0, seed=0):
@@ -455,6 +630,8 @@ class BatteryPlaneVec:
         b0s = np.atleast_1d(np.asarray(b0s, float))
         env = BatteryPlaneVec(n_envs=len(b0s), auto_reset=False, seed=seed, **self._kw)
         env.reset(b0=b0s, y0=y0, vx0=vx0)
+        if env.warmup_steps > 0:                             # b0s are the hand-over batteries
+            env.take_off()
         n = env.n
         alive = np.ones(n, dtype=bool)
         ret, t_dead, s_goal, s_band, b_end = np.zeros(n), np.full(n, np.nan), np.zeros(n), np.zeros(n), np.zeros(n)
@@ -489,6 +666,24 @@ class BatteryPlaneVec:
         k_id = (self.sigma / (0.1 * dv_db)) ** 2 if (self.sigma > 0 and dv_db > 0) else 0.0
         # --- simulations
         fine = np.round(np.arange(0.05, 1.0001, 0.01), 2)
+        takeoff_line = None
+        if self.warmup_steps > 0:
+            # b0 is the hand-over battery: only those a full battery can still reach after the prelude, from any start
+            # (corners of the start ranges; with a transition also of the target speeds), without speed noise
+            corners = np.array(np.meshgrid(self.y0_range, self.vx0_range, self.vx0_range)).reshape(3, -1)
+            b_reach = float(self._prelude_end(np.ones(corners.shape[1]), corners[0], corners[1], corners[2],
+                                              np.zeros((corners.shape[1], self.prelude_steps + 1)))[0].min())
+            fine = fine[fine <= b_reach]
+            b0_grid = tuple(b for b in b0_grid if b <= b_reach)
+            b_h = np.array(b0_grid)
+            b_s = self.start_battery_for(b_h, np.full(len(b_h), 100.0), np.full(len(b_h), 15.0), np.full(len(b_h), 15.0))
+            back = (f", then {self.transition_steps} steps ({self.transition_steps * self.dt:g} s) of flying back to the "
+                    f"mission's starting speed" if self.transition_steps > 0 else "")
+            takeoff_line = (f"take-off: {self.warmup_steps} steps ({self.warmup_steps * self.dt:g} s) of autopilot action "
+                            f"{tuple(float(a) for a in self.warmup_action)}{back} before the agent takes over; it uses "
+                            f"{(b_s - b_h).min():.3f}..{(b_s - b_h).max():.3f} of b from y0=100 m, vx0=15 m/s"
+                            + (" back to 15 m/s" if self.transition_steps > 0 else "")
+                            + f"; hand-over batteries up to {b_reach:.2f} are reachable from every start")
         sim_fine = self.simulate(policy_command_max, fine)
         died = ~np.isnan(sim_fine["t_dead"])
         b_death = float(fine[died].max()) + 0.01 if died.any() else None       # smallest surviving b0 (always-sprint)
@@ -516,6 +711,7 @@ class BatteryPlaneVec:
             + (f"{b_death:.2f}" if b_death is not None else "any") + f" -> rationing needed inside the b0 range: {ok(b_death is not None and lo < b_death <= hi + 1e-9)}",
             f"identification: dv_steady/db = {dv_db:.1f} m/s per unit b at b={b_mid:.2f}; one speed reading pins b to +-{(self.sigma / dv_db if dv_db > 0 else 0):.2f}; "
             + (f"~{k_id:.0f} saturated steps of memory for +-0.1" if k_id > 0 else "exact speed: b is exact from 2 consecutive readings while saturated"),
+            *([takeoff_line] if takeoff_line else []),
             "",
             "scripted rollouts from y0=100 m, vx0=15 m/s  (return | dead at | seconds at >=90% reward / in band | b at end):",
             f"{'b0':>5} | {'always-sprint':^38} | {'best budgeted (hold v_goal, then cruise)':^46} | {'cruise-only':^14}",
@@ -527,8 +723,15 @@ class BatteryPlaneVec:
                          f" | {bb['ret'][i]:7.1f} {dead(bb)} {bb['s_goal'][i]:5.1f}/{bb['s_band'][i]:5.1f} b={bb['b_end'][i]:.2f} (b_stop={b_stops[best[i]]:.2f})"
                          f" | {cr['ret'][i]:7.1f} {dead(cr)}")
         full = res_bud[b_stops[best[-1]]]["s_goal"][-1]
-        lines.append(f"a full battery earns >= 90% reward for {full:.1f}s of {dur:.0f}s under the best budgeted policy: "
-                     f"{ok(full >= 0.2 * dur)} (rule: >= 20% of the mission)")
+        if self.warmup_steps == 0:
+            lines.append(f"a full battery earns >= 90% reward for {full:.1f}s of {dur:.0f}s under the best budgeted policy: "
+                         f"{ok(full >= 0.2 * dur)} (rule: >= 20% of the mission)")
+        else:
+            # The mission after the hand-over is today's, so the rule is checked by today's report (b0 = 1 cannot be
+            # handed over here)
+            lines.append(f"the fullest reachable hand-over battery (b0={b0_grid[-1]:.2f}) earns >= 90% reward for {full:.1f}s "
+                         f"of {dur:.0f}s under the best budgeted policy (the full-battery rule is a property of the mission, "
+                         f"checked by the report without a take-off)")
         return "\n".join(lines)
 
 
@@ -642,7 +845,10 @@ if gym is not None:
         Omitted options use constructor defaults. Clean/full modes always have zero noise.
         add_eval_args() and iter_eval_resets() connect a CLI evaluation grid to reset().
         info carries privileged diagnostics (b0, b, cap, saturated, mission_complete): log them, never feed them
-        to a hidden-mode agent.
+        to a hidden-mode agent. With warmup_steps > 0 (the easy version, see the module docstring) reset() flies the
+        forced take-off first (and with transition_steps > 0 the flight back to the starting speed); b0 is then the
+        hand-over battery (with a transition, y0 and vx0 are the hand-over state too) and the reset info adds the
+        prelude's record (warmup_observations, warmup_actions: inputs; warmup_batteries, b_start: privileged).
         """
         metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 20}
         W, H, PW = 960, 540, 300                  # window and right-panel width
@@ -671,11 +877,19 @@ if gym is not None:
             options = options or {}
             obs = self.core.reset(b0=options.get("b0"), y0=options.get("y0"), vx0=options.get("vx0"),
                                   vx_obs_noise=options.get("vx_obs_noise"))
+            info = {}
+            if self.core.warmup_steps > 0:
+                # The easy version: b0 (sampled or given) is the hand-over battery; the autopilot flies the take-off (and
+                # the transition back to vx0) from the solved starting battery, and the agent's first observation is the
+                # hand-over state (tau = 1)
+                obs, record = self.core.take_off()
+                info = {"warmup_observations": record["observations"][0], "warmup_actions": record["actions"][0],
+                        "warmup_batteries": record["batteries"][0], "b_start": float(record["b_start"][0])}
             self._needs_reset = False
             self._ep_return = 0.0; self._last_obs = obs[0]; self._status = ""; self._trail.clear()
             if self.render_mode == "human":
                 self.render()
-            return obs[0], {"b0": float(self.core.b0[0])}
+            return obs[0], {"b0": float(self.core.b0[0]), **info}
 
         def step(self, action):
             if self._needs_reset:
@@ -878,8 +1092,10 @@ if gym is not None:
         return list(ids)
 
 
-if __name__ == "__main__":                 # python battery_plane.py  -> design rules + value of context for the defaults
-    _env = BatteryPlaneVec()
+if __name__ == "__main__":     # python battery_plane.py [--warmup-steps 100 [--transition-steps 80]] -> design rules + value of context
+    import sys
+    _arg = lambda name: int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else 0
+    _env = BatteryPlaneVec(warmup_steps=_arg("--warmup-steps"), transition_steps=_arg("--transition-steps"), auto_reset=False)
     print(_env.describe())
     print()
     _env.value_of_context()
