@@ -267,7 +267,7 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. 
   - **Its encoder seed hardly matters.** Two more encoder seeds at batch 1024 score 313 and 331 on the final test (validation 279 and 272), against 152–240 for the three encoder seeds of the GRU trained on the true battery.
 - **Swap test** (validation flights): the frozen-encoder policies flown with the true battery in place of their encoder's estimate.
   - **The teacher-trained GRU's policies** score as well or better (+18 on average, 23 of 32 runs, p = 0.008). Like the ideal-estimate policies of step 2, they are simply better pilots, and for them the estimate and the true battery are interchangeable.
-  - **The policies of the GRU trained on the true battery** mostly score worse (−20 on average, 17 of 32 runs). They learned to read their encoder's biased estimate (too high for low batteries, too low for high ones), so the truth is an unfamiliar input.
+  - **The policies of the GRU trained on the true battery** mostly score worse (−20 on average, 17 of 32 runs). Their policies rarely fly at the motor's limit, so the battery stays hidden: on their flights even the ideal estimator is pulled toward the average battery (too high for low batteries, too low for high ones), and the GRU only a little more. The policies adapted to that compressed input, so the truth is an unfamiliar input.
 
 **Battery estimates on held-out pilot flights** (error in battery units, 1,900 test flights of 11 pilot styles):
 
@@ -347,6 +347,7 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 | `pilots.py` | Pilot flights in many styles for training a battery encoder offline |
 | `train_encoder.py`, `recurrent_encoders.py` | Offline encoder training (A's xLSTM, GRU, ConvGRU; the true battery or the ideal estimate as the target; resume and finalize) and the standalone GRU / ConvGRU encoders, with an optional Gaussian head |
 | `step1_ideal_estimator.py`, `step4_floor.py` | The ideal estimator (exact physics, the encoder's inputs), the floor it sets on the pilot flights, and the teacher targets |
+| `figures/` | The paper figures: `collect_data.py` gathers the numbers from the saved results into `figures/data/`, `make_figures.py` draws them into `figures/out/` (PDF, PNG, SVG) |
 | `pilot_gifs.py`, `policy_gifs.py` | GIFs of the pilot styles and of trained plain-PPO agents on the final-test flights, written to `videos/` (gitignored) |
 | `step4_probes.py`, `step4_closed_loop.py` | Encoder diagnostics: the counting and finding tasks, GRU / LSTM vs xLSTM, and the encoder on PPO's own flights |
 | `flight_logging.py` | Flight diagnostics shared by both learners (validation, rollouts, gradient norms, final validation) |

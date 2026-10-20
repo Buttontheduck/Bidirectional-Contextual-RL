@@ -1665,8 +1665,11 @@ python step2_swap_battery.py --runs runs_step0/frozen_gru_a/runs.json runs_step0
   - So their lead over plain PPO trained with the true battery doesn't come from extra information in the estimate. It comes from how they learned to fly.
   - The small gain with the true battery is what T1's remaining estimation error costs them.
 - **The GRU-on-labels policies learned to read a distorted signal.** Given the true battery, most score worse (−20 on average; s1's policies lose in 7 of 8 seeds at batch 1024).
-  - Their encoder's estimate is biased in a way that depends on the starting battery (the closed-loop check: +0.18 to +0.20 at 0.2, −0.11 to −0.13 at 0.7).
-  - The policies adapted to that bias, so the truth is an unfamiliar input to them.
+  - Their encoder's estimate is pulled toward the average battery: too high at low starting batteries and too low at high ones (the closed-loop check: +0.18 to +0.20 at 0.2, −0.11 to −0.13 at 0.7).
+  - **Most of that pull comes from the flights, not the encoder (checked 2026-10-19).** On the same flights the ideal estimator is pulled almost as far: +0.13 at 0.2 and −0.13 at 0.7 (GRU s1, batch 256), against the GRU's +0.20 and −0.13. These policies rarely fly at the motor's limit, so the battery stays hidden from any estimator. The GRU adds extra overestimation only at low batteries (+0.05 to +0.07 at 0.2–0.3).
+  - On the T1 policies' flights both are near zero (+0.07 and +0.05 at 0.2, −0.04 at 0.7). Those policies probe, so the battery shows.
+  - The labels-GRU policies adapted to an input compressed toward the average, so the truth, with its full range, is an unfamiliar input to them.
+  - The figures (`figures/`, figure 5 and figure 6 e–f) show the encoder next to the ideal estimator on the same flights.
 - **For the T1 policies, their encoder's estimate and the true battery are interchangeable inputs.** That is the practical sense in which T1 "learned the battery".
 
 ## Next steps
