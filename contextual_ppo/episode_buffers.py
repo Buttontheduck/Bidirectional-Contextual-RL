@@ -40,7 +40,8 @@ class SupervisedContextualEpisodeBuffer:
     observation), with the executed action that led to it and its label, and closes the episode. The
     environment's next ``add()`` starts a new episode, so an automatic reset never mixes two episodes.
     ``drop_unfinished()`` discards the unfinished episodes, e.g. when the environments are reset without
-    ending them.
+    ending them. ``start_episodes()`` begins new episodes with a prelude (steps the agent did not act in, read by
+    the encoder before the first observation), whose last action is then the first observation's previous action.
 
     **Storage.** Completed episodes only, oldest first, as numpy copies. Each is assigned, when it completes,
     to the ``"train"`` or the ``"validation"`` split (validation with probability ``validation_fraction``,
@@ -122,6 +123,44 @@ class SupervisedContextualEpisodeBuffer:
         their episodes. Completed episodes are kept.
         """
         self._new_unfinished()
+
+    def start_episodes(
+        self,
+        starts: np.ndarray,
+        observations: np.ndarray,
+        actions: np.ndarray,
+        labels: np.ndarray,
+    ) -> None:
+        """
+        Begin the new episodes of the environments in ``starts`` with their preludes: steps the agent did not act in
+        (e.g. an autopilot's take-off) that the encoder reads before the episode's first observation. The prelude's
+        rows ``(o_k, a_{k-1}, label_k)`` come first, with ``a_{-1} = 0``, and its last action becomes the previous
+        action of the episode's first observation, as during collection. Their unfinished episodes must be empty.
+
+        :param starts: [N] bool, the environments whose episodes start
+        :param observations: [N, K, D_o] the preludes' observations (rows outside ``starts`` are ignored)
+        :param actions: [N, K, D_a] the preludes' executed actions
+        :param labels: [N, K, D_c] the true context of each prelude observation (training targets only)
+        """
+        starts = np.asarray(starts, dtype=bool).reshape(-1)
+        length = observations.shape[1] if np.ndim(observations) == 3 else 0
+        expected = ((self.n_envs, length, self.obs_dim), (self.n_envs, length, self.action_dim), (self.n_envs, length, self.label_dim))
+        given = (np.shape(observations), np.shape(actions), np.shape(labels))
+        if starts.shape != (self.n_envs,) or length < 1 or given != expected:
+            raise ValueError(f"start_episodes(): expected {self.n_envs} starts and preludes of shapes {expected}, got {given}")
+        for env_idx in np.flatnonzero(starts):
+            episode = self._unfinished[env_idx]
+            if episode["observations"]:
+                raise RuntimeError(f"start_episodes(): env {env_idx} has an unfinished episode")
+            prelude_actions = np.asarray(actions[env_idx], dtype=np.float32)
+            outside = np.any((prelude_actions < self.action_space.low) | (prelude_actions > self.action_space.high), axis=-1)
+            if outside.any():
+                raise ValueError(f"start_episodes(): the prelude actions of env {env_idx} lie outside the action space bounds")
+            prev_actions = np.concatenate([np.zeros((1, self.action_dim), np.float32), prelude_actions[:-1]])
+            episode["observations"].extend(np.asarray(observations[env_idx], dtype=np.float32))
+            episode["prev_actions"].extend(prev_actions)
+            episode["labels"].extend(np.asarray(labels[env_idx], dtype=np.float32))
+            self._last_actions[env_idx] = prelude_actions[-1]
 
     def add(
         self,

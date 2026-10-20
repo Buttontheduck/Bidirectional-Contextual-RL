@@ -84,7 +84,8 @@ class ContextualRolloutBuffer:
     target): never an input of the encoder or the actor. Within a stream, with ``dones = terminated | truncated``,
     ``finalize()`` checks for ``t < T - 1``:
 
-    - ``episode_starts[t + 1] == dones[t]``, and ``prev_actions`` is zero wherever ``episode_starts`` is set
+    - ``episode_starts[t + 1] == dones[t]``, and ``prev_actions`` is zero wherever ``episode_starts`` is set (not
+      checked with ``preludes``: there an episode's first previous action is its prelude's last action)
     - if not ``dones[t]``: ``next_observations[t] == observations[t + 1]``, ``prev_actions[t + 1] == executed_actions[t]``
       and ``next_contexts[t] == contexts[t + 1]``
 
@@ -140,6 +141,10 @@ class ContextualRolloutBuffer:
         or a mapping from a key in a leaf's path to its axis (the innermost matching key wins).
         None selects ``DEFAULT_STATE_BATCH_AXIS``.
     :param seed: Seed of the generator that permutes environments in ``get()``
+    :param preludes: The episodes start after a prelude the encoder read (``start_episodes`` of the policy), so the
+        state at an episode start is not the initial state and ``prev_actions`` there is the prelude's last action.
+        Replaying from ``initial_state`` with resets at ``episode_starts`` would lose the preludes: the learner must use
+        the cached ``context_estimates`` instead, which is exact while the encoder has not changed since collection
     """
 
     # Batch axis of the state leaves returned by xlstm's sLSTMLayer / mLSTMLayer / xLSTMBlockStack .step()
@@ -158,8 +163,12 @@ class ContextualRolloutBuffer:
         estimate_dim: int | None = None,
         recurrent_state_batch_axis: int | Mapping[str, int] | None = None,
         seed: int | None = None,
+        preludes: bool = False,
     ):
         self.n_steps = _check_int("n_steps", n_steps, minimum=1)
+        if not isinstance(preludes, bool):
+            raise TypeError(f"preludes must be a bool, got {preludes!r}")
+        self.preludes = preludes
         self.n_envs = _check_int("n_envs", n_envs, minimum=1)
 
         if not (
@@ -411,7 +420,8 @@ class ContextualRolloutBuffer:
         continuing = ~dones[:-1]
         self._raise_where(self.terminated & self.truncated, "terminated and truncated are both set")
         self._raise_where(self.episode_starts[1:] != dones[:-1], "episode_starts[t + 1] must equal terminated[t] | truncated[t]")
-        self._raise_where(self.episode_starts & np.any(self.prev_actions != 0, axis=-1), "prev_actions must be zero at episode starts")
+        if not self.preludes:
+            self._raise_where(self.episode_starts & np.any(self.prev_actions != 0, axis=-1), "prev_actions must be zero at episode starts")
         self._raise_where(
             continuing & np.any(self.next_observations[:-1] != self.observations[1:], axis=-1),
             "next_observations[t] must equal observations[t + 1] within an episode",

@@ -86,6 +86,16 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         like the true context (BatteryPlane: the true speed ratio ``vx / v_ref``, ``("vx_ratio", "vx_ratio")``
         with the project's label wrapper). The episode buffer stores them after the context labels, for the
         encoder's auxiliary head; they need the episode buffer and never reach the policy. None reads none.
+    :param prelude_info_keys: ``(observations_key, actions_key)`` of each episode's prelude in the env's reset
+        ``info``: steps the agent did not act in (BatteryPlane's easy version: the autopilot's take-off,
+        ``("warmup_observations", "warmup_actions")``), as ``[K, *obs_shape]`` observations and ``[K, action_dim]``
+        executed actions. At every episode start the encoder reads the prelude from its initial state
+        (``policy.start_episodes``) and the episode continues from that memory, with the prelude's last action as the
+        first previous action. The rollout buffer then caches the collected contexts, which the learner must use
+        instead of replaying from episode starts. None: no preludes, the memory starts at the initial state
+    :param prelude_label_key: Key of the true context at each prelude observation in the reset ``info``
+        (BatteryPlane: ``"warmup_batteries"``), which the episode buffer stores as the prelude's labels; needed with
+        preludes and an episode buffer. Labels never reach the policy
     :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
         the reported success rate, mean episode length, and mean reward over
     :param tensorboard_log: the log location for tensorboard (if None, no logging)
@@ -128,6 +138,8 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         reset_envs_each_rollout: bool = False,
         context_info_keys: Sequence[str] | None = None,
         auxiliary_info_keys: Sequence[str] | None = None,
+        prelude_info_keys: Sequence[str] | None = None,
+        prelude_label_key: str | None = None,
         stats_window_size: int = 100,
         tensorboard_log: str | None = None,
         monitor_wrapper: bool = True,
@@ -144,6 +156,10 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         self.reset_envs_each_rollout = bool(reset_envs_each_rollout)
         self.context_info_keys = self._check_context_info_keys(context_info_keys)
         self.auxiliary_info_keys = self._check_context_info_keys(auxiliary_info_keys, "auxiliary_info_keys")
+        self.prelude_info_keys = self._check_context_info_keys(prelude_info_keys, "prelude_info_keys")
+        if prelude_label_key is not None and (not isinstance(prelude_label_key, str) or self.prelude_info_keys is None):
+            raise ValueError(f"prelude_label_key must be None or a string, and needs prelude_info_keys, got {prelude_label_key!r}")
+        self.prelude_label_key = prelude_label_key
         # Memory of every env before the next step, None until the envs start new episodes
         self._last_policy_state: ContextualPolicyState | None = None
         # True context of the next observation [n_envs, D_c], only with context_info_keys
@@ -193,6 +209,9 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         # Saved models store the keys as JSON, which turns the tuple into a list
         self.context_info_keys = self._check_context_info_keys(self.context_info_keys)
         self.auxiliary_info_keys = self._check_context_info_keys(self.auxiliary_info_keys, "auxiliary_info_keys")
+        # Saved before preludes existed: none
+        self.prelude_info_keys = self._check_context_info_keys(getattr(self, "prelude_info_keys", None), "prelude_info_keys")
+        self.prelude_label_key = getattr(self, "prelude_label_key", None)
 
         if self.rollout_buffer_class is None:
             self.rollout_buffer_class = ContextualRolloutBuffer  # type: ignore[assignment]
@@ -213,6 +232,16 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         elif buffer_kwargs.get("context_dim") is not None:
             raise ValueError("Storing true contexts (rollout_buffer_kwargs['context_dim']) requires context_info_keys")
 
+        # The policy first (the buffer draws no random numbers): with preludes the buffer caches its contexts
+        self.policy = self.policy_class(  # type: ignore[assignment]
+            self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **self.policy_kwargs
+        )
+        self.policy = self.policy.to(self.device)
+        if self.prelude_info_keys is not None:
+            if buffer_kwargs.setdefault("estimate_dim", self.policy.latent_dim) != self.policy.latent_dim:
+                raise ValueError(f"With preludes the buffer caches the contexts: estimate_dim must be {self.policy.latent_dim}")
+            buffer_kwargs["preludes"] = True
+
         self.rollout_buffer = self.rollout_buffer_class(  # type: ignore[misc]
             self.n_steps,
             self.n_envs,
@@ -223,10 +252,6 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
             device=self.device,
             **buffer_kwargs,
         )
-        self.policy = self.policy_class(  # type: ignore[assignment]
-            self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **self.policy_kwargs
-        )
-        self.policy = self.policy.to(self.device)
         # Warn when not using CPU with MlpPolicy
         self._maybe_recommend_cpu("ContextualActorCriticPolicy")
 
@@ -279,7 +304,9 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         if reset_envs:
             self._last_obs = env.reset()  # type: ignore[assignment]
             self._last_episode_starts = np.ones((env.num_envs,), dtype=bool)
-        self._last_policy_state = self.policy.initial_state(env.num_envs)
+        self._last_policy_state = self._episode_start_memory(
+            env, self.policy.initial_state(env.num_envs), np.ones(env.num_envs, dtype=bool)
+        )
         # VecEnv wrappers keep their own (empty) reset_infos
         if self.context_info_keys is not None:
             self._last_contexts = self._context_labels(env.unwrapped.reset_infos, self.context_info_keys[0])
@@ -287,6 +314,63 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
             self._last_auxiliary = self._context_labels(
                 env.unwrapped.reset_infos, self.auxiliary_info_keys[0], "auxiliary_info_keys"
             )
+
+    def read_preludes(
+        self, infos: Sequence[dict[str, Any]], starts: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """
+        The preludes of the episodes that start (``prelude_info_keys``), read from their reset ``info`` dicts.
+
+        :param infos: The reset info of every env (``VecEnv.reset_infos`` of the unwrapped VecEnv)
+        :param starts: [n_envs] bool, the envs whose episodes start; all their preludes must have the same length K
+        :return: observations [n_envs, K, D_o], executed actions [n_envs, K, D_a] and, with ``prelude_label_key``, the
+            labels [n_envs, K, D_c] (else None); zero for the rows that don't start
+        """
+        assert self.prelude_info_keys is not None
+        keys = (*self.prelude_info_keys, *(() if self.prelude_label_key is None else (self.prelude_label_key,)))
+        obs_dim, action_dim = int(self.observation_space.shape[0]), int(self.action_space.shape[0])  # type: ignore[index]
+        rows = np.flatnonzero(starts)
+        preludes = {}
+        for i in rows:
+            missing = [key for key in keys if key not in infos[i]]
+            if missing:
+                raise KeyError(f"prelude_info_keys: the reset info of env {i} has no {missing} entry (it has {sorted(infos[i])})")
+            observations = np.asarray(infos[i][keys[0]], dtype=np.float32)
+            actions = np.asarray(infos[i][keys[1]], dtype=np.float32)
+            length = len(observations)
+            if length < 1 or observations.shape != (length, obs_dim) or actions.shape != (length, action_dim):
+                raise ValueError(f"The prelude of env {i} must be [K >= 1, {obs_dim}] observations and [K, {action_dim}] actions, "
+                                 f"got {observations.shape} and {actions.shape}")
+            labels = None if self.prelude_label_key is None else np.asarray(infos[i][keys[2]], dtype=np.float32).reshape(length, -1)
+            preludes[i] = (observations, actions, labels)
+        lengths = {len(prelude[0]) for prelude in preludes.values()}
+        if len(lengths) != 1:
+            raise ValueError(f"The preludes of the episodes that start together must have one length, got {sorted(lengths)}")
+        length = lengths.pop()
+        observations = np.zeros((len(starts), length, obs_dim), dtype=np.float32)
+        actions = np.zeros((len(starts), length, action_dim), dtype=np.float32)
+        labels = None
+        if self.prelude_label_key is not None:
+            labels = np.zeros((len(starts), length, next(iter(preludes.values()))[2].shape[1]), dtype=np.float32)  # type: ignore[union-attr]
+        for i, (prelude_obs, prelude_actions, prelude_labels) in preludes.items():
+            observations[i], actions[i] = prelude_obs, prelude_actions
+            if labels is not None:
+                labels[i] = prelude_labels
+        return observations, actions, labels
+
+    def _episode_start_memory(self, env: VecEnv, memory: ContextualPolicyState, starts: np.ndarray) -> ContextualPolicyState:
+        """
+        The memory after the episodes in ``starts`` began: the initial state, or with preludes the encoder's state after
+        each episode's prelude; the episode buffer's new episodes begin with the prelude's rows.
+        """
+        if self.prelude_info_keys is None or not np.any(starts):
+            return self.policy.reset_state(memory, starts)
+        observations, actions, labels = self.read_preludes(env.unwrapped.reset_infos, starts)
+        if self.episode_buffer is not None:
+            if labels is None:
+                raise ValueError("The episode buffer stores the preludes with their labels: set prelude_label_key")
+            self.episode_buffer.start_episodes(starts, observations, actions, labels)
+        return self.policy.start_episodes(memory, starts, (observations, actions))
 
     @staticmethod
     def _context_labels(infos: Sequence[dict[str, Any]], key: str, name: str = "context_info_keys") -> np.ndarray:
@@ -492,8 +576,8 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
                 )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
-            # Envs that finished an episode start the next one from the initial memory
-            self._last_policy_state = self.policy.reset_state(memory, dones)
+            # Envs that finished an episode start the next one from the initial memory, or after its prelude
+            self._last_policy_state = self._episode_start_memory(env, memory, dones)
             if self.context_info_keys is not None:
                 self._last_contexts = self._next_labels(env, next_contexts, dones, self.context_info_keys[0])
             if self.auxiliary_info_keys is not None:
@@ -526,3 +610,43 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         callback.on_rollout_end()
 
         return True
+
+
+class PreludePredictor:
+    """
+    A model with ``prelude_info_keys``, for prediction loops on a VecEnv that never show the policy the reset infos,
+    such as SB3's ``evaluate_policy``: at every episode start the memory is the encoder's state after that episode's
+    prelude, read from the env's reset infos, as during collection. Every other attribute is the model's, so it can
+    stand in for the model (e.g. as an ``EvalCallback``'s model, which also saves it).
+
+    :param model: The trained algorithm (``ContextualOnPolicyAlgorithm`` with ``prelude_info_keys``)
+    :param env: The VecEnv the predictions are for; its unwrapped ``reset_infos`` hold the current episodes' preludes
+    """
+
+    def __init__(self, model: ContextualOnPolicyAlgorithm, env: VecEnv) -> None:
+        if model.prelude_info_keys is None:
+            raise ValueError("PreludePredictor needs a model with prelude_info_keys")
+        self.model, self.env = model, env
+
+    def predict(
+        self,
+        observation: np.ndarray,
+        state: ContextualPolicyState | None = None,
+        episode_start: np.ndarray | None = None,
+        deterministic: bool = False,
+    ) -> tuple[np.ndarray, ContextualPolicyState]:
+        """``policy.predict``, with the memory of the episodes that start (all of them when ``state`` is None) set after
+        their preludes."""
+        policy = self.model.policy
+        n_envs = len(observation)
+        if state is None:
+            state, starts = policy.initial_state(n_envs), np.ones(n_envs, dtype=bool)
+        else:
+            starts = np.zeros(n_envs, dtype=bool) if episode_start is None else np.asarray(episode_start, dtype=bool)
+        if starts.any():
+            observations, actions, _ = self.model.read_preludes(self.env.unwrapped.reset_infos, starts)
+            state = policy.start_episodes(state, starts, (observations, actions))
+        return self.model.predict(observation, state=state, episode_start=None, deterministic=deterministic)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.model, name)

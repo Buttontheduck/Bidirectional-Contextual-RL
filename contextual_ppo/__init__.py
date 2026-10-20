@@ -1,7 +1,7 @@
 from .buffers import ContextualRolloutBuffer
 from .contextual_ppo import ContextualPPO
 from .episode_buffers import SupervisedContextualEpisodeBuffer
-from .on_policy_algorithm import ContextualOnPolicyAlgorithm
+from .on_policy_algorithm import ContextualOnPolicyAlgorithm, PreludePredictor
 from .policies import ContextualActorCriticPolicy, MlpPolicy
 from .type_aliases import ContextualEpisodeSamples, ContextualPolicyState, ContextualRolloutSamples
 
@@ -14,5 +14,6 @@ __all__ = [
     "ContextualRolloutBuffer",
     "ContextualRolloutSamples",
     "MlpPolicy",
+    "PreludePredictor",
     "SupervisedContextualEpisodeBuffer",
 ]

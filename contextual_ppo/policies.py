@@ -288,6 +288,44 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
         prev_actions = th.where(episode_start.unsqueeze(-1), th.zeros_like(state.prev_actions), state.prev_actions)
         return ContextualPolicyState(self.encoder.reset_state(state.encoder_state, episode_start), prev_actions)
 
+    def start_episodes(
+        self,
+        state: ContextualPolicyState,
+        episode_start: th.Tensor | np.ndarray,
+        preludes: tuple[th.Tensor | np.ndarray, th.Tensor | np.ndarray] | None = None,
+    ) -> ContextualPolicyState:
+        """
+        Memory of the environments that start a new episode: reset (``reset_state``) and, with ``preludes``, the
+        encoder run over each episode's prelude from its initial state. A prelude is a stretch the agent did not act
+        in, e.g. an autopilot's take-off, that the encoder reads before the episode's first observation as
+        ``[o_k, a_{k-1}]`` with ``a_{-1} = 0``; the memory then continues from the state after its last observation,
+        with its last action as previous action. Computed without gradient. The state passed in is not modified.
+
+        :param state: Current memory
+        :param episode_start: [n_envs] bool, True where a new episode starts
+        :param preludes: None, or the observations [n_envs, K, *obs_shape] and executed actions [n_envs, K, action_dim]
+            of every row's prelude (``K >= 1``; rows that don't start an episode are ignored)
+        """
+        reset = self.reset_state(state, episode_start)
+        if preludes is None:
+            return reset
+        observations = th.as_tensor(np.asarray(preludes[0], dtype=np.float32), device=self.device)
+        actions = th.as_tensor(np.asarray(preludes[1], dtype=np.float32), device=self.device)
+        n_envs, length = observations.shape[:2]
+        if length < 1 or tuple(actions.shape[:2]) != (n_envs, length) or n_envs != reset.prev_actions.shape[0]:
+            raise ValueError(f"preludes must be [n_envs, K >= 1, ...] observations and actions for {reset.prev_actions.shape[0]} "
+                             f"envs, got {tuple(observations.shape)} and {tuple(actions.shape)}")
+        prev_actions = th.cat([th.zeros_like(actions[:, :1]), actions[:, :-1]], dim=1)
+        with th.no_grad():
+            _, encoder_state = self.encoder.unroll(
+                self.encoder.initial_state(n_envs), self.encoder_observations(observations, n_batch_dims=2), prev_actions
+            )
+        start = th.as_tensor(episode_start, dtype=th.bool, device=self.device).reshape(-1)
+        return ContextualPolicyState(
+            self.encoder._select_state(start, encoder_state, reset.encoder_state),
+            th.where(start.unsqueeze(-1), actions[:, -1], reset.prev_actions),
+        )
+
     def encoder_observations(self, observations: th.Tensor, n_batch_dims: int = 1) -> th.Tensor:
         """
         Observation input of the encoder, preprocessed like the actor and critic inputs
@@ -443,11 +481,28 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
         if isinstance(initial_state, ContextualPolicyState):
             # The previous actions come from prev_actions, the stored stream
             raise TypeError("initial_state is the encoder state (e.g. ContextualPolicyState.encoder_state), not the whole memory")
-        n_envs, n_steps = obs.shape[:2]
         with th.set_grad_enabled(th.is_grad_enabled() and not detach_context):
             latents, final_state = self.encoder.unroll(
                 initial_state, self.encoder_observations(obs, n_batch_dims=2), prev_actions, episode_starts=episode_starts
             )
+        values, log_prob, entropy = self.evaluate_actions_from_contexts(obs, actions, latents)
+        return values, log_prob, entropy, final_state, latents
+
+    def evaluate_actions_from_contexts(
+        self, obs: th.Tensor, actions: th.Tensor, latents: th.Tensor
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Evaluate recorded actions given the contexts ``z_t`` instead of re-encoding the history, e.g. the contexts
+        cached at collection when the encoder has not changed since (the supervised objective, whose encoder steps
+        come after the PPO epochs). The actor's and critic's losses never reach the encoder through them.
+
+        :param obs: [E, T, *obs_shape]
+        :param actions: [E, T, action_dim] recorded samples (unclipped)
+        :param latents: [E, T, latent_dim] the contexts ``z_t``
+        :return: estimated values, log likelihood of taking those actions and entropy of the action distribution,
+            each [E, T]
+        """
+        n_envs, n_steps = obs.shape[:2]
         flat_obs = obs.reshape(n_envs * n_steps, *obs.shape[2:])
         pi_input, vf_input = self._branch_inputs(flat_obs, latents.reshape(n_envs * n_steps, self.latent_dim))
         distribution = self._get_action_dist_from_latent(self.mlp_extractor.forward_actor(pi_input))
@@ -455,13 +510,7 @@ class ContextualActorCriticPolicy(ActorCriticPolicy):
         values = self.value_net(self.mlp_extractor.forward_critic(vf_input))
         entropy = distribution.entropy()
         assert entropy is not None
-        return (
-            values.reshape(n_envs, n_steps),
-            log_prob.reshape(n_envs, n_steps),
-            entropy.reshape(n_envs, n_steps),
-            final_state,
-            latents,
-        )
+        return values.reshape(n_envs, n_steps), log_prob.reshape(n_envs, n_steps), entropy.reshape(n_envs, n_steps)
 
     def _predict(  # type: ignore[override]
         self, observation: PyTorchObs, state: ContextualPolicyState, deterministic: bool = False

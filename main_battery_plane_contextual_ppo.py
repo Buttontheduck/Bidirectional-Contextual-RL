@@ -52,7 +52,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import battery_plane as bp  # noqa: E402
 import contextual_ppo  # noqa: E402
 from battery_plane import iter_eval_resets  # noqa: E402
-from contextual_ppo import ContextualPPO  # noqa: E402
+from contextual_ppo import ContextualPPO, PreludePredictor  # noqa: E402
 from contextual_ppo.policies import CONTEXT_VARIANCE_INPUTS  # noqa: E402
 from contextual_ppo.torch_layers import CONTEXT_ACTIVATIONS, CONTEXT_HEADS, ENCODER_ARCHS  # noqa: E402
 from flight_logging import (  # noqa: E402
@@ -91,6 +91,19 @@ def reward_scale_from(cfg: DictConfig) -> float:
 def battery_noise_from(cfg: DictConfig) -> float:
     """Std of the noise on the observed battery (step 1's noisy oracle); older saved configs have none."""
     return float(cfg.env.get("battery_noise", 0.0))
+
+
+# The easy version's prelude (battery_plane.py, env.kwargs.warmup_steps > 0): the reset-info keys of the autopilot's
+# take-off, which a learned encoder reads before every episode, and of the true battery at its observations (labels)
+PRELUDE_INFO_KEYS, PRELUDE_LABEL_KEY = ("warmup_observations", "warmup_actions"), "warmup_batteries"
+
+
+def prelude_keys_from(cfg: DictConfig) -> tuple[list[str] | None, str | None]:
+    """The prelude keys for a learned encoder on the easy version, else none (the oracle and the memoryless control
+    have no encoder to give it to; they start from the hand-over state, as plain PPO)."""
+    if int(env_kwargs_from(cfg).get("warmup_steps", 0)) > 0 and context_source_from(cfg) == "encoder":
+        return list(PRELUDE_INFO_KEYS), PRELUDE_LABEL_KEY
+    return None, None
 
 
 def initial_model_from(cfg: DictConfig) -> Path | None:
@@ -154,6 +167,12 @@ class RenderingEvalCallback(FlightLoggingEvalCallback):
         self.render_env = render_env
         self.render_fps = render_fps
         self.reset_scheduler = reset_scheduler
+
+    def _init_callback(self) -> None:
+        super()._init_callback()
+        if getattr(self.model, "prelude_info_keys", None) is not None:
+            # The encoder reads every validation flight's prelude: SB3's evaluate_policy never shows the reset infos
+            self.model = PreludePredictor(self.model, self.eval_env)
 
     def _on_step(self) -> bool:
         evaluating = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
@@ -467,6 +486,9 @@ def validate_config(cfg: DictConfig) -> None:
     if weight > 0 and (cppo.context_head != "gaussian" or cppo.encoder_objective != "supervised" or context_source != "encoder"):
         raise ValueError("cppo.curiosity rewards the drop in the Gaussian head's entropy: it needs cppo.context_head=gaussian, "
                          "a learned encoder and cppo.encoder_objective=supervised")
+    if prelude_keys_from(cfg)[0] is not None and (cppo.encoder_objective != "supervised" or velocity.enabled):
+        raise ValueError("A learned encoder on the easy version (env.kwargs.warmup_steps > 0) reads the take-off as a prelude: "
+                         "it needs cppo.encoder_objective=supervised and cppo.velocity_head.enabled=false")
 
 
 def check_episode_alignment(cfg: DictConfig, episode_length: int) -> None:
@@ -520,6 +542,9 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
         bptt_len=None if cppo.bptt_len is None else int(cppo.bptt_len),
         reset_envs_each_rollout=bool(cppo.reset_envs_each_rollout),
         context_info_keys=None if keys is None else list(OmegaConf.to_container(keys, resolve=True)),
+        # The easy version: the encoder reads the take-off before every episode
+        prelude_info_keys=prelude_keys_from(cfg)[0],
+        prelude_label_key=prelude_keys_from(cfg)[1],
         target_kl=cppo.target_kl,
         tensorboard_log=tensorboard_log,
         policy_kwargs={
@@ -586,8 +611,10 @@ def run_schedule(model, cfg: DictConfig, reset_grid: DictConfig, plot_batteries=
         scheduler.rewind()
         # SB3's callback exposes the ending episode's info, even after VecEnv has reset the environment.
         # These privileged diagnostics are used only for reports, never as model inputs.
+        # The easy version: the encoder reads every flight's prelude first
+        predictor = PreludePredictor(model, env) if getattr(model, "prelude_info_keys", None) is not None else model
         rewards, lengths, recorder = evaluate_flights(
-            model, env, len(schedule), bool(cfg.evaluation.deterministic), raw_env.core, plot_batteries,
+            predictor, env, len(schedule), bool(cfg.evaluation.deterministic), raw_env.core, plot_batteries,
         )
     finally:
         env.close()
@@ -702,7 +729,7 @@ def main(cfg: DictConfig) -> None:
             f" | gamma={cfg.cppo.gamma} reward_scale={reward_scale_from(cfg)} battery_noise={battery_noise_from(cfg)}"
             f" until={cfg.env.get('battery_noise_until')} flight={cfg.env.get('battery_noise_flight')}"
             f" | bptt_len={cfg.cppo.bptt_len} reset_envs_each_rollout={cfg.cppo.reset_envs_each_rollout}"
-            f" | context_source={context_source_from(cfg)}"
+            f" | context_source={context_source_from(cfg)} preludes={model.prelude_info_keys}"
             f" encoder_objective={cfg.cppo.encoder_objective} encoder_actor_loss_weight={cfg.cppo.encoder_actor_loss_weight}"
             f" context_head={cfg.cppo.context_head}"
             + (f" (variance input {cfg.cppo.context_variance_input}, nll_beta {cfg.cppo.supervised.nll_beta})"

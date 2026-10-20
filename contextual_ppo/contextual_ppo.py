@@ -143,6 +143,13 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
     :param auxiliary_info_keys: ``(reset_key, step_key)`` of the auxiliary head's targets in the env ``info``
         dicts (needs the policy's ``auxiliary_dim`` and ``encoder_objective="supervised"``), see
         ``ContextualOnPolicyAlgorithm``; None for no auxiliary head
+    :param prelude_info_keys: ``(observations_key, actions_key)`` of each episode's prelude in the reset ``info``,
+        see ``ContextualOnPolicyAlgorithm``: the encoder reads it before the episode's first observation, and the
+        encoder steps train on it too (its labels: ``prelude_label_key``). Supervised only, without an auxiliary
+        head: the PPO epochs then evaluate the actor and critic on the contexts cached at collection instead of
+        replaying the encoder, which is exact because the encoder steps come after them. None: no preludes
+    :param prelude_label_key: Key of the true context at each prelude observation in the reset ``info``
+        (BatteryPlane: ``"warmup_batteries"``); required with preludes
     :param target_kl: Limit the KL divergence between updates,
         because the clipping is not enough to prevent large update
         see issue #213 (cf https://github.com/hill-a/stable-baselines/issues/213)
@@ -206,6 +213,8 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         reset_envs_each_rollout: bool = False,
         context_info_keys: Sequence[str] | None = None,
         auxiliary_info_keys: Sequence[str] | None = None,
+        prelude_info_keys: Sequence[str] | None = None,
+        prelude_label_key: str | None = None,
         target_kl: float | None = None,
         stats_window_size: int = 100,
         tensorboard_log: str | None = None,
@@ -232,6 +241,8 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
             reset_envs_each_rollout=reset_envs_each_rollout,
             context_info_keys=context_info_keys,
             auxiliary_info_keys=auxiliary_info_keys,
+            prelude_info_keys=prelude_info_keys,
+            prelude_label_key=prelude_label_key,
             stats_window_size=stats_window_size,
             tensorboard_log=tensorboard_log,
             policy_kwargs=policy_kwargs,
@@ -283,6 +294,10 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
             raise ValueError(f"curiosity_until must be None or an integer >= 1, got {curiosity_until!r}")
         if curiosity_weight > 0 and encoder_objective != "supervised":
             raise ValueError("curiosity_weight rewards the drop in the Gaussian head's variance: it needs encoder_objective='supervised'")
+        if self.prelude_info_keys is not None and (encoder_objective != "supervised" or self.prelude_label_key is None
+                                                   or self.auxiliary_info_keys is not None):
+            raise ValueError("prelude_info_keys needs encoder_objective='supervised' (the PPO epochs use the contexts cached at "
+                             "collection), prelude_label_key (the preludes' labels) and no auxiliary head")
 
         if self.env is not None:
             # Each minibatch holds complete streams
@@ -519,17 +534,30 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         sums = {"policy_loss": 0.0, "value_loss": 0.0, "entropy_loss": 0.0, "clipped": 0.0, "kl": 0.0}
 
         encoder_state = rollout_data.initial_state
+        # With preludes the episodes don't start from the initial state: the contexts cached at collection, exact
+        # because the encoder (supervised) has not changed since
+        cached = self.prelude_info_keys is not None
+        if cached and rollout_data.context_estimates is None:
+            raise RuntimeError("With preludes the rollout buffer must cache the collected contexts (estimate_dim)")
         for start in range(0, n_steps, segment_len):
             segment = slice(start, start + segment_len)
-            values, log_prob, entropy, final_state, _ = self.policy.evaluate_actions(
-                rollout_data.observations[:, segment],
-                rollout_data.actions[:, segment],
-                encoder_state,
-                rollout_data.prev_actions[:, segment],
-                rollout_data.episode_starts[:, segment],
-                # Supervised: the encoder runs without gradient, the PPO losses must not reach it
-                detach_context=supervised,
-            )
+            if cached:
+                values, log_prob, entropy = self.policy.evaluate_actions_from_contexts(
+                    rollout_data.observations[:, segment],
+                    rollout_data.actions[:, segment],
+                    rollout_data.context_estimates[:, segment],  # type: ignore[index]
+                )
+                final_state = encoder_state
+            else:
+                values, log_prob, entropy, final_state, _ = self.policy.evaluate_actions(
+                    rollout_data.observations[:, segment],
+                    rollout_data.actions[:, segment],
+                    encoder_state,
+                    rollout_data.prev_actions[:, segment],
+                    rollout_data.episode_starts[:, segment],
+                    # Supervised: the encoder runs without gradient, the PPO losses must not reach it
+                    detach_context=supervised,
+                )
             # The losses are means over the minibatch: each segment counts by its share of the transitions
             weight = values.numel() / n_transitions
 
