@@ -3,102 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Batın Muslu">
   <title>Reading Your Own Battery: Autogenic Context in RL</title>
   <meta name="description" content="BatteryPlane, a benchmark where the agent's own actions change and hide its context, and a two-stage recipe that learns to infer it.">
   <meta property="og:title" content="Reading Your Own Battery: Autogenic Context in Reinforcement Learning">
   <meta property="og:description" content="A plane whose battery is hidden and drained by its own thrust. End-to-end memory agents fail; a frozen encoder trained on many pilots' flights recovers most of the value of knowing the battery.">
   <meta property="og:image" content="assets/figures/fig1_method.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg: #ffffff; --surface: #f6f7f9; --card: #ffffff; --ink: #111111; --ink2: #4a4a46; --muted: #7d7b75;
-      --line: #e3e2dc; --accent: #2a78d6; --accent-dark: #1c5cab; --accent-tint: #eaf2fc;
-      --red: #a8322d; --green: #3aa655; --purple: #7a2e8e; --code: #f3f3f0;
-      color-scheme: light;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root:not([data-theme="light"]) {
-        --bg: #141414; --surface: #1c1c1b; --card: #222221; --ink: #f0efec; --ink2: #c3c2b7; --muted: #8f8d86;
-        --line: #33332f; --accent: #4f93e6; --accent-dark: #8fbaf0; --accent-tint: #1d2a3a; --code: #1f1f1e;
-        color-scheme: dark;
-      }
-    }
-    :root[data-theme="dark"] {
-      --bg: #141414; --surface: #1c1c1b; --card: #222221; --ink: #f0efec; --ink2: #c3c2b7; --muted: #8f8d86;
-      --line: #33332f; --accent: #4f93e6; --accent-dark: #8fbaf0; --accent-tint: #1d2a3a; --code: #1f1f1e;
-      color-scheme: dark;
-    }
-    * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    body { margin: 0; background: var(--bg); color: var(--ink); font: 400 17px/1.65 "Roboto", system-ui, -apple-system, "Segoe UI", sans-serif; }
-    main { max-width: 1000px; margin: 0 auto; padding: 0 16px 64px; }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.15; margin: 0 0 14px; font-weight: 700; letter-spacing: -0.01em; }
-    h2 { font-size: 27px; margin: 64px 0 14px; font-weight: 700; }
-    h3 { font-size: 19px; margin: 30px 0 8px; font-weight: 500; }
-    p { margin: 0 0 14px; color: var(--ink2); }
-    strong { color: var(--ink); font-weight: 500; }
-    .hero { text-align: center; padding: 64px 0 20px; }
-    .subtitle { font-size: clamp(17px, 2.3vw, 21px); color: var(--ink2); max-width: 760px; margin: 0 auto 18px; }
-    .authors { font-size: 18px; margin-bottom: 22px; }
-    .buttons { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
-    .button { display: inline-flex; align-items: center; gap: 8px; padding: 9px 18px; border-radius: 999px; background: var(--ink); color: var(--bg);
-              font-weight: 500; font-size: 15px; }
-    .button:hover { text-decoration: none; opacity: 0.85; }
-    .button svg { width: 18px; height: 18px; fill: currentColor; }
-    .teaser { margin: 34px 0 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-    .video-card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-    .video-card video { display: block; width: 100%; height: auto; background: #0b0b0b; }
-    .video-card .label { padding: 9px 12px 10px; font-size: 15px; display: flex; align-items: center; gap: 8px; color: var(--ink); }
-    .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-    .caption { font-size: 15px; color: var(--muted); text-align: center; margin: 6px auto 0; max-width: 820px; }
-    .tldr { background: var(--accent-tint); border-radius: 14px; padding: 20px 24px; margin: 40px 0 0; }
-    .tldr p { margin: 0; color: var(--ink); }
-    .tldr strong { color: var(--accent-dark); }
-    figure { margin: 22px 0; }
-    figure img { display: block; width: 100%; height: auto; background: #ffffff; border-radius: 10px; border: 1px solid var(--line); padding: 10px; }
-    figcaption { font-size: 15px; color: var(--muted); margin-top: 8px; }
-    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
-    .numbers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 22px 0 6px; }
-    .stat { background: var(--surface); border-radius: 12px; padding: 14px 16px; }
-    .stat .value { font-size: 30px; font-weight: 700; line-height: 1.1; color: var(--ink); }
-    .stat .name { font-size: 14px; color: var(--muted); margin-top: 4px; }
-    .stat.ours .value { color: var(--accent); }
-    .pilots { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 16px; }
-    .pilots .label { font-size: 14px; }
-    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 16px; }
-    .controls span { color: var(--muted); font-size: 15px; margin-right: 4px; }
-    .chip { border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 999px; padding: 6px 15px; font: 500 15px "Roboto", sans-serif;
-            cursor: pointer; }
-    .chip[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
-    .gallery { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-    .tag { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; margin-left: auto; }
-    ul.points { padding-left: 20px; margin: 0 0 14px; color: var(--ink2); }
-    ul.points li { margin-bottom: 8px; }
-    .bib { position: relative; }
-    pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 16px; overflow-x: auto; font: 400 14px/1.5 "Roboto Mono", ui-monospace, monospace;
-          color: var(--ink); margin: 0; }
-    .copy { position: absolute; top: 10px; right: 10px; }
-    footer { text-align: center; color: var(--muted); font-size: 14px; padding: 30px 16px 40px; border-top: 1px solid var(--line); margin-top: 40px; }
-    @media (max-width: 760px) {
-      .teaser, .two { grid-template-columns: 1fr; }
-      .numbers, .pilots { grid-template-columns: 1fr 1fr; }
-      .gallery { grid-template-columns: 1fr 1fr; }
-      h2 { margin-top: 48px; }
-    }
-    @media (max-width: 460px) { .gallery { grid-template-columns: 1fr; } }
-  </style>
+  <link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
+<nav class="site-nav" aria-label="Pages"><div class="inner"><a class="brand" href="index.html">Reading Your Own Battery</a><div class="links"><a href="index.html" aria-current="page">Overview</a><a href="environment.html">Environment</a><a href="contextual_ppo.html">Contextual PPO</a><a href="results.html">Results</a><a href="ablations.html">Ablations</a><a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Code</a></div></div></nav>
 <main>
 
   <header class="hero">
     <h1>Reading Your Own Battery:<br>Autogenic Context in Reinforcement Learning</h1>
     <p class="subtitle">A plane whose battery is hidden from the pilot and drained by the pilot's own thrust: a small benchmark for a context the agent creates itself, and a two-stage recipe that learns to infer it.</p>
-    <div class="authors"><a href="https://github.com/Buttontheduck">Buttontheduck</a></div>
+    <div class="authors"><a href="https://github.com/Buttontheduck">Batın Muslu</a></div>
     <div class="buttons">
       <a class="button" href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -127,148 +50,49 @@
     <p><strong>TL;DR.</strong> In BatteryPlane the agent must infer its own hidden battery charge, and the only way to see it is to fly at full throttle, which drains it. Memory agents trained end to end fall into a loop: the policy flies one narrow style, so the battery rarely shows, so the encoder learns a clock instead of the battery, so the policy ignores it. Training the encoder <strong>offline on many pilots' flights</strong> and then freezing it breaks the loop: in our main setting, plain PPO with the frozen encoder recovers about 80% of the value of seeing the true battery.</p>
   </div>
 
-  <h2 id="problem">An autogenic context</h2>
-  <p>Contextual reinforcement learning usually studies contexts that the environment imposes: gravity, mass, friction. The agent cannot change them, and they stay fixed during an episode. This project studies the other kind, which <a href="https://arxiv.org/abs/2604.02348">Biedenkapp (2026)</a> calls <strong>autogenic</strong>: a context that the agent's own behaviour creates and changes.</p>
-  <p>Our example is a plane's battery. The battery limits how hard the cruise motor can push, and every bit of thrust drains it. A good pilot must know how much is left: with a full battery it can fly fast; with a weak one it must fly slowly to survive the 35-second mission. But the battery is <strong>hidden</strong>. It shows in the plane's motion only while the motor runs at its limit, so finding out how much battery is left costs battery. Observing the context changes it.</p>
-
-  <h2 id="environment">BatteryPlane</h2>
-  <p>A 2D point-mass plane with a lift motor, a cruise motor, a wing and a battery. The agent sees four numbers: altitude, a noisy speed reading (±5 m/s), climb rate and time left. It earns reward for flying in a high speed band and loses heavily if the battery runs empty or the plane hits the ground. The starting battery is drawn between 20% and 70%, the range where rationing matters.</p>
-  <ul class="points">
-    <li><strong>The context matters:</strong> the best hand-written pilot that cannot see the battery earns 36% less than one that can, and learned agents without memory gain 130–235 points from seeing it.</li>
-    <li><strong>The context is hidden:</strong> below the motor's limit, the plane's motion does not depend on the battery at all.</li>
-    <li><strong>The context is autogenic:</strong> only the agent's own thrust drains it, and probing it (flying at the limit) is exactly what drains it fastest.</li>
-  </ul>
-  <h3>The pilots</h3>
-  <p>To train the encoder offline we fly the plane with 11 scripted and learned pilots in different styles and record 19,000 flights. Variety matters: some styles reveal the battery, others hide it completely.</p>
-  <div class="pilots" id="pilots"></div>
-
-  <h2 id="method">Method</h2>
-  <figure>
-    <img src="assets/figures/fig1_method.png" alt="Diagram of the two-stage method: offline supervised encoder training, then PPO with the frozen encoder." loading="lazy">
-    <figcaption><strong>(a)</strong> The pilots' flights train a GRU encoder f<sub>φ</sub> to predict the battery b<sub>t</sub> from the observation o<sub>t</sub> and the previous action a<sub>t−1</sub>; the true battery is used only as the training label. <strong>(b)</strong> The encoder is frozen; at every step it gives PPO its estimate b̂<sub>t</sub>, and the actor and critic learn from the reward alone. The policy never sees the battery.</figcaption>
-  </figure>
-
-  <h2 id="results">Results</h2>
-  <p>All numbers are on reserved test seeds (2000–2002), never used for training or selection: the mean final-test return over 8 training seeds.</p>
+  <h2 id="glance">At a glance</h2>
+  <p>Mean final-test return over 8 training seeds, on reserved test seeds (2000–2002) never used for training or selection.</p>
   <div class="numbers">
     <div class="stat"><div class="value" style="color:var(--red)">49</div><div class="name">PPO, no battery information</div></div>
     <div class="stat ours"><div class="value">238</div><div class="name">PPO + frozen GRU (ours)</div></div>
     <div class="stat"><div class="value" style="color:var(--purple)">283</div><div class="name">PPO, true battery</div></div>
     <div class="stat"><div class="value" style="color:var(--green)">316</div><div class="name">PPO, ideal Bayesian estimate</div></div>
   </div>
-  <div class="two">
-    <figure>
-      <img src="assets/figures/fig2a_plain_ppo.png" alt="Bar chart: final-test return of plain PPO with no battery information, the frozen GRU, the true battery and the ideal estimate." loading="lazy">
-      <figcaption>Plain PPO with a frozen encoder closes most of the gap between no battery information and the true battery.</figcaption>
-    </figure>
-    <figure>
-      <img src="assets/figures/fig2b_end_to_end.png" alt="Bar chart: Contextual PPO with encoders trained end to end does no better than without memory." loading="lazy">
-      <figcaption>Contextual PPO with its encoder trained end to end, as an xLSTM or a GRU, does no better than without memory at all.</figcaption>
-    </figure>
-  </div>
-  <div class="two">
-    <figure>
-      <img src="assets/figures/fig3a_return_by_battery.png" alt="Line chart: return by starting battery for the four agents." loading="lazy">
-      <figcaption>By starting battery: without the battery the agent fails at low charge; ours matches the references up to 40% and flies safely above it.</figcaption>
-    </figure>
-    <figure>
-      <img src="assets/figures/fig3b_completion_by_battery.png" alt="Bar chart: share of flights completed by starting battery." loading="lazy">
-      <figcaption>Flights completed: from 30% up, ours and both references finish every flight; without the battery almost none below 60%.</figcaption>
-    </figure>
+
+  <h2 id="method">The recipe</h2>
+  <figure>
+    <img src="assets/figures/fig1_method.png" alt="Diagram of the two-stage method: offline supervised encoder training, then PPO with the frozen encoder." loading="lazy">
+    <figcaption><strong>(a)</strong> The pilots' flights train a GRU encoder f<sub>φ</sub> to predict the battery b<sub>t</sub> from the observation o<sub>t</sub> and the previous action a<sub>t−1</sub>; the true battery is used only as the training label. <strong>(b)</strong> The encoder is frozen; at every step it gives PPO its estimate b̂<sub>t</sub>, and the actor and critic learn from the reward alone. The policy never sees the battery.</figcaption>
+  </figure>
+  <p>Why training the encoder together with the policy fails, and why this works: <a href="contextual_ppo.html">Contextual PPO →</a></p>
+
+  <h2 id="explore">Explore</h2>
+  <div class="cards four">
+    <a class="card" href="environment.html"><div class="title">Environment</div><p>BatteryPlane: state, observation and action spaces, and why the plane climbs.</p></a>
+    <a class="card" href="contextual_ppo.html"><div class="title">Contextual PPO</div><p>A memory that infers the battery, why training it end to end fails, and the two-stage recipe with the pilots.</p></a>
+    <a class="card" href="results.html"><div class="title">Results</div><p>Final-test returns, results by starting battery, and every agent flying the same test flight.</p></a>
+    <a class="card" href="ablations.html"><div class="title">Ablations</div><p>The encoder's training target, its architecture, end-to-end variants, lessons, and the full configuration.</p></a>
   </div>
 
-  <h2 id="gallery">See them fly</h2>
-  <p>The same test flight for each agent; choose the starting battery. Every clip is a real final-test flight (2× speed), with the outcome in its caption.</p>
-  <div class="controls" role="group" aria-label="Starting battery">
-    <span>Starting battery</span>
-    <button class="chip" data-b="02">20%</button>
-    <button class="chip" data-b="03" aria-pressed="true">30%</button>
-    <button class="chip" data-b="05">50%</button>
-    <button class="chip" data-b="07">70%</button>
-  </div>
-  <div class="gallery" id="gallery"></div>
-
-  <h2 id="ablations">Ablations</h2>
-  <h3>The training target: true battery or the ideal estimate</h3>
-  <p>The true battery is a noisy label where the battery cannot be known. Training the same GRU on the ideal Bayesian estimate instead, the best guess possible from the same inputs, lowers the offline error only a little (0.097 → 0.093) but lifts PPO from 238 to 330, and removes the instability at larger batch sizes. The catch: computing that estimate needs the exact physics.</p>
-  <figure><img src="assets/figures/fig_ablation_target.png" alt="Six-panel ablation of the encoder's training target." loading="lazy"></figure>
-  <h3>The encoder architecture</h3>
-  <p>xLSTM, GRU and a convolutional GRU, with and without the time-left input, all land within 0.097–0.103 offline error once trained long enough. Patience matters far more than architecture: stopped too early, the xLSTM stays at 0.129, near a clock-only guess.</p>
-  <figure><img src="assets/figures/fig_ablation_architecture.png" alt="Offline test error by encoder architecture." loading="lazy"></figure>
-  <h3>End-to-end training</h3>
-  <p>More encoder training, an entropy bonus, a Gaussian head, a curiosity bonus and a warm-up: no joint-training variant beats Contextual PPO without memory.</p>
-  <figure><img src="assets/figures/fig_ablation_end_to_end.png" alt="Joint-training variants and the encoder-head grid, all at the memoryless level." loading="lazy"></figure>
-
-  <h2 id="lessons">What we learned</h2>
-  <ul class="points">
-    <li><strong>The environment works as a test:</strong> knowing the battery is worth 130–235 points to agents without memory.</li>
-    <li><strong>End-to-end memory fails, for an autogenic reason:</strong> the policy decides what its own encoder gets to see, and a narrow policy teaches the encoder a clock.</li>
-    <li><strong>Diverse data breaks the loop:</strong> an encoder trained offline on many pilots' flights, then frozen, works in closed loop.</li>
-    <li><strong>A clean target matters more than the architecture:</strong> learning the ideal estimate instead of the noisy true battery brings PPO to the ideal estimate's level.</li>
-    <li><strong>Behaviour decides what can be known:</strong> policies that never fly at the motor's limit hide the battery even from a perfect estimator.</li>
-  </ul>
-  <h3>Limitations</h3>
-  <p>The encoders that work are trained with privileged information: the true battery as labels, or an estimate that needs the exact physics. No method here learns the battery from reward alone. BatteryPlane is a small, single-context toy problem, and all agents train on CPU for 2 million steps.</p>
+  <h2 id="ai-use">Use of AI tools</h2>
+  <p>Claude (Anthropic) helped with the code, experiments, figures and this website. The research direction and conclusions are the author's.</p>
 
   <h2 id="citation">Citation</h2>
   <div class="bib">
     <pre id="bibtex">@misc{batteryplane2026,
   title        = {Reading Your Own Battery: Autogenic Context in Reinforcement Learning},
-  author       = {Buttontheduck},
+  author       = {Muslu, Bat{\i}n},
   year         = {2026},
   howpublished = {\url{https://github.com/Buttontheduck/Bidirectional-Contextual-RL}}
 }</pre>
     <button class="chip copy" id="copy">Copy</button>
   </div>
 
+  <div class="pager"><a class="next" href="environment.html"><span class="dir">Next →</span><span class="name">Environment</span></a></div>
 </main>
 <footer>
-  Built from the experiment logs in the <a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">repository</a>. Videos are real final-test flights rendered with the environment's own renderer.
+  Built from the experiment logs in the <a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">repository</a>. Videos are real final-test flights rendered with the environment's own renderer. Developed with the help of large language models (<a href="index.html#ai-use">details</a>).
 </footer>
-
-<script>
-  // Pilot styles (test seed 2001, starting battery 44%)
-  const pilots = [["probe_hold", "Probe & hold"], ["steady_below", "Steady below cap"], ["shaky", "Shaky"], ["wavy", "Wavy"],
-                  ["cruise", "Cruise"], ["blind_ppo", "PPO, memoryless"], ["replay_good", "Good PPO, replayed"],
-                  ["switching", "Style switching"]];
-  document.getElementById("pilots").innerHTML = pilots.map(([file, name]) =>
-    `<div class="video-card"><video src="assets/videos/pilot_${file}.mp4" muted loop playsinline preload="metadata"></video>` +
-    `<div class="label">${name}</div></div>`).join("");
-
-  // Gallery: the same test flight (seed 2000) for each agent, by starting battery
-  const agents = [["memoryless_ppo", "No battery information", "var(--red)", ""],
-                  ["gru_labels_ppo", "Frozen GRU (ours)", "var(--accent)", ""],
-                  ["true_battery_ppo", "True battery", "var(--purple)", "reference"],
-                  ["ideal_ppo", "Ideal estimate", "var(--green)", "reference"],
-                  ["gru_teacher_ppo", "Frozen GRU, ideal-estimate teacher", "#eb6834", "ablation"]];
-  const gallery = document.getElementById("gallery");
-  function showBattery(b) {
-    gallery.innerHTML = agents.map(([file, name, color, tag]) =>
-      `<div class="video-card"><video src="assets/videos/${file}_b${b}.mp4" muted loop playsinline preload="metadata"></video>` +
-      `<div class="label"><span class="dot" style="background:${color}"></span>${name}` +
-      (tag ? `<span class="tag">${tag}</span>` : "") + `</div></div>`).join("");
-    gallery.querySelectorAll("video").forEach(observe);
-  }
-  document.querySelectorAll(".chip[data-b]").forEach(chip => chip.addEventListener("click", () => {
-    document.querySelectorAll(".chip[data-b]").forEach(c => c.setAttribute("aria-pressed", String(c === chip)));
-    showBattery(chip.dataset.b);
-  }));
-
-  // Play videos only while they are on screen
-  const watcher = "IntersectionObserver" in window ? new IntersectionObserver(entries => entries.forEach(e => {
-    if (e.isIntersecting) { e.target.play().catch(() => {}); } else { e.target.pause(); }
-  }), { threshold: 0.25 }) : null;
-  function observe(video) { if (watcher) { watcher.observe(video); } else { video.autoplay = true; } }
-  document.querySelectorAll("video").forEach(observe);
-  showBattery("03");
-
-  // Copy the BibTeX
-  document.getElementById("copy").addEventListener("click", async () => {
-    const button = document.getElementById("copy");
-    try { await navigator.clipboard.writeText(document.getElementById("bibtex").textContent); button.textContent = "Copied"; }
-    catch (err) { button.textContent = "Select and copy"; }
-    setTimeout(() => { button.textContent = "Copy"; }, 1600);
-  });
-</script>
+<script src="assets/site.js"></script>
 </body>
 </html>

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Batın Muslu">
+  <title>Ablations · Reading Your Own Battery</title>
+  <meta name="description" content="Ablations of the encoder's training target, architecture and end-to-end training, lessons and limitations.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="site-nav" aria-label="Pages"><div class="inner"><a class="brand" href="index.html">Reading Your Own Battery</a><div class="links"><a href="index.html">Overview</a><a href="environment.html">Environment</a><a href="contextual_ppo.html">Contextual PPO</a><a href="results.html">Results</a><a href="ablations.html" aria-current="page">Ablations</a><a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Code</a></div></div></nav>
+<main>
+  <header class="page-head">
+    <h1>Ablations and lessons</h1>
+    <p class="lead">What the encoder's training target and architecture change, why end-to-end training fails, what we learned, and the full configuration behind every run.</p>
+  </header>
+
+  <h2 id="ablations">Ablations</h2>
+  <h3>The training target: true battery or the ideal estimate</h3>
+  <p>The true battery is a noisy label where the battery cannot be known. Training the same GRU on the ideal Bayesian estimate instead, the best guess possible from the same inputs, lowers the offline error only a little (0.097 → 0.093) but lifts PPO from 238 to 330, and removes the instability at larger batch sizes. The catch: computing that estimate needs the exact physics.</p>
+  <figure><img src="assets/figures/fig_ablation_target.png" alt="Six-panel ablation of the encoder's training target." loading="lazy"></figure>
+  <h3>The encoder architecture</h3>
+  <p>xLSTM, GRU and a convolutional GRU, with and without the time-left input, all land within 0.097–0.103 offline error once trained long enough. Patience matters far more than architecture: stopped too early, the xLSTM stays at 0.129, near a clock-only guess.</p>
+  <figure><img src="assets/figures/fig_ablation_architecture.png" alt="Offline test error by encoder architecture." loading="lazy"></figure>
+  <h3>End-to-end training</h3>
+  <p>More encoder training, an entropy bonus, a Gaussian head, a curiosity bonus and a warm-up: no joint-training variant beats Contextual PPO without memory.</p>
+  <figure><img src="assets/figures/fig_ablation_end_to_end.png" alt="Joint-training variants and the encoder-head grid, all at the memoryless level." loading="lazy"></figure>
+
+  <h2 id="lessons">What we learned</h2>
+  <ul class="points">
+    <li><strong>The environment works as a test:</strong> knowing the battery is worth 130–235 points to agents without memory.</li>
+    <li><strong>End-to-end memory fails, for an autogenic reason:</strong> the policy decides what its own encoder gets to see, and a narrow policy teaches the encoder a clock.</li>
+    <li><strong>Diverse data breaks the loop:</strong> an encoder trained offline on many pilots' flights, then frozen, works in closed loop.</li>
+    <li><strong>A clean target matters more than the architecture:</strong> learning the ideal estimate instead of the noisy true battery brings PPO to the ideal estimate's level.</li>
+    <li><strong>Behaviour decides what can be known:</strong> policies that never fly at the motor's limit hide the battery even from a perfect estimator.</li>
+  </ul>
+  <h3>Limitations</h3>
+  <p>The encoders that work are trained with privileged information: the true battery as labels, or an estimate that needs the exact physics. No method here learns the battery from reward alone. BatteryPlane is a small, single-context toy problem, and all agents train on CPU for 2 million steps.</p>
+
+  <h2 id="configuration">Configuration</h2>
+  <p>Every setting behind the results, as the runs used them: the environment, plain PPO with its frozen encoder, the ideal estimator, Contextual PPO with its end-to-end encoders, and the evaluation.</p>
+
+  <h3>Environment: BatteryPlane</h3>
+  <div class="table-wrap">
+    <table class="config two-col">
+      <tbody>
+        <tr><td>Mission</td><td>700 steps of 0.05 s (35 s). Reaching the end is a real terminal state: the time left is observed</td></tr>
+        <tr><td>Start</td><td>Battery uniform in 20–70%, altitude 30–120 m, speed 0–30 m/s, climb rate 0</td></tr>
+        <tr><td>Observation</td><td>Altitude ÷ 200 m, speed + Gaussian noise (σ = 5 m/s) ÷ 60 m/s, climb rate ÷ 60 m/s, time left (1 → 0). The battery is hidden</td></tr>
+        <tr><td>Action</td><td>(a<sub>x</sub>, a<sub>y</sub>) in [−1, 1]²</td></tr>
+        <tr><td>Cruise motor</td><td>20·a<sub>x</sub> m/s², capped at ±(11.5 + 6.5 b) m/s²: the battery b sets the cap</td></tr>
+        <tr><td>Lift motor</td><td>g − L + 10·a<sub>y</sub>, kept within 0–20 m/s²: a<sub>y</sub> = 0 holds level flight at any speed</td></tr>
+        <tr><td>Air density</td><td>e<sup>−y/H</sup> with H = 200 m / ln 2 ≈ 289 m: half at the 200 m ceiling</td></tr>
+        <tr><td>Wing lift</td><td>min(0.015 ρ v<sub>x</sub>², g); none when flying backwards</td></tr>
+        <tr><td>Drag</td><td>0.008 ρ v<sub>x</sub> |v<sub>x</sub>|</td></tr>
+        <tr><td>Gravity, damping</td><td>g = 10 m/s²; the climb rate is damped at 0.25 per second</td></tr>
+        <tr><td>Battery</td><td>Each step drains (a<sub>x</sub>² + a<sub>y</sub>²)/g² × Δt / 100 for the thrust actually delivered: a full battery could hover for 100 s</td></tr>
+        <tr><td>Reward per step</td><td>clip((v<sub>x</sub> − 52)/10, 0, 1)² + clip(v<sub>x</sub>/62, 0, 1)²: up to 1 for the band 52–62 m/s, plus up to 1 that grows with speed</td></tr>
+        <tr><td>Failure</td><td>Battery empty or altitude 0: −300 and the flight ends</td></tr>
+        <tr><td>Integration</td><td>Semi-implicit Euler, Δt = 0.05 s; the ceiling caps the altitude at 200 m</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Plain PPO</h3>
+  <div class="table-wrap">
+    <table class="config two-col">
+      <tbody>
+        <tr><td>Library</td><td>Stable-Baselines3 PPO</td></tr>
+        <tr><td>Input</td><td>The hidden observation (4 numbers) plus one battery value: none (the no-battery baseline), the frozen GRU's estimate, or the ideal estimate. Or the true battery, as the reference</td></tr>
+        <tr><td>Actor and critic</td><td>Two separate networks, each with 2 hidden layers of 256 units, tanh activations, orthogonal initialization</td></tr>
+        <tr><td>Action distribution</td><td>Gaussian with a learned standard deviation that doesn't depend on the state (log std starts at 0); the executed action is clipped to [−1, 1]</td></tr>
+        <tr><td>Parameters</td><td>Actor 67,844, critic 67,585 (67,588 and 67,329 with no battery input)</td></tr>
+        <tr><td>Optimizer</td><td>Adam, learning rate 3 × 10<sup>−4</sup>, constant</td></tr>
+        <tr><td>Rollout per update</td><td>8 parallel environments × 512 steps = 4,096 transitions</td></tr>
+        <tr><td>Minibatches</td><td>256 or 1,024 shuffled transitions (the batch-256 and batch-1024 runs), 10 epochs per update</td></tr>
+        <tr><td>Discount γ / GAE λ</td><td>0.99 / 0.95</td></tr>
+        <tr><td>Clip range</td><td>0.2 for the policy ratio, no value clipping; advantages normalized per minibatch</td></tr>
+        <tr><td>Loss coefficients</td><td>Entropy 0, value loss 0.5; gradient clipping at norm 0.5</td></tr>
+        <tr><td>Reward scale</td><td>0.1, during training only; every return on this site is in environment units</td></tr>
+        <tr><td>Training</td><td>2 million environment steps (488 updates) on CPU, 8 seeds (0–7)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Frozen GRU encoder (ours)</h3>
+  <div class="table-wrap">
+    <table class="config two-col">
+      <tbody>
+        <tr><td>Input per step</td><td>Observation o<sub>t</sub> (4 numbers) and the previous action a<sub>t−1</sub> (2): 6 numbers. Never the battery</td></tr>
+        <tr><td>Network</td><td>Linear 6 → 128, a GRU of 2 layers × 128 units, then a head of 2 hidden layers × 128 (tanh) with a sigmoid output: the estimate b̂<sub>t</sub> in [0, 1]</td></tr>
+        <tr><td>Parameters</td><td>232,193</td></tr>
+        <tr><td>Training target</td><td>The true battery b<sub>t</sub>, mean squared error (ablation T1: the ideal estimate's mean instead)</td></tr>
+        <tr><td>Training data</td><td>19,000 recorded flights of 11 pilot styles: 15,200 train, 1,900 validation, 1,900 test, split by flight seed</td></tr>
+        <tr><td>Batch</td><td>32 whole flights</td></tr>
+        <tr><td>Optimizer</td><td>Adam, 3 × 10<sup>−4</sup>, gradient clipping at norm 1.0</td></tr>
+        <tr><td>Schedule</td><td>Up to 40 passes over the data, stopping after 8 without a better validation error (best pass: 38, 5.8 h on CPU)</td></tr>
+        <tr><td>Choice</td><td>The best validation error of 5 seeds (seed 1; teacher-trained T1: seed 3)</td></tr>
+        <tr><td>During PPO</td><td>Frozen: plain PPO reads its estimate as an extra input</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Ideal estimator</h3>
+  <div class="table-wrap">
+    <table class="config two-col">
+      <tbody>
+        <tr><td>What it is</td><td>A Bayes filter: the best estimate of b<sub>t</sub> possible from the same inputs as the encoder, using the exact physics</td></tr>
+        <tr><td>Candidates</td><td>101 starting batteries × 301 starting speeds, each replayed through the physics with the executed actions</td></tr>
+        <tr><td>Evidence</td><td>The noisy speed reading (σ = 5 m/s) and the climb rate at every step</td></tr>
+        <tr><td>Pruning</td><td>Candidates more than 30 log-units below the best are dropped</td></tr>
+        <tr><td>Output</td><td>The posterior mean of b<sub>t</sub> (and its standard deviation, in the variant that also feeds the uncertainty)</td></tr>
+        <tr><td>Used for</td><td>Plain PPO with the ideal estimate as its extra input, and the training target of the teacher-trained GRU (T1)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Contextual PPO (CPPO), encoder trained end to end</h3>
+  <div class="table-wrap">
+    <table class="config">
+      <thead><tr><th>Setting</th><th>Experiment A<span>xLSTM encoder</span></th><th>Joint training J0–J5<span>GRU encoder</span></th></tr></thead>
+      <tbody>
+        <tr><td>PPO settings</td><td colspan="2">As plain PPO (networks, optimizer, rollout, epochs, γ, λ, clipping, coefficients, reward scale, budget), except the rows below</td></tr>
+        <tr><td>Actor and critic input</td><td colspan="2">The hidden observation (4 numbers) plus the encoder's output z<sub>t</sub> (1)</td></tr>
+        <tr><td>Minibatches</td><td colspan="2">4 per epoch, each 2 whole environment streams of 512 steps (1,024 transitions, in time order)</td></tr>
+        <tr><td>Entropy coefficient</td><td>0</td><td>0 (J2–J4: 0.01)</td></tr>
+        <tr><td>Encoder input</td><td colspan="2">Observation o<sub>t</sub> and the previous action a<sub>t−1</sub>: 6 numbers, never the battery</td></tr>
+        <tr><td>Encoder core</td><td>Linear 6 → 128, then 2 xLSTM blocks (an mLSTM, then an sLSTM), 4 heads, a causal convolution over 4 steps</td><td>Linear 6 → 128, then a GRU of 2 layers × 128 units</td></tr>
+        <tr><td>Output head</td><td colspan="2">2 hidden layers × 128 (tanh) with a sigmoid output (J3–J4: a Gaussian head, mean and variance)</td></tr>
+        <tr><td>Encoder parameters</td><td>186,377</td><td>232,193</td></tr>
+        <tr><td>Encoder training</td><td colspan="2">After the PPO epochs of every update, on the agent's own flights: the true battery b<sub>t</sub> as target, mean squared error (J3–J4: β-NLL with β = 0.5). PPO's losses never reach the encoder</td></tr>
+        <tr><td>Encoder steps per update</td><td>8</td><td>8 (J0), 32 (J1–J5). J5: the policy waits for the first 200,000 steps, with 128 encoder steps per update</td></tr>
+        <tr><td>Episode batch</td><td>16 whole episodes</td><td>16 (J0), 32 (J1–J5)</td></tr>
+        <tr><td>Episode buffer</td><td>200,000 steps</td><td>200,000 (J0), 2.1 million (J1–J5); 10% of episodes held out for validation</td></tr>
+        <tr><td>Encoder optimizer</td><td colspan="2">Adam, 3 × 10<sup>−4</sup>, the same optimizer as the actor and critic; no gradient clipping</td></tr>
+        <tr><td>Training seeds</td><td>3 (0–2)</td><td>5 per variant (0–4)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Evaluation</h3>
+  <div class="table-wrap">
+    <table class="config two-col">
+      <tbody>
+        <tr><td>Validation</td><td>Every 50,000 steps: 18 flights (seeds 1000–1002 × starting battery 20%, 30%, … 70%), deterministic actions</td></tr>
+        <tr><td>Training score</td><td>The mean validation return over the last quarter of training (1.5–2 million steps, 11 evaluations)</td></tr>
+        <tr><td>Final test</td><td>Seeds 2000–2002 on the same 18-flight grid, the final model, run once after every choice was made</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="pager"><a class="prev" href="results.html"><span class="dir">← Previous</span><span class="name">Results</span></a></div>
+</main>
+<footer>
+  Built from the experiment logs in the <a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">repository</a>. Videos are real final-test flights rendered with the environment's own renderer. Developed with the help of large language models (<a href="index.html#ai-use">details</a>).
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>

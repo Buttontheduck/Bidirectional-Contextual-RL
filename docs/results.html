@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Batın Muslu">
+  <title>Results · Reading Your Own Battery</title>
+  <meta name="description" content="Final-test results of plain PPO with a frozen encoder and of Contextual PPO trained end to end, and videos of every agent.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="site-nav" aria-label="Pages"><div class="inner"><a class="brand" href="index.html">Reading Your Own Battery</a><div class="links"><a href="index.html">Overview</a><a href="environment.html">Environment</a><a href="contextual_ppo.html">Contextual PPO</a><a href="results.html" aria-current="page">Results</a><a href="ablations.html">Ablations</a><a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Code</a></div></div></nav>
+<main>
+  <header class="page-head">
+    <h1>Results</h1>
+    <p class="lead">Plain PPO with a frozen encoder against no battery information, the true battery and the ideal estimate, and Contextual PPO trained end to end.</p>
+  </header>
+
+  <h2 id="results">Final test</h2>
+  <p>All numbers are on reserved test seeds (2000–2002), never used for training or selection: the mean final-test return over 8 training seeds.</p>
+  <div class="numbers">
+    <div class="stat"><div class="value" style="color:var(--red)">49</div><div class="name">PPO, no battery information</div></div>
+    <div class="stat ours"><div class="value">238</div><div class="name">PPO + frozen GRU (ours)</div></div>
+    <div class="stat"><div class="value" style="color:var(--purple)">283</div><div class="name">PPO, true battery</div></div>
+    <div class="stat"><div class="value" style="color:var(--green)">316</div><div class="name">PPO, ideal Bayesian estimate</div></div>
+  </div>
+  <div class="two">
+    <figure>
+      <img src="assets/figures/fig2a_plain_ppo.png" alt="Bar chart: final-test return of plain PPO with no battery information, the frozen GRU, the true battery and the ideal estimate." loading="lazy">
+      <figcaption>Plain PPO with a frozen encoder closes most of the gap between no battery information and the true battery.</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/figures/fig2b_end_to_end.png" alt="Bar chart: Contextual PPO with encoders trained end to end does no better than without memory." loading="lazy">
+      <figcaption>Contextual PPO with its encoder trained end to end, as an xLSTM or a GRU, does no better than without memory at all.</figcaption>
+    </figure>
+  </div>
+  <div class="two">
+    <figure>
+      <img src="assets/figures/fig3a_return_by_battery.png" alt="Line chart: return by starting battery for the four agents." loading="lazy">
+      <figcaption>By starting battery: without the battery the agent fails at low charge; ours matches the references up to 40% and flies safely above it.</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/figures/fig3b_completion_by_battery.png" alt="Bar chart: share of flights completed by starting battery." loading="lazy">
+      <figcaption>Flights completed: from 30% up, ours and both references finish every flight; without the battery almost none below 60%.</figcaption>
+    </figure>
+  </div>
+
+  <h2 id="see-them-fly">See them fly</h2>
+  <p>The same test flight for each agent; choose the starting battery. Every clip is a real final-test flight (2× speed), with the outcome in its caption.</p>
+  <div class="controls" role="group" aria-label="Starting battery">
+    <span>Starting battery</span>
+    <button class="chip" data-b="02">20%</button>
+    <button class="chip" data-b="03" aria-pressed="true">30%</button>
+    <button class="chip" data-b="05">50%</button>
+    <button class="chip" data-b="07">70%</button>
+  </div>
+  <div class="gallery" id="gallery"></div>
+
+  <div class="pager"><a class="prev" href="contextual_ppo.html"><span class="dir">← Previous</span><span class="name">Contextual PPO</span></a><a class="next" href="ablations.html"><span class="dir">Next →</span><span class="name">Ablations</span></a></div>
+</main>
+<footer>
+  Built from the experiment logs in the <a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">repository</a>. Videos are real final-test flights rendered with the environment's own renderer. Developed with the help of large language models (<a href="index.html#ai-use">details</a>).
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>
