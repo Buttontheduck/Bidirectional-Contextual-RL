@@ -30,6 +30,8 @@
 - **E1 with the transition passes:** gaps of 182, 171 and 198 points (rule: at least 100), and memoryless agents score as in the hard version (69 against 72 on average).
 - **E3 (end-to-end Contextual PPO with the GRU encoder, reading the take-off) fails** (section 11): J1 scores 95 and J0 67, against 58 without memory and 256 with the true battery. The take-off solved identification: the online encoder is 0.047–0.049 off at hand-over, at the best possible. But even given the true battery, its policies score only about 157 and fly near full throttle at every battery: the policy settles on a no-memory flying style in the first ~130k steps, before the online encoder becomes useful.
 - **J5 (the encoder learns for 200k steps before the policy) fails too:** 70. Its policies use the battery input much more than J1's, but still average only 151 given the true battery. The remaining suspect is the encoder changing while the policy learns; J6 (the encoder stops after the warm-up) would test it.
+- **The take-off-only version is a usable test bench after all** (revised 2026-10-21): its memoryless agents' higher returns come mostly from the faster start, plus a partial hint; judged on survival it separates agents with and without the battery as clearly as the transition version (section 11).
+- **E3c, end-to-end on the take-off-only version, is the closest end-to-end result so far** (section 11): J1 scores 169 on validation and 197 on the final test, against 155–158 without memory and 254–275 with the true battery (not a clear gain over no memory: final test p = 0.27). Its policies depend on the battery estimate, and given the true battery they match the true-battery agent (247 against 254); the encoder's remaining error (0.05 at hand-over) is what holds them back. Next: a 7-second take-off or a Gaussian head, chosen on validation.
 - **E2 skipped for now** (the user's choice, 2026-10-20): E3 went first.
 
 - **On a rented GPU:**
@@ -239,6 +241,51 @@ Everything as in step 0: discount 0.99, reward scale 0.1, 2M steps, 8 environmen
 
 ## 11. Results
 
+### Training settings of every run in this section
+
+**Environment versions** (`battery_plane.py`, set through `env.kwargs`; everything else at the defaults of the hard version):
+
+| Version | Settings | Prelude before the mission |
+|---|---|---|
+| Hard (for reference) | `warmup_steps=0` | none |
+| Take-off only | `warmup_steps=100` | 5 s at full cruise throttle, level (100 steps) |
+| Take-off + transition | `warmup_steps=100`, `transition_steps=80` | 5 s full throttle, then 4 s flying back to the mission's starting speed (180 steps) |
+
+In all versions the hand-over battery is uniform in 20–70% (the reset's b0), the mission is 700 steps of 0.05 s, the speed reading has noise σ = 5 m/s, and the rest of the physics, reward and failure rules are the hard version's (`battery_plane.py` module docstring).
+
+**Plain PPO** (0a, 0b, 0a_blind, 0b_blind; `ppo/main_battery_plane_ppo.py`, step 0's configs):
+- Stable-Baselines3 PPO; actor and critic separate, 2 hidden layers × 256, tanh, orthogonal initialization; Gaussian actions with a state-independent learned std (log std 0 at the start), clipped to [−1, 1].
+- Adam, learning rate 3 × 10⁻⁴ constant; 8 environments × 512 steps = 4,096 transitions per update; minibatches of 256 (0a, 0a_blind) or 1,024 (0b, 0b_blind) shuffled transitions; 10 epochs.
+- γ = 0.99, GAE λ = 0.95, clip range 0.2, no value clipping, advantages normalized; entropy coefficient 0, value-loss coefficient 0.5, gradient clipping 0.5.
+- Reward scale 0.1 during training only (all returns in environment units); 2M steps (488 updates).
+- Inputs: observed mode (hidden observation plus the true battery) for 0a/0b; hidden mode (4 numbers) for the memoryless controls.
+
+**Contextual PPO** (0c, 0c_blind, J0, J1, J5; `main_battery_plane_contextual_ppo.py`):
+- The same PPO settings, except the minibatches: 4 per epoch, each 2 whole environment streams of 512 steps (1,024 transitions in time order). Actor and critic read the observation plus the context z<sub>t</sub>.
+- 0c: the true battery as z<sub>t</sub> (observed mode, `TrueBatteryPolicy`). 0c_blind: z<sub>t</sub> = 0 (hidden mode, `NoContextPolicy`).
+- J0, J1, J5 (`config/joint/`): a GRU encoder learned online. Input [o<sub>t</sub>, a<sub>t−1</sub>] (6 numbers), linear 6 → 128, GRU of 2 layers × 128, head of 2 hidden layers × 128 (tanh) with a sigmoid output; 232,193 parameters. After the PPO epochs of every update it takes supervised steps towards the true battery b<sub>t</sub> (mean squared error) on complete episodes of the agent's own flights; PPO's losses never reach it. Adam 3 × 10⁻⁴ shared with the actor and critic, no encoder gradient clipping; 10% of the episodes held out for validation.
+- Preludes (`contextual_ppo/`, on automatically for a learned encoder when `warmup_steps > 0`): before every episode the encoder reads the prelude (the take-off, and the transition if any) from the reset info, and the episode starts from that memory with the autopilot's last action as previous action; the episode buffer stores each episode with its prelude and the prelude's batteries as labels; the PPO epochs use the contexts cached at collection; validation and the final test feed the prelude through `PreludePredictor`.
+
+| Variant | Encoder steps per update | Episodes per encoder step | Episode buffer | Other |
+|---|---:|---:|---:|---|
+| J0 (A's encoder budget) | 8 | 16 | 200,000 steps | |
+| J1 | 32 | 32 | 2.1 million steps | |
+| J5 | 32 | 32 | 2.1 million steps | no PPO update for the first 200,000 steps, with 128 encoder steps per update during that warm-up |
+
+**Evaluation** (all runs): validation every 50,000 steps on 18 flights (seeds 1000–1002 × starting battery 0.2, 0.3, … 0.7, where the starting battery is the hand-over battery), deterministic actions. Score: the mean validation return over 1.5M–2M steps (11 evaluations). Final test: seeds 2000–2002 on the same grid, only through `evaluate_final_test.py`, which first re-runs each run's validation and refuses if the flights don't reproduce.
+
+**Seeds, launches and run times** (16-core Ryzen 9 9950X, CPU only; `run_step0.py` gives every run its own process; W&B names end in `_warm100` for the take-off-only version and `_warm100_trans80` with the transition):
+
+| Experiment | Conditions × seeds | Launch | Run time per run |
+|---|---|---|---|
+| E1, take-off only | 0a 0b 0c 0a_blind 0b_blind 0c_blind × 0–7 | `--jobs 32 --threads 1 --warmup-steps 100 --output runs_step0/easy_e1` | 11–21 min |
+| E1, with the transition | the same | `--jobs 32 --threads 1 --warmup-steps 100 --transition-steps 80 --output runs_step0/easy_e1_trans80` | 17–29 min |
+| E3, with the transition | J0 J1 × 0–4 | `--jobs 10 --threads 3 --warmup-steps 100 --transition-steps 80 --output runs_step0/easy_e3` | J0 68–70 min, J1 227–232 min |
+| E3b (J5), with the transition | J5 × 0–4 | `--jobs 5 --threads 3 --warmup-steps 100 --transition-steps 80 --output runs_step0/easy_e3_j5` | 249–251 min |
+| E3c, take-off only | J0 J1 × 0–4 | `--jobs 10 --threads 3 --warmup-steps 100 --output runs_step0/easy_e3_takeoff` | J0 53–62 min, J1 206–208 min |
+
+Each launch line is `nohup python run_step0.py --conditions <conditions> --seeds <seeds> <launch> > run_<name>.log 2>&1 &`.
+
 ### E0: the environment option (2026-10-20)
 
 - **Implemented as in section 4.** The starting battery is solved by a vectorized grid search refined 7 times (to about 1e-11); the hand-over battery is checked to within 1e-9, then set exactly.
@@ -260,7 +307,40 @@ Everything as in step 0: discount 0.99, reward scale 0.1, 2M steps, 8 environmen
 | Contextual PPO (0c) | 254 | 158 | 96 | **not met** |
 
 - **Memoryless agents got much better:** 154 on average, against 72 in the hard version.
-- **Why:** the hand-over speed gives the battery away. During 5 s at full throttle a fuller battery accelerates harder, so the hand-over speed is correlated with the battery at 0.62, and a memoryless agent reads that from its first observation.
+- **First explanation (revised below):** the hand-over speed gives the battery away. During 5 s at full throttle a fuller battery accelerates harder, so the hand-over speed is correlated with the battery at 0.62, and a memoryless agent reads that from its first observation.
+
+**All six agents in detail** (added 2026-10-21). Score: mean validation return over 1.5M–2M steps, ± the standard deviation across the 8 seeds; final: the final checkpoint's validation.
+
+| Agent | Score | Final |
+|---|---:|---:|
+| Plain PPO batch 256, true battery (0a) | 288 ± 27 | 273 ± 26 |
+| Plain PPO batch 1024, true battery (0b) | 245 ± 35 | 225 ± 51 |
+| Contextual PPO, true battery (0c) | 254 ± 49 | 265 ± 69 |
+| Plain PPO batch 256, no memory (0a_blind) | 128 ± 51 | 127 ± 39 |
+| Plain PPO batch 1024, no memory (0b_blind) | 177 ± 26 | 193 ± 38 |
+| Contextual PPO, no memory (0c_blind) | 158 ± 42 | 144 ± 60 |
+
+Failed flights by starting battery (battery empty or ground crash; final validation, 24 flights per battery):
+
+| Agent | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | All |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0a, true battery | 100% | 0% | 0% | 0% | 0% | 0% | 17% |
+| 0b, true battery | 100% | 12% | 0% | 0% | 0% | 0% | 19% |
+| 0c, true battery | 79% | 12% | 0% | 0% | 0% | 0% | 15% |
+| 0a_blind, no memory | 100% | 100% | 100% | 88% | 62% | 0% | 75% |
+| 0b_blind, no memory | 100% | 100% | 100% | 75% | 46% | 0% | 70% |
+| 0c_blind, no memory | 100% | 100% | 100% | 100% | 54% | 0% | 76% |
+
+- The true-battery agents fail at 0.2 by both causes (0a: 62% battery empty, 38% ground; 0c: 25% / 54%); their few failures at 0.3 are ground crashes. The memoryless agents fail only by emptying the battery.
+- For comparison, with the transition the memoryless agents fail 79% of the flights at 0.6 and 29% at 0.7.
+
+**Revised explanation (2026-10-21).** The failure rates don't support "memoryless agents read the battery":
+- **They still fail every flight from 0.2 to 0.4,** like agents with no battery information. They do better only at the top: every flight at 0.7 completes and fewer fail at 0.6.
+- **A good part of their higher return comes from the faster start.** The mission begins at about 40–50 m/s instead of 0–30, so they reach the reward band sooner and spend no battery accelerating; agents that fly near full throttle anyway profit most. The design report shows the same: the scripted blind pilot gains far more from this version (284 → 398) than the one that knows the battery (443 → 500).
+- **There is a small real hint** (the hand-over speed correlates 0.62 with the battery), visible at 0.6–0.7.
+- So this version gave memoryless agents a faster start plus a partial hint. The transition removes both.
+
+**Revised verdict: the take-off-only version is a usable test bench.** It missed the return rule, but returns mix two things: whether an agent survives (where knowing the battery matters) and how much reward it collects before the flight ends (where the fast start helps everyone, and memoryless agents most). Judged on survival it separates the two kinds of agent as clearly as the transition version: 15–19% of flights failed with the true battery against 70–76% without memory, and 88–100% of the flights at 0.3–0.5 completed against 0–25%. The transition version stays the main one for comparisons with the hard version: the mission starts from the hard version's state, so the scores compare directly, and nothing about the battery is visible at hand-over. That is a preference for clean comparisons, not a flaw of the take-off-only version, which is simpler and has a natural story (take off at full power, hand over at cruising speed). Section "E3c" below runs end-to-end Contextual PPO on it.
 
 ### The fix: a transition back to the starting speed (2026-10-20)
 
@@ -422,3 +502,86 @@ Failed flights by starting battery (battery empty or ground crash; final validat
 - **The main remaining suspect is the encoder changing during training.** It trains after every update on the latest flights, so what a given estimate means keeps shifting while the policy learns to read it. Its errors also shift as the policy's flying changes, which shows as the drift later in the flight. A frozen encoder's estimate means the same thing throughout training, which plain PPO handled well even at 0.10 error.
 
 **Next test (not run): J6, the encoder stops after the warm-up.** J5, except that the encoder stops training once the policy starts (after 200k steps). Still end-to-end in one run from scratch, on the agent's own flights, with no separate data. Its estimate then means the same thing for the rest of training. If J6 comes close to 256, the moving encoder was the obstacle. It needs a small option in `contextual_ppo/` (stop the encoder steps after a given step) and a check, then about 1–1.5 hours for 5 seeds (no encoder training after the warm-up).
+
+### E3c: end-to-end Contextual PPO on the take-off-only version (2026-10-20 to 2026-10-21)
+
+**Design.** E3 again, on the take-off-only version (5-second full-throttle take-off, no transition back): Contextual PPO with the GRU encoder learned online from scratch, J0 and J1, 5 seeds each (0–4), with no warm-up and no pretraining. The encoder reads the 100-step take-off before every episode. Settings as in "Training settings" above; `runs_step0/easy_e3_takeoff/`, W&B names `J0_gru_Abudget_gamma0.99_rs0.1_warm100_s<seed>` and `J1_gru_budget_gamma0.99_rs0.1_warm100_s<seed>`. The bars are this version's E1 runs: Contextual PPO with the true battery (0c) and without memory (0c_blind), 8 seeds each.
+
+**Validation results** (late score, mean ± std across seeds, 95% bootstrap interval of the mean):
+
+| Agent (take-off-only version) | Score | Seeds | Flights completed |
+|---|---:|---|---:|
+| True battery (0c) | 254 ± 49 (222–285) | 8 | 85% |
+| **J1** | **169 ± 41** (137–201) | 139, 219, 152, 207, 128 | 32% |
+| **J0** | **83 ± 181** (−79–188) | −234, 125, 218, 168, 138 | 20% |
+| No memory (0c_blind) | 158 ± 42 (128–183) | 8 | 24% |
+
+- **J1 is no better than no memory** (+11, Welch p = 0.65) and below the true battery (−85, p = 0.008).
+- **J0 also fails:** one seed collapsed to −234; without it J0 averages 162, the no-memory level (J0 − no memory: −75, p = 0.41).
+
+| By starting battery (final validation) | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 |
+|---|---:|---:|---:|---:|---:|---:|
+| Failed flights, true battery | 79% | 12% | 0% | 0% | 0% | 0% |
+| Failed flights, J1 | 100% | 100% | 87% | 80% | 20% | 20% |
+| Failed flights, J0 | 100% | 100% | 100% | 80% | 80% | 20% |
+| Failed flights, no memory | 100% | 100% | 100% | 100% | 54% | 0% |
+| Mean throttle, true battery | 0.10 | 0.35 | 0.47 | 0.59 | 0.69 | 0.78 |
+| Mean throttle, J1 | 0.81 | 0.81 | 0.74 | 0.76 | 0.78 | 0.83 |
+| Mean throttle, J0 | 0.55 | 0.69 | 0.72 | 0.67 | 0.67 | 0.69 |
+| Mean throttle, no memory | 1.00 | 1.00 | 1.00 | 0.96 | 0.89 | 0.87 |
+
+**Diagnostics** (validation flights only; `runs_step0/easy_e3_takeoff/diagnostics_validation.json`, `diagnostics_followup.json`; every run reproduces its saved final validation exactly):
+
+| J1 seed | With its estimate | With the true battery | With a fixed 0.45 | Error at hand-over (200 random flights) |
+|---|---:|---:|---:|---:|
+| 0 | 223 | 383 | 187 | 0.052 |
+| 1 | 200 | 206 | 166 | 0.053 |
+| 2 | 108 | 112 | −12 | 0.053 |
+| 3 | 256 | 336 | 17 | 0.058 |
+| 4 | 143 | 197 | 38 | 0.053 |
+| Mean | 186 | 247 | 79 | |
+
+- **J1's policies really use the battery input:** with a fixed 0.45 they drop to 79 on average (seeds 2–4 lose 105–240 points).
+- **Given the true battery they are as good as the true-battery agent:** 247 on average against 254 (its validation score), and seeds 0 and 3 beat it (383, 336). In the transition version, J1's policies reached only 157 even with the truth.
+- **The encoder is at the best possible at hand-over:** 0.052–0.058 off on 200 random flights (correlation 0.93 with the battery; section 3: 0.050 after a 5-second take-off). On the validation flights it is 0.035–0.049 off at hand-over and 0.02–0.06 later in the flight.
+- **So the remaining gap is the estimate's error,** not the policy: those errors cost about 60 points on average (186 → 247 with the truth), and up to 160 in seed 0.
+- J0's policies use the input less (a fixed 0.45 changes little except in seed 1), and its encoder is a little less accurate at hand-over (0.055–0.066).
+
+**Final test** (2026-10-21; seeds 2000–2002, run once; `runs_step0/easy_e3_takeoff/final_test_takeoff.json`). All 21 runs first reproduced their validation exactly, so the code changes since the E1 runs (the transition and the prelude support) left the take-off-only version unchanged.
+
+```bash
+python evaluate_final_test.py --reports runs_step0/easy_e3_takeoff/step0_report_joint_J1.json \
+  runs_step0/easy_e1/step0_report_easy_true_battery.json runs_step0/easy_e1/step0_report_easy_blind.json \
+  --conditions J1 0c 0c_blind --output runs_step0/easy_e3_takeoff/final_test_takeoff.json --jobs 16
+```
+
+| Agent (take-off-only version) | Final test (mean ± std, 95% CI) | Seeds | Flights completed |
+|---|---:|---|---:|
+| Contextual PPO, true battery (0c) | **275 ± 56** (237–309) | 307, 283, 206, 330, 219, 203, 324, 326 | 85% |
+| **J1, encoder trained online** | **197 ± 61** (150–244) | 206, 211, 124, 285, 157 | 33% |
+| Contextual PPO, no memory (0c_blind) | **155 ± 61** (114–192) | 84, 223, 138, 179, 177, 214, 176, 51 | 24% |
+
+- **J1 against no memory:** +41 points (95% CI −19 to +104; Welch p = 0.27, Mann-Whitney p = 0.52). It is ahead, but with 5 seeds against 8 the difference isn't clear.
+- **J1 against the true battery:** −78 points (95% CI −136 to −16; Welch p = 0.049, Mann-Whitney p = 0.065).
+- **The final test agrees with validation:** true battery 254 → 275, J1 169 → 197, no memory 158 → 155.
+
+Failed flights on the final test by starting battery:
+
+| Agent | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | All |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| True battery | 79% | 8% | 0% | 0% | 0% | 0% | 15% |
+| J1 | 100% | 100% | 80% | 80% | 20% | 20% | 67% |
+| No memory | 100% | 100% | 100% | 100% | 54% | 0% | 76% |
+
+- **J1 saves some mid-battery flights that no memory loses** (20% completed at 0.4–0.5, 80% at 0.6 against 46%).
+- **It still fails nearly all low-battery flights,** and loses 20% at 0.7, where no memory completes every flight. The true-battery agent completes almost everything from 0.3 up.
+
+**What it means.**
+- This is the best end-to-end result of the project so far: on the take-off-only version, end-to-end training produced policies that depend on the battery and that match the true-battery agent when given the truth. That never happened in the hard version or with the transition.
+- The remaining obstacle is the accuracy of the online estimate (about 0.05 off at hand-over): not enough for these policies, which rely on it heavily.
+- Why this version and not the transition version: not established. Possible factors are the shorter prelude (100 instead of 180 steps), the faster start (the policy reaches the reward band sooner, so it learns its flying style under different pressure), and the partial hint in the hand-over speed.
+
+**Next tests (not run; choose between them on validation only, never on the final test above):**
+- **A 7-second take-off** (`--warmup-steps 140`): the best possible error after 7 s is 0.037 instead of 0.050 (section 3). If the estimate's error is the limit, J1 should move towards the true-battery agent.
+- **A Gaussian head** (J3's encoder: the estimate plus its variance, both read by the actor and critic): lets the policy fly more cautiously when the estimate is uncertain.
+- Each is about 3.5 hours for J1 with 5 seeds (10 runs at once with 3 threads, as here).
