@@ -486,6 +486,16 @@ def validate_config(cfg: DictConfig) -> None:
     if weight > 0 and (cppo.context_head != "gaussian" or cppo.encoder_objective != "supervised" or context_source != "encoder"):
         raise ValueError("cppo.curiosity rewards the drop in the Gaussian head's entropy: it needs cppo.context_head=gaussian, "
                          "a learned encoder and cppo.encoder_objective=supervised")
+    sequence = cppo.supervised.get("sequence", "episode")
+    if sequence not in ContextualPPO.SUPERVISED_SEQUENCES:
+        raise ValueError(f"cppo.supervised.sequence must be one of {ContextualPPO.SUPERVISED_SEQUENCES}")
+    for key, default, minimum in (("chunk_len", 16, 1), ("burn_in", 16, 0), ("chunk_batch_size", 512, 1)):
+        value = cppo.supervised.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"cppo.supervised.{key} must be an integer >= {minimum}")
+    if sequence != "episode" and (cppo.encoder_objective != "supervised" or velocity.enabled or context_source != "encoder"):
+        raise ValueError("cppo.supervised.sequence=chunk or stored_state cuts the supervised encoder steps into windows: it needs "
+                         "a learned encoder, cppo.encoder_objective=supervised and cppo.velocity_head.enabled=false")
     if prelude_keys_from(cfg)[0] is not None and (cppo.encoder_objective != "supervised" or velocity.enabled):
         raise ValueError("A learned encoder on the easy version (env.kwargs.warmup_steps > 0) reads the take-off as a prelude: "
                          "it needs cppo.encoder_objective=supervised and cppo.velocity_head.enabled=false")
@@ -534,6 +544,12 @@ def build_model(cfg: DictConfig, env: VecEnv, tensorboard_log: str | None = None
         supervised_gradient_steps=int(cppo.supervised.gradient_steps),
         validation_fraction=float(cppo.supervised.validation_fraction),
         episode_buffer_seed=None if cppo.supervised.seed is None else int(cppo.supervised.seed),
+        # What one encoder step trains on: whole episodes, or windows (plain chunking, R2D2 stored states); saved configs
+        # from before these options have none
+        supervised_sequence=str(cppo.supervised.get("sequence", "episode")),
+        supervised_chunk_len=int(cppo.supervised.get("chunk_len", 16)),
+        supervised_burn_in=int(cppo.supervised.get("burn_in", 16)),
+        supervised_chunk_batch_size=int(cppo.supervised.get("chunk_batch_size", 512)),
         # Joint-training options; saved configs from before them have neither
         policy_warmup_steps=int(cppo.get("policy_warmup_steps", 0)),
         supervised_warmup_gradient_steps=cppo.supervised.get("warmup_gradient_steps"),
@@ -741,6 +757,10 @@ def main(cfg: DictConfig) -> None:
                 f"  supervised encoder: episode buffer of {supervised.capacity} steps, {supervised.gradient_steps} steps "
                 f"of {supervised.episode_batch_size} episodes per update, validation {supervised.validation_fraction:.0%}"
             )
+            if supervised.get("sequence", "episode") != "episode":
+                print(f"  encoder steps on windows ({supervised.sequence}): {supervised.chunk_batch_size} windows of "
+                      + (f"{supervised.burn_in} burn-in + " if supervised.sequence == "stored_state" else "")
+                      + f"{supervised.chunk_len} trained steps")
             if cfg.cppo.velocity_head.enabled:
                 print(f"  velocity head: L_context + {cfg.cppo.velocity_head.weight} x L_velocity (vx / v_ref)")
         print(f"  parameters={metadata['parameters_by_group']} | eval episodes={len(schedule)}\n  artifacts: {run_dir}")

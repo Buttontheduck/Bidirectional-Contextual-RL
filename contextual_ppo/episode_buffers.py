@@ -13,8 +13,8 @@ from gymnasium import spaces
 
 from stable_baselines3.common.utils import get_device
 
-from .buffers import ContextualRolloutBuffer, _check_finite_real, _check_int
-from .type_aliases import ContextualEpisodeSamples
+from .buffers import ContextualRolloutBuffer, _check_finite_real, _check_int, _flatten_recurrent_state, _unflatten_recurrent_state
+from .type_aliases import ContextualChunkSamples, ContextualEpisodeSamples
 
 
 class _Episode(NamedTuple):
@@ -23,6 +23,38 @@ class _Episode(NamedTuple):
     observations: np.ndarray  # [L, D_o]
     prev_actions: np.ndarray  # [L, D_a]
     labels: np.ndarray  # [L, D_c]
+    states: np.ndarray | None = None  # [L, D_s] the encoder memory before each observation (stored-state windows only)
+
+
+def encoder_state_rows(encoder: Any, state: Any) -> np.ndarray:
+    """
+    A batched encoder state as one row per batch element [B, D_s] float32: every leaf with its batch axis
+    (``encoder._batch_axis``) moved first, flattened and concatenated in the state's fixed leaf order.
+    """
+    parts = []
+    for path, leaf in _flatten_recurrent_state(state)[1]:
+        leaf = leaf.detach().cpu().numpy() if isinstance(leaf, th.Tensor) else np.asarray(leaf)
+        moved = np.moveaxis(leaf, encoder._batch_axis(path), 0)
+        parts.append(moved.reshape(moved.shape[0], -1).astype(np.float32))
+    return np.concatenate(parts, axis=1)
+
+
+def encoder_state_from_rows(encoder: Any, rows: np.ndarray | th.Tensor, device: th.device | str = "cpu") -> Any:
+    """The inverse of ``encoder_state_rows``: a batched encoder state, with the leaves' shapes of ``encoder.initial_state``."""
+    rows = th.as_tensor(rows, dtype=th.float32, device=device)
+    treedef, leaves = _flatten_recurrent_state(encoder.initial_state(1))
+    parts, start = [], 0
+    for path, leaf in leaves:
+        axis = encoder._batch_axis(path)
+        shape = list(leaf.shape)
+        shape.pop(axis)
+        size = int(np.prod(shape)) if shape else 1
+        part = rows[:, start : start + size].reshape(rows.shape[0], *shape)
+        parts.append(th.movedim(part, 0, axis).to(dtype=leaf.dtype).contiguous())
+        start += size
+    if start != rows.shape[1]:
+        raise ValueError(f"State rows of width {rows.shape[1]} don't match this encoder's state ({start} values)")
+    return _unflatten_recurrent_state(treedef, iter(parts))
 
 
 class SupervisedContextualEpisodeBuffer:
@@ -65,6 +97,8 @@ class SupervisedContextualEpisodeBuffer:
     :param validation_fraction: Probability that a completed episode goes to the validation split, in [0, 1)
     :param device: PyTorch device of the returned samples
     :param seed: Seed of the split assignment and of the sampling
+    :param state_dim: Width of the encoder memory stored with every step (``encoder_state_rows``), for windows that start
+        from the memory saved at collection (``sample_chunks(..., stored_states=True)``); None stores none
     """
 
     SPLITS = ("train", "validation")
@@ -80,8 +114,10 @@ class SupervisedContextualEpisodeBuffer:
         validation_fraction: float = 0.1,
         device: th.device | str = "auto",
         seed: int | None = None,
+        state_dim: int | None = None,
     ):
         self.n_envs = _check_int("n_envs", n_envs, minimum=1)
+        self.state_dim = None if state_dim is None else _check_int("state_dim", state_dim, minimum=1)
         if not (isinstance(observation_space, spaces.Box) and len(observation_space.shape) == 1 and observation_space.dtype == np.float32):
             raise NotImplementedError(f"SupervisedContextualEpisodeBuffer supports flat float32 Box observation spaces, got {observation_space}")
         if not (isinstance(action_space, spaces.Box) and len(action_space.shape) == 1 and np.issubdtype(action_space.dtype, np.floating)):
@@ -112,10 +148,11 @@ class SupervisedContextualEpisodeBuffer:
 
     def _new_unfinished(self) -> None:
         # Rows of the unfinished episode of every env, and the action it executed last (the next step's previous action)
-        self._unfinished: list[dict[str, list[np.ndarray]]] = [
-            {"observations": [], "prev_actions": [], "labels": []} for _ in range(self.n_envs)
-        ]
+        self._unfinished: list[dict[str, list[np.ndarray]]] = [self._empty_episode() for _ in range(self.n_envs)]
         self._last_actions = np.zeros((self.n_envs, self.action_dim), dtype=np.float32)
+
+    def _empty_episode(self) -> dict[str, list[np.ndarray]]:
+        return {"observations": [], "prev_actions": [], "labels": [], "states": []}
 
     def drop_unfinished(self) -> None:
         """
@@ -130,6 +167,7 @@ class SupervisedContextualEpisodeBuffer:
         observations: np.ndarray,
         actions: np.ndarray,
         labels: np.ndarray,
+        states: np.ndarray | None = None,
     ) -> None:
         """
         Begin the new episodes of the environments in ``starts`` with their preludes: steps the agent did not act in
@@ -141,6 +179,7 @@ class SupervisedContextualEpisodeBuffer:
         :param observations: [N, K, D_o] the preludes' observations (rows outside ``starts`` are ignored)
         :param actions: [N, K, D_a] the preludes' executed actions
         :param labels: [N, K, D_c] the true context of each prelude observation (training targets only)
+        :param states: [N, K, D_s] the encoder memory before each prelude observation; required with ``state_dim``
         """
         starts = np.asarray(starts, dtype=bool).reshape(-1)
         length = observations.shape[1] if np.ndim(observations) == 3 else 0
@@ -148,6 +187,9 @@ class SupervisedContextualEpisodeBuffer:
         given = (np.shape(observations), np.shape(actions), np.shape(labels))
         if starts.shape != (self.n_envs,) or length < 1 or given != expected:
             raise ValueError(f"start_episodes(): expected {self.n_envs} starts and preludes of shapes {expected}, got {given}")
+        if (self.state_dim is None) != (states is None) or (states is not None and np.shape(states) != (self.n_envs, length, self.state_dim)):
+            raise ValueError(f"start_episodes(): the prelude's encoder memories must be [{self.n_envs}, {length}, {self.state_dim}] "
+                             f"exactly when state_dim is set, got {None if states is None else np.shape(states)}")
         for env_idx in np.flatnonzero(starts):
             episode = self._unfinished[env_idx]
             if episode["observations"]:
@@ -160,6 +202,8 @@ class SupervisedContextualEpisodeBuffer:
             episode["observations"].extend(np.asarray(observations[env_idx], dtype=np.float32))
             episode["prev_actions"].extend(prev_actions)
             episode["labels"].extend(np.asarray(labels[env_idx], dtype=np.float32))
+            if states is not None:
+                episode["states"].extend(np.asarray(states[env_idx], dtype=np.float32))
             self._last_actions[env_idx] = prelude_actions[-1]
 
     def add(
@@ -171,6 +215,8 @@ class SupervisedContextualEpisodeBuffer:
         dones: np.ndarray,
         final_observations: np.ndarray | th.Tensor,
         final_labels: np.ndarray | th.Tensor,
+        encoder_states: np.ndarray | None = None,
+        final_encoder_states: np.ndarray | None = None,
     ) -> int:
         """
         Append step ``t`` of every environment, then close the episodes that ended with it.
@@ -183,6 +229,8 @@ class SupervisedContextualEpisodeBuffer:
         :param final_observations: [N, D_o], the final observation (``terminal_observation``) where ``dones``;
             other rows are ignored
         :param final_labels: [N, D_c], the true context of the final observation where ``dones``; other rows are ignored
+        :param encoder_states: [N, D_s] the encoder memory before ``o_t`` (``encoder_state_rows``); required with ``state_dim``
+        :param final_encoder_states: [N, D_s] the memory before the final observation (after ``o_t``); with ``state_dim``
         :return: Number of episodes completed by this call
         """
         N = self.n_envs
@@ -194,6 +242,11 @@ class SupervisedContextualEpisodeBuffer:
             dones = check("dones", dones, (N,), bool)
             final_observations = check("final_observations", final_observations, (N, self.obs_dim), float)
             final_labels = check("final_labels", final_labels, (N, self.label_dim), float)
+            if (self.state_dim is None) != (encoder_states is None) or (encoder_states is None) != (final_encoder_states is None):
+                raise ValueError("encoder_states and final_encoder_states are required exactly when state_dim is set")
+            if self.state_dim is not None:
+                encoder_states = check("encoder_states", encoder_states, (N, self.state_dim), float)
+                final_encoder_states = check("final_encoder_states", final_encoder_states, (N, self.state_dim), float)
         except (TypeError, ValueError) as error:
             raise type(error)(f"add(): {error}") from error
         outside = np.any((executed_actions < self.action_space.low) | (executed_actions > self.action_space.high), axis=-1)
@@ -211,14 +264,18 @@ class SupervisedContextualEpisodeBuffer:
             episode["observations"].append(observations[env_idx])
             episode["prev_actions"].append(prev_action.copy())
             episode["labels"].append(labels[env_idx])
+            if encoder_states is not None:
+                episode["states"].append(encoder_states[env_idx])
             self._last_actions[env_idx] = executed_actions[env_idx]
             if dones[env_idx]:
                 # The final observation belongs to this episode; the next add() starts the next one
                 episode["observations"].append(final_observations[env_idx])
                 episode["prev_actions"].append(executed_actions[env_idx].copy())
                 episode["labels"].append(final_labels[env_idx])
+                if final_encoder_states is not None:
+                    episode["states"].append(final_encoder_states[env_idx])
                 self._store(episode)
-                self._unfinished[env_idx] = {"observations": [], "prev_actions": [], "labels": []}
+                self._unfinished[env_idx] = self._empty_episode()
                 self._last_actions[env_idx] = 0.0
                 completed += 1
         return completed
@@ -234,6 +291,7 @@ class SupervisedContextualEpisodeBuffer:
             observations=np.stack(rows["observations"]).astype(np.float32),
             prev_actions=np.stack(rows["prev_actions"]).astype(np.float32),
             labels=np.stack(rows["labels"]).astype(np.float32),
+            states=np.stack(rows["states"]).astype(np.float32) if rows["states"] else None,
         )
         # Evict the oldest completed episodes, whole, until the new one fits
         while self.stored_steps + length > self.capacity:
@@ -275,6 +333,54 @@ class SupervisedContextualEpisodeBuffer:
         batch_size = self.episode_batch_size if batch_size is None else _check_int("batch_size", batch_size, minimum=1)
         chosen = self._sample_rng.choice(len(episodes), size=min(batch_size, len(episodes)), replace=False)
         return self._to_samples([episodes[index] for index in chosen])
+
+    def sample_chunks(
+        self, split: str, n_chunks: int, chunk_len: int, burn_in: int = 0, stored_states: bool = False
+    ) -> ContextualChunkSamples:
+        """
+        ``n_chunks`` windows of ``burn_in + chunk_len`` consecutive steps of a split's episodes, drawn so that every
+        possible window start is equally likely (episodes shorter than a window give one, from their start). With
+        ``stored_states``, each window comes with the encoder memory saved at collection before its first step (it needs
+        ``state_dim``) and only episodes longer than ``burn_in`` are used, so every window has a trained step.
+
+        :param split: ``"train"`` or ``"validation"``
+        :param n_chunks: Number of windows (drawn with replacement)
+        :param chunk_len: Steps that the loss is computed on
+        :param burn_in: Leading steps that only rebuild the memory
+        :param stored_states: Start every window from its stored memory (else from a blank memory)
+        """
+        _check_int("n_chunks", n_chunks, minimum=1)
+        _check_int("chunk_len", chunk_len, minimum=1)
+        _check_int("burn_in", burn_in, minimum=0)
+        if stored_states and self.state_dim is None:
+            raise ValueError("Windows from stored memories need a buffer built with state_dim")
+        episodes = [e for e in self.episodes(split) if not stored_states or len(e.observations) > burn_in]
+        if not episodes:
+            raise RuntimeError(f"No completed {split} episode long enough for these windows is stored yet")
+        window = burn_in + chunk_len
+        lengths = np.array([len(e.observations) for e in episodes], dtype=np.int64)
+        starts = np.maximum(lengths - window + 1, 1)
+        chosen = self._sample_rng.choice(len(episodes), size=n_chunks, replace=True, p=starts / starts.sum())
+        offsets = np.minimum((self._sample_rng.random(n_chunks) * starts[chosen]).astype(np.int64), starts[chosen] - 1)
+        observations = np.zeros((n_chunks, window, self.obs_dim), dtype=np.float32)
+        prev_actions = np.zeros((n_chunks, window, self.action_dim), dtype=np.float32)
+        labels = np.zeros((n_chunks, window, self.label_dim), dtype=np.float32)
+        mask = np.zeros((n_chunks, window), dtype=bool)
+        states = np.zeros((n_chunks, self.state_dim), dtype=np.float32) if stored_states else None
+        for row, (index, start) in enumerate(zip(chosen, offsets)):
+            episode = episodes[index]
+            n = min(window, len(episode.observations) - start)
+            observations[row, :n] = episode.observations[start : start + n]
+            prev_actions[row, :n] = episode.prev_actions[start : start + n]
+            labels[row, :n] = episode.labels[start : start + n]
+            mask[row, :n] = True
+            if states is not None:
+                states[row] = episode.states[start]
+        tensor = lambda array: th.as_tensor(array, device=self.device)
+        return ContextualChunkSamples(
+            observations=tensor(observations), prev_actions=tensor(prev_actions), labels=tensor(labels), mask=tensor(mask),
+            initial_states=None if states is None else tensor(states), burn_in=burn_in,
+        )
 
     def iterate(
         self, split: str = "validation", batch_size: int | None = None, shuffle: bool = False

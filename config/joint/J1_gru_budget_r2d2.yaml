@@ -1,0 +1,25 @@
+# @package _global_
+# ENCODER_PLAN.md / EASY_ENV_WARMUP.md, joint training: Contextual_PPO with its GRU encoder trained together with the
+# policy, at J1's settings (config/joint/J1_gru_budget.yaml); only the windows the encoder steps train on change.
+#
+#   python run_step0.py --conditions J1_chunk J1_r2d2 --seeds 0 1 2 --jobs 6 --threads 5 --warmup-steps 100
+# J1_r2d2: J1 with R2D2's stored-state windows: each encoder step trains on cppo.supervised.chunk_batch_size windows
+# that start from the encoder memory saved at collection, run cppo.supervised.burn_in steps without loss or gradient,
+# then cppo.supervised.chunk_len trained steps (default 512 x (16 + 16)), instead of whole episodes.
+experiment_id: J1_gru_budget_r2d2
+training:
+  total_timesteps: 2000000
+cppo:
+  gamma: 0.99
+  reward_scale: 0.1
+  encoder_arch: gru
+  supervised:
+    gradient_steps: 32
+    episode_batch_size: 32
+    capacity: 2100000
+    sequence: stored_state
+wandb:
+  study: ""
+  run_name: J1_gru_budget_r2d2_burn${cppo.supervised.burn_in}_chunk${cppo.supervised.chunk_len}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}_s${training.seed}
+  group: J1_gru_budget_r2d2_burn${cppo.supervised.burn_in}_chunk${cppo.supervised.chunk_len}_gamma${cppo.gamma}_rs${cppo.reward_scale}${wandb.study}
+  tags: [cppo, joint, gru, J1, r2d2]

@@ -94,3 +94,25 @@ class ContextualPolicyState(NamedTuple):
 
     encoder_state: Any
     prev_actions: th.Tensor
+
+
+class ContextualChunkSamples(NamedTuple):
+    """
+    Fixed-length windows of complete episodes for the encoder's supervised steps, as returned by
+    ``SupervisedContextualEpisodeBuffer.sample_chunks`` (``supervised_sequence="chunk"`` or ``"stored_state"``). Each
+    window is ``burn_in + chunk_len`` consecutive steps of one episode (fewer at its end: zero-padded, ``mask`` False).
+
+    :param observations: ``o_t`` [B, W, D_o]
+    :param prev_actions: previous executed action [B, W, D_a], as in the episode (not zero at a window's start)
+    :param labels: true context of ``o_t`` [B, W, D_c], the training target only
+    :param mask: [B, W] bool, True for real steps
+    :param initial_states: [B, D_s] the encoder memory saved at collection before each window's first step, as rows
+        (``encoder_state_rows``); None for windows that start from a blank memory
+    :param burn_in: number of leading steps of every window that only rebuild the memory (no loss, no gradient)
+    """
+    observations: th.Tensor
+    prev_actions: th.Tensor
+    labels: th.Tensor
+    mask: th.Tensor
+    initial_states: th.Tensor | None
+    burn_in: int

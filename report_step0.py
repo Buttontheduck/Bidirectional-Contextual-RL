@@ -46,9 +46,9 @@ from contextual_ppo.torch_layers import GRURolloutEncoder, XLSTMRolloutEncoder
 
 CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch", "1a_early", "1b_early", "1c_early",
               "1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear", "0a_blind", "0b_blind", "0c_blind",
-              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std", "4a_encoder", "4b_encoder", "J0", "J1", "J2", "J3", "J4", "J5")
+              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std", "4a_encoder", "4b_encoder", "J0", "J1", "J2", "J3", "J4", "J5", "J1_chunk", "J1_r2d2")
 # Joint training with a GRU encoder: hidden mode, Contextual_PPO's learned encoder, like A but with the GRU
-JOINT = ("J0", "J1", "J2", "J3", "J4", "J5")
+JOINT = ("J0", "J1", "J2", "J3", "J4", "J5", "J1_chunk", "J1_r2d2")
 # Memoryless controls: the step 0 run each condition repeats in hidden mode, without the battery and without memory
 BLIND = {"0a_blind": "0a", "0b_blind": "0b", "0c_blind": "0c"}
 # Step 2's ideal context: the step 0 learner each condition uses in hidden mode, with the ideal estimator's estimate

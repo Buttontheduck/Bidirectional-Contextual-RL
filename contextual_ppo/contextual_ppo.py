@@ -12,10 +12,10 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import FloatSchedule, explained_variance
 
 from .buffers import ContextualRolloutBuffer, _flatten_recurrent_state, _unflatten_recurrent_state
-from .episode_buffers import SupervisedContextualEpisodeBuffer
+from .episode_buffers import SupervisedContextualEpisodeBuffer, encoder_state_from_rows, encoder_state_rows
 from .on_policy_algorithm import ContextualOnPolicyAlgorithm
 from .policies import ContextualActorCriticPolicy, MlpPolicy
-from .type_aliases import ContextualEpisodeSamples, ContextualRolloutSamples
+from .type_aliases import ContextualChunkSamples, ContextualEpisodeSamples, ContextualRolloutSamples
 
 SelfContextualPPO = TypeVar("SelfContextualPPO", bound="ContextualPPO")
 
@@ -129,6 +129,16 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
     :param validation_fraction: Supervised only: probability that a completed episode is kept for validation
         instead of training
     :param episode_buffer_seed: Supervised only: seed of the episode buffer's split and sampling; None uses ``seed``
+    :param supervised_sequence: Supervised only: what one encoder step trains on. ``"episode"`` (default): complete
+        episodes from their first step, backpropagated through the whole episode. ``"chunk"`` (plain chunking):
+        ``supervised_chunk_batch_size`` windows of ``supervised_chunk_len`` steps, each from a blank memory.
+        ``"stored_state"`` (R2D2, Kapturowski et al., 2019): windows started from the encoder memory saved at
+        collection before their first step (the episode buffer stores it with every step), whose first
+        ``supervised_burn_in`` steps only rebuild the memory (no loss, no gradient) before ``supervised_chunk_len``
+        trained steps. The validation fit is always on complete episodes. Point or Gaussian head, no auxiliary head
+    :param supervised_chunk_len: Trained steps per window (``"chunk"``, ``"stored_state"``)
+    :param supervised_burn_in: Burn-in steps per window (``"stored_state"``)
+    :param supervised_chunk_batch_size: Windows per encoder step (``"chunk"``, ``"stored_state"``)
     :param bptt_len: Maximum number of steps connected by backpropagation through the encoder memory;
         None backpropagates through the whole stream (episode starts still cut it)
     :param use_sde: Must be False: gSDE is not supported
@@ -174,6 +184,7 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
     rollout_buffer: ContextualRolloutBuffer
 
     ENCODER_OBJECTIVES = ("rl", "supervised")
+    SUPERVISED_SEQUENCES = ("episode", "chunk", "stored_state")
 
     def __init__(
         self,
@@ -201,6 +212,10 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         supervised_gradient_steps: int = 8,
         validation_fraction: float = 0.1,
         episode_buffer_seed: int | None = None,
+        supervised_sequence: str = "episode",
+        supervised_chunk_len: int = 16,
+        supervised_burn_in: int = 16,
+        supervised_chunk_batch_size: int = 512,
         policy_warmup_steps: int = 0,
         supervised_warmup_gradient_steps: int | None = None,
         curiosity_weight: float = 0.0,
@@ -294,6 +309,15 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
             raise ValueError(f"curiosity_until must be None or an integer >= 1, got {curiosity_until!r}")
         if curiosity_weight > 0 and encoder_objective != "supervised":
             raise ValueError("curiosity_weight rewards the drop in the Gaussian head's variance: it needs encoder_objective='supervised'")
+        if supervised_sequence not in self.SUPERVISED_SEQUENCES:
+            raise ValueError(f"supervised_sequence must be one of {self.SUPERVISED_SEQUENCES}, got {supervised_sequence!r}")
+        for name, value, minimum in (("supervised_chunk_len", supervised_chunk_len, 1), ("supervised_burn_in", supervised_burn_in, 0),
+                                     ("supervised_chunk_batch_size", supervised_chunk_batch_size, 1)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+        if supervised_sequence != "episode" and (encoder_objective != "supervised" or self.auxiliary_info_keys is not None):
+            raise ValueError("supervised_sequence 'chunk' or 'stored_state' cuts the supervised encoder steps into windows: it "
+                             "needs encoder_objective='supervised' and no auxiliary head")
         if self.prelude_info_keys is not None and (encoder_objective != "supervised" or self.prelude_label_key is None
                                                    or self.auxiliary_info_keys is not None):
             raise ValueError("prelude_info_keys needs encoder_objective='supervised' (the PPO epochs use the contexts cached at "
@@ -328,6 +352,10 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         self.supervised_gradient_steps = supervised_gradient_steps
         self.validation_fraction = validation_fraction
         self.episode_buffer_seed = episode_buffer_seed
+        self.supervised_sequence = supervised_sequence
+        self.supervised_chunk_len = supervised_chunk_len
+        self.supervised_burn_in = supervised_burn_in
+        self.supervised_chunk_batch_size = supervised_chunk_batch_size
         # Warm-up: until this many collected steps the PPO epochs are skipped (the policy keeps its initial, varied
         # behaviour) and the encoder trains on its flights, with supervised_warmup_gradient_steps steps per update
         self.policy_warmup_steps = policy_warmup_steps
@@ -367,6 +395,15 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
                     f"encoder_objective='supervised' fits z_t to the label: policy context_dim ({self.policy.context_dim}) "
                     f"must equal the label size ({label_dim})"
                 )
+            # Saved before these options existed: whole episodes
+            self.supervised_sequence = getattr(self, "supervised_sequence", "episode")
+            self.supervised_chunk_len = getattr(self, "supervised_chunk_len", 16)
+            self.supervised_burn_in = getattr(self, "supervised_burn_in", 16)
+            self.supervised_chunk_batch_size = getattr(self, "supervised_chunk_batch_size", 512)
+            # Stored-state windows keep the encoder memory of every collected step
+            state_dim = None
+            if self.supervised_sequence == "stored_state":
+                state_dim = encoder_state_rows(self.policy.encoder, self.policy.encoder.initial_state(1)).shape[1]
             # Complete episodes for the encoder, filled by the collector; not saved with the model.
             # Each label row is the true context, followed by the auxiliary targets
             self.episode_buffer = SupervisedContextualEpisodeBuffer(
@@ -379,6 +416,7 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
                 validation_fraction=self.validation_fraction,
                 device=self.device,
                 seed=self.seed if self.episode_buffer_seed is None else self.episode_buffer_seed,
+                state_dim=state_dim,
             )
         else:
             self.episode_buffer = None
@@ -644,7 +682,13 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
         if buffer.n_episodes("train") > 0:
             fits, grad_norms = [], []
             for _ in range(gradient_steps or self.supervised_gradient_steps):
-                loss, fit = self._episode_fit(buffer.sample("train"))
+                if self.supervised_sequence == "episode":
+                    loss, fit = self._episode_fit(buffer.sample("train"))
+                else:
+                    stored = self.supervised_sequence == "stored_state"
+                    loss, fit = self._chunk_fit(buffer.sample_chunks(
+                        "train", self.supervised_chunk_batch_size, self.supervised_chunk_len,
+                        burn_in=self.supervised_burn_in if stored else 0, stored_states=stored))
                 grads = th.autograd.grad(loss, encoder_params, allow_unused=True)
                 grad_norms.append(self._grad_norm(grads))
                 fits.append(fit)
@@ -684,9 +728,52 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
             latents, _ = encoder.unroll(initial_state, observations, samples.prev_actions, mask=samples.mask)
         else:
             latents, auxiliaries, _ = encoder.unroll_with_auxiliary(initial_state, observations, samples.prev_actions, mask=samples.mask)
-        labels = samples.labels[..., : encoder.context_dim]
-        estimates, variances = encoder.split_context(latents)
+        loss, fit = self._context_fit(latents, samples.labels[..., : encoder.context_dim], samples.mask)
         valid = samples.mask.unsqueeze(-1).to(latents.dtype)
+        if auxiliaries is not None:
+            context_loss = loss
+            _, auxiliary_loss, auxiliary_r2 = self._masked_fit(auxiliaries, samples.labels[..., encoder.context_dim :], valid)
+            loss = context_loss + self.auxiliary_loss_weight * auxiliary_loss
+            fit.update(
+                auxiliary_mse=auxiliary_loss.item(),
+                auxiliary_r2=auxiliary_r2,
+                context_loss=context_loss.item(),
+                encoder_loss=loss.item(),
+            )
+        return loss, fit
+
+    def _chunk_fit(self, samples: ContextualChunkSamples) -> tuple[th.Tensor, dict[str, float]]:
+        """
+        The fit on windows of episodes (``supervised_sequence`` ``"chunk"`` or ``"stored_state"``): the encoder starts from
+        a blank memory, or from the memory stored at collection, runs the burn-in steps without gradient, then the trained
+        steps, and is compared with the labels there (``_context_fit``). Backpropagation reaches back to the first trained
+        step only.
+        """
+        encoder = self.policy.encoder
+        n_chunks = samples.observations.shape[0]
+        observations = self.policy.encoder_observations(samples.observations, n_batch_dims=2)
+        if samples.initial_states is None:
+            state = encoder.initial_state(n_chunks)
+        else:
+            state = encoder_state_from_rows(encoder, samples.initial_states, self.device)
+        burn_in = samples.burn_in
+        if burn_in > 0:
+            with th.no_grad():
+                _, state = encoder.unroll(state, observations[:, :burn_in], samples.prev_actions[:, :burn_in],
+                                          mask=samples.mask[:, :burn_in])
+            state = self._detach_state(state)
+        latents, _ = encoder.unroll(state, observations[:, burn_in:], samples.prev_actions[:, burn_in:],
+                                    mask=samples.mask[:, burn_in:])
+        return self._context_fit(latents, samples.labels[:, burn_in:, : encoder.context_dim], samples.mask[:, burn_in:])
+
+    def _context_fit(self, latents: th.Tensor, labels: th.Tensor, mask: th.Tensor) -> tuple[th.Tensor, dict[str, float]]:
+        """
+        Compare the contexts with the labels on the valid steps: the masked mean squared error of ``z_t``, or with the
+        Gaussian head the masked Gaussian negative log-likelihood (weighted by ``nll_beta``); see ``_episode_fit``.
+        """
+        encoder = self.policy.encoder
+        estimates, variances = encoder.split_context(latents)
+        valid = mask.unsqueeze(-1).to(latents.dtype)
         squared_errors, loss, r2 = self._masked_fit(estimates, labels, valid)
         fit: dict[str, float] = {"context_mse": loss.item(), "context_r2": r2}
         if variances is not None:
@@ -703,16 +790,6 @@ class ContextualPPO(ContextualOnPolicyAlgorithm):
                     context_variance=((variances * valid).sum() / n_values).item(),
                     context_calibration=((squared_errors / variances * valid).sum() / n_values).item(),
                 )
-        if auxiliaries is not None:
-            context_loss = loss
-            _, auxiliary_loss, auxiliary_r2 = self._masked_fit(auxiliaries, samples.labels[..., encoder.context_dim :], valid)
-            loss = context_loss + self.auxiliary_loss_weight * auxiliary_loss
-            fit.update(
-                auxiliary_mse=auxiliary_loss.item(),
-                auxiliary_r2=auxiliary_r2,
-                context_loss=context_loss.item(),
-                encoder_loss=loss.item(),
-            )
         return loss, fit
 
     @staticmethod

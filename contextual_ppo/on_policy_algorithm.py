@@ -11,7 +11,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.vec_env import VecEnv
 
 from .buffers import ContextualRolloutBuffer
-from .episode_buffers import SupervisedContextualEpisodeBuffer
+from .episode_buffers import SupervisedContextualEpisodeBuffer, encoder_state_rows
 from .policies import ContextualActorCriticPolicy
 from .torch_layers import GRURolloutEncoder, XLSTMRolloutEncoder
 from .type_aliases import ContextualPolicyState
@@ -369,8 +369,27 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
         if self.episode_buffer is not None:
             if labels is None:
                 raise ValueError("The episode buffer stores the preludes with their labels: set prelude_label_key")
-            self.episode_buffer.start_episodes(starts, observations, actions, labels)
+            states = self._prelude_states(observations, actions) if self.episode_buffer.state_dim is not None else None
+            self.episode_buffer.start_episodes(starts, observations, actions, labels, states=states)
         return self.policy.start_episodes(memory, starts, (observations, actions))
+
+    def _prelude_states(self, observations: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        """
+        The encoder memory before each prelude observation [n_envs, K, D_s] (``encoder_state_rows``), stepping the encoder
+        from its initial state as ``policy.start_episodes`` does in one call; for stored-state windows.
+        """
+        policy = self.policy
+        n_envs, length = observations.shape[:2]
+        obs = th.as_tensor(observations, dtype=th.float32, device=self.device)
+        acts = th.as_tensor(actions, dtype=th.float32, device=self.device)
+        state, prev = policy.encoder.initial_state(n_envs), th.zeros_like(acts[:, 0])
+        rows = []
+        with th.no_grad():
+            for k in range(length):
+                rows.append(encoder_state_rows(policy.encoder, state))
+                _, state = policy.encoder.step(state, policy.encoder_observations(obs[:, k]), prev)
+                prev = acts[:, k]
+        return np.stack(rows, axis=1)
 
     @staticmethod
     def _context_labels(infos: Sequence[dict[str, Any]], key: str, name: str = "context_info_keys") -> np.ndarray:
@@ -566,6 +585,11 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
                     # The auxiliary targets follow the context in every label row
                     labels = np.concatenate([labels, self._last_auxiliary], axis=1)  # type: ignore[list-item]
                     final_labels = np.concatenate([final_labels, next_auxiliary], axis=1)
+                stored: dict[str, Any] = {}
+                if self.episode_buffer.state_dim is not None:
+                    # Stored-state windows: the memory before o_t, and before the final observation (after o_t)
+                    stored = {"encoder_states": encoder_state_rows(self.policy.encoder, state.encoder_state),
+                              "final_encoder_states": encoder_state_rows(self.policy.encoder, memory.encoder_state)}
                 self.episode_buffer.add(
                     observations=self._last_obs,  # type: ignore[arg-type]
                     executed_actions=clipped_actions,
@@ -573,6 +597,7 @@ class ContextualOnPolicyAlgorithm(OnPolicyAlgorithm):
                     dones=dones,
                     final_observations=next_obs,
                     final_labels=final_labels,
+                    **stored,
                 )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones

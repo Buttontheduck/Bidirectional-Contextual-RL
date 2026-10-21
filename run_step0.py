@@ -92,6 +92,8 @@ CONDITIONS = {
     "J3": ("main_battery_plane_contextual_ppo.py", "+joint=J3_gru_budget_entropy_gaussian", "cppo"),
     "J4": ("main_battery_plane_contextual_ppo.py", "+joint=J4_gru_budget_entropy_gaussian_curiosity", "cppo"),
     "J5": ("main_battery_plane_contextual_ppo.py", "+joint=J5_gru_budget_warmup", "cppo"),
+    "J1_chunk": ("main_battery_plane_contextual_ppo.py", "+joint=J1_gru_budget_chunk", "cppo"),
+    "J1_r2d2": ("main_battery_plane_contextual_ppo.py", "+joint=J1_gru_budget_r2d2", "cppo"),
     "4a_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4a_encoder_bs256", "ppo"),
     "4b_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4b_encoder_bs1024", "ppo"),
 }

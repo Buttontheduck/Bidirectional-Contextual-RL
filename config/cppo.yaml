@@ -103,6 +103,13 @@ cppo:
     seed: null                             # null = training.seed
     nll_beta: 0.0                          # Gaussian head only: beta of the beta-NLL (0 = plain NLL)
     warmup_gradient_steps: null            # encoder steps per update during the warm-up (null = gradient_steps)
+    sequence: episode                      # what one encoder step trains on: episode (whole episodes from their start,
+                                           # full BPTT), chunk (plain chunking: windows of chunk_len steps from a blank
+                                           # memory) or stored_state (R2D2: windows from the memory saved at collection,
+                                           # burn_in steps without loss or gradient, then chunk_len trained steps)
+    chunk_len: 16                          # chunk / stored_state: trained steps per window
+    burn_in: 16                            # stored_state: steps that only rebuild the memory, before the trained ones
+    chunk_batch_size: 512                  # chunk / stored_state: windows per encoder step
 
   # Context head: embedding -> 128 -> 128 -> 1 -> sigmoid, z_t = b_hat_t in (0, 1).
   context_dim: 1
