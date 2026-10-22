@@ -26,6 +26,16 @@ tensorboard==2.21.0       # SB3 logging, synced to W&B
 pygame==2.6.1             # BatteryPlane rendering
 matplotlib==3.11.1        # result figures
 
+# Only to regenerate the paper figures in figures/ (figure 1's PNG and PDF, and the Roboto font);
+# not used by training, evaluation or the checks
+resvg-py==0.5.0           # SVG -> PNG
+svglib==2.3.0             # SVG -> PDF, with reportlab
+font-roboto==0.0.1        # the Roboto font files
+cssselect2==0.10.1        # svglib's dependencies
+lxml==6.1.3
+tinycss2==1.5.1
+webencodings==0.6.1
+
 # The rest of the carlos env (dependencies of the above, notebooks, CARL), for an exact copy
 absl-py==2.5.0
 annotated-doc==0.0.5

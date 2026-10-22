@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Batın Muslu">
+  <title>Environment · Reading Your Own Battery</title>
+  <meta name="description" content="BatteryPlane's state, observation and action spaces, why the plane climbs, and the pilots.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="site-nav" aria-label="Pages"><div class="inner"><a class="brand" href="index.html">Reading Your Own Battery</a><div class="links"><a href="index.html">Overview</a><a href="environment.html" aria-current="page">Environment</a><a href="contextual_ppo.html">Contextual PPO</a><a href="results.html">Results</a><a href="ablations.html">Ablations</a><a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Code</a></div></div></nav>
+<main>
+  <header class="page-head">
+    <h1>The environment</h1>
+    <p class="lead">A plane whose battery is hidden from the pilot and drained by the pilot's own thrust.</p>
+  </header>
+
+  <h2 id="problem">An autogenic context</h2>
+  <p>Contextual reinforcement learning usually studies contexts that the environment imposes: gravity, mass, friction. The agent cannot change them, and they stay fixed during an episode. This project studies the other kind, which <a href="https://arxiv.org/abs/2604.02348">Biedenkapp (2026)</a> calls <strong>autogenic</strong>: a context that the agent's own behaviour creates and changes.</p>
+  <p>Our example is a plane's battery. The battery limits how hard the cruise motor can push, and every bit of thrust drains it. A good pilot must know how much is left: with a full battery it can fly fast; with a weak one it must fly slowly to survive the 35-second mission. But the battery is <strong>hidden</strong>. It shows in the plane's motion only while the motor runs at its limit, so finding out how much battery is left costs battery. Observing the context changes it.</p>
+
+  <h2 id="environment">BatteryPlane</h2>
+  <p>A 2D point-mass plane with a lift motor, a cruise motor, a wing and a battery. Every flight is a 35-second mission (700 steps of 0.05 s). It starts at 30–120 m and 0–30 m/s, with a battery drawn between 20% and 70%, the range where rationing matters.</p>
+  <div class="spaces">
+    <div class="space">
+      <div class="kind">State</div>
+      <div class="eq">s<sub>t</sub> = (y, v<sub>x</sub>, v<sub>y</sub>, b, τ)</div>
+      <dl>
+        <dt>y</dt><dd>altitude, 0–200 m (the ceiling)</dd>
+        <dt>v<sub>x</sub></dt><dd>forward speed (m/s)</dd>
+        <dt>v<sub>y</sub></dt><dd>climb rate (m/s)</dd>
+        <dt>b</dt><dd>battery charge, 0–1</dd>
+        <dt>τ</dt><dd>time left, from 1 down to 0</dd>
+      </dl>
+    </div>
+    <div class="space">
+      <div class="kind">Observation</div>
+      <div class="eq">o<sub>t</sub> = (y, v<sub>x</sub> + ε, v<sub>y</sub>, τ)</div>
+      <dl>
+        <dt>ε</dt><dd>sensor noise on the speed reading, ±5 m/s (Gaussian), fresh every step</dd>
+        <dt>b</dt><dd><strong>not observed:</strong> the agent never sees its battery</dd>
+      </dl>
+      <p class="note">Altitude and speeds are scaled to about 0–1 (÷200 m, ÷60 m/s).</p>
+    </div>
+    <div class="space">
+      <div class="kind">Action</div>
+      <div class="eq">a<sub>t</sub> = (a<sub>x</sub>, a<sub>y</sub>) ∈ [−1, 1]²</div>
+      <dl>
+        <dt>a<sub>x</sub></dt><dd>cruise motor: thrust 20·a<sub>x</sub> m/s², capped at ±(11.5 + 6.5 b). <strong>The battery sets the cap.</strong></dd>
+        <dt>a<sub>y</sub></dt><dd>lift motor around level flight: 0 holds the altitude, positive climbs, negative descends</dd>
+      </dl>
+    </div>
+  </div>
+  <ul class="points">
+    <li><strong>Air thins with altitude:</strong> its density halves from the ground to the ceiling, and drag grows with density × speed². Up high, the same thrust holds a higher speed.</li>
+    <li><strong>Thrust drains the battery:</strong> every step costs (a<sub>x</sub>² + a<sub>y</sub>²)/g² × Δt/E of charge, for the thrust actually delivered (a full battery could hover for E = 100 s).</li>
+    <li><strong>Reward:</strong> each step earns up to 1 for speed inside the band 52–62 m/s (0 below 52, 1 from 62), plus a smaller bonus that grows with speed. A flight that runs the battery empty or hits the ground loses 300.</li>
+  </ul>
+
+  <h3>Why climb</h3>
+  <p>The reward starts at 52 m/s, and near the ground the plane cannot get there: the air is thick, and drag balances even a full battery's thrust at 47 m/s. Higher up the air is thinner, so the same motor pushes the plane faster. Climbing costs some battery, but it is the only way to earn the speed reward, and the weaker the battery, the higher the plane must go.</p>
+  <div class="two">
+    <figure class="shot">
+      <img src="assets/figures/env_snapshot_low.png" alt="BatteryPlane frame: the plane flies at 20 m at full throttle; its speed marker sits left of the yellow reward band." loading="lazy">
+      <figcaption><strong>Low, 20 m:</strong> full throttle tops out at 44 m/s (filled marker on the speed bar), short of the yellow reward band.</figcaption>
+    </figure>
+    <figure class="shot">
+      <img src="assets/figures/env_snapshot_high.png" alt="BatteryPlane frame: the same plane at the 200 m ceiling at full throttle; its speed marker sits inside the yellow reward band." loading="lazy">
+      <figcaption><strong>High, 200 m:</strong> the same plane and battery hold 58 m/s, inside the band.</figcaption>
+    </figure>
+  </div>
+  <p class="caption">Real frames from the environment's renderer: 8 seconds at full cruise throttle with a 60% battery, once low and once after climbing to the ceiling. The sky turns paler as the air thins. The speed bar shows the true speed (filled marker), the agent's noisy reading (hollow marker) and the reward band (yellow). The plane is drawn red while its cruise motor runs at the battery's limit, the only time the battery shows in the motion.</p>
+  <figure class="narrow">
+    <img src="assets/figures/fig_top_speed_by_altitude.png" alt="Line chart: top speed at full cruise thrust against altitude for 20%, 50% and 100% battery, with the reward band 52-62 m/s shaded; the band becomes reachable at 152 m, 110 m and 54 m." loading="lazy">
+    <figcaption>The speed the cruise motor can hold in level flight, by altitude. The reward band becomes reachable at 54 m with a full battery, 110 m at 50% and 152 m at 20%.</figcaption>
+  </figure>
+
+  <h3>A test of autogenic context</h3>
+  <ul class="points">
+    <li><strong>The context matters:</strong> the best hand-written pilot that cannot see the battery earns 36% less than one that can, and learned agents without memory gain 130–235 points from seeing it.</li>
+    <li><strong>The context is hidden:</strong> below the motor's limit, the plane's motion does not depend on the battery at all.</li>
+    <li><strong>The context is autogenic:</strong> only the agent's own thrust drains it, and probing it (flying at the limit) is exactly what drains it fastest.</li>
+  </ul>
+  <div class="pager"><a class="prev" href="index.html"><span class="dir">← Previous</span><span class="name">Overview</span></a><a class="next" href="contextual_ppo.html"><span class="dir">Next →</span><span class="name">Contextual PPO</span></a></div>
+</main>
+<footer>
+  Built from the experiment logs in the <a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">repository</a>. Videos are real final-test flights rendered with the environment's own renderer. Developed with the help of large language models (<a href="index.html#ai-use">details</a>).
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>

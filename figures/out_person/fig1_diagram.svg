@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="454" viewBox="0 0 1000 454">
+<rect width="1000" height="454" fill="#ffffff"/>
+<rect x="8" y="8" width="984" height="212" rx="10" fill="none" stroke="#b9b7af" stroke-width="1.1" stroke-dasharray="5 4"/>
+<text x="22.00" y="30.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="bold" font-style="normal" fill="#111111">(a)</text>
+<text x="45.46" y="30.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="bold" font-style="normal" fill="#111111">Offline: supervised encoder training</text>
+<rect x="22" y="52" width="238" height="136" rx="7" fill="#f4f4f1" stroke="#4a4a46" stroke-width="1.1"/>
+<text x="34.00" y="72.00" xml:space="preserve" font-family="Roboto" font-size="12.00" font-weight="bold" font-style="normal" fill="#111111">Pilot policies</text>
+<text x="109.90" y="72.00" xml:space="preserve" font-family="Roboto" font-size="12.00" font-weight="normal" font-style="normal" fill="#4a4a46">11 flying styles</text>
+<circle cx="34" cy="90.2" r="2.1" fill="#8e8c85"/>
+<text x="40.00" y="94.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Probe &amp; hold</text>
+<circle cx="34" cy="106.2" r="2.1" fill="#8e8c85"/>
+<text x="40.00" y="110.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Steady below cap</text>
+<circle cx="34" cy="122.2" r="2.1" fill="#8e8c85"/>
+<text x="40.00" y="126.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Random hold</text>
+<circle cx="34" cy="138.2" r="2.1" fill="#8e8c85"/>
+<text x="40.00" y="142.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Shaky</text>
+<circle cx="34" cy="154.2" r="2.1" fill="#8e8c85"/>
+<text x="40.00" y="158.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Wavy</text>
+<circle cx="34" cy="170.2" r="2.1" fill="#8e8c85"/>
+<text x="40.00" y="174.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Hold speed</text>
+<circle cx="146" cy="90.2" r="2.1" fill="#8e8c85"/>
+<text x="152.00" y="94.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Cruise</text>
+<circle cx="146" cy="106.2" r="2.1" fill="#8e8c85"/>
+<text x="152.00" y="110.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Endurance</text>
+<circle cx="146" cy="122.2" r="2.1" fill="#8e8c85"/>
+<text x="152.00" y="126.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">PPO, memoryless</text>
+<circle cx="146" cy="138.2" r="2.1" fill="#8e8c85"/>
+<text x="152.00" y="142.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">PPO, replayed</text>
+<circle cx="146" cy="154.2" r="2.1" fill="#8e8c85"/>
+<text x="152.00" y="158.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">Style switching</text>
+<path d="M260 120 L312.00 120.00" fill="none" stroke="#4a4a46" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="318.00,120.00 310.50,116.25 310.50,123.75" fill="#4a4a46"/>
+<text x="271.72" y="113.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="italic" fill="#4a4a46">roll out</text>
+<path d="M320 72 V154 A50 12 0 0 0 420 154 V72" fill="#f4f4f1" stroke="#4a4a46" stroke-width="1.1"/>
+<ellipse cx="370" cy="72" rx="50" ry="12" fill="#ffffff" stroke="#4a4a46" stroke-width="1.1"/>
+<text x="359.38" y="112.00" xml:space="preserve" font-family="STIXGeneral" font-size="24.00" font-weight="normal" font-style="italic" fill="#111111">𝒟</text>
+<text x="345.79" y="136.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="italic" fill="#111111">o</text>
+<text x="352.04" y="139.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="354.40" y="136.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="normal" fill="#111111">,</text>
+<text x="360.65" y="136.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="italic" fill="#111111">a</text>
+<text x="366.91" y="139.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="369.28" y="139.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="normal" fill="#111111">−1</text>
+<text x="379.35" y="136.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="normal" fill="#111111">,</text>
+<text x="385.60" y="136.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="italic" fill="#111111">b</text>
+<text x="391.85" y="139.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="319.24" y="186.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">19,000 flights</text>
+<path d="M420 120 L460.00 120.00" fill="none" stroke="#4a4a46" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="466.00,120.00 458.50,116.25 458.50,123.75" fill="#4a4a46"/>
+<text x="438.89" y="113.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.00" font-weight="normal" font-style="italic" fill="#111111">x</text>
+<text x="444.66" y="116.38" xml:space="preserve" font-family="STIXGeneral" font-size="8.84" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<rect x="468" y="88" width="222" height="64" rx="7" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1.3"/>
+<text x="531.27" y="115.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="bold" font-style="normal" fill="#1c5cab">Encoder</text>
+<text x="584.30" y="115.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.50" font-weight="normal" font-style="italic" fill="#1c5cab">f</text>
+<text x="588.06" y="118.51" xml:space="preserve" font-family="STIXGeneral" font-size="9.18" font-weight="normal" font-style="italic" fill="#1c5cab">φ</text>
+<text x="600.46" y="115.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="normal" font-style="normal" fill="#4a4a46">GRU</text>
+<text x="546.78" y="138.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">trained on</text>
+<text x="601.04" y="138.00" xml:space="preserve" font-family="STIXGeneral" font-size="11.50" font-weight="normal" font-style="italic" fill="#4a4a46">𝒟</text>
+<path d="M690 120 L736.00 120.00" fill="none" stroke="#2a78d6" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="742.00,120.00 734.50,116.25 734.50,123.75" fill="#2a78d6"/>
+<text x="711.35" y="113.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.50" font-weight="normal" font-style="italic" fill="#1c5cab">b</text>
+<path d="M712.70 103.42 L715.40 101.39 L718.10 103.42" fill="none" stroke="#1c5cab" stroke-width="0.95" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="718.10" y="116.51" xml:space="preserve" font-family="STIXGeneral" font-size="9.18" font-weight="normal" font-style="italic" fill="#1c5cab">t</text>
+<rect x="744" y="90" width="230" height="60" rx="7" fill="#ffffff" stroke="#4a4a46" stroke-width="1.2"/>
+<text x="794.59" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="italic" fill="#111111">ℒ</text>
+<text x="809.73" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="normal" fill="#111111">(</text>
+<text x="815.06" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="italic" fill="#111111">φ</text>
+<text x="825.01" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="normal" fill="#111111">) =</text>
+<text x="849.30" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="normal" fill="#111111">Σ</text>
+<text x="859.28" y="130.16" xml:space="preserve" font-family="STIXGeneral" font-size="10.88" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="866.30" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="normal" fill="#111111">(</text>
+<text x="871.63" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="italic" fill="#111111">b</text>
+<path d="M873.23 114.64 L876.43 112.24 L879.63 114.64" fill="none" stroke="#111111" stroke-width="1.12" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="879.63" y="130.16" xml:space="preserve" font-family="STIXGeneral" font-size="10.88" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="886.66" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="normal" fill="#111111">−</text>
+<text x="901.62" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="italic" fill="#111111">b</text>
+<text x="909.62" y="130.16" xml:space="preserve" font-family="STIXGeneral" font-size="10.88" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="912.64" y="126.00" xml:space="preserve" font-family="STIXGeneral" font-size="16.00" font-weight="normal" font-style="normal" fill="#111111">)</text>
+<text x="917.97" y="119.28" xml:space="preserve" font-family="STIXGeneral" font-size="10.88" font-weight="normal" font-style="normal" fill="#111111">2</text>
+<path d="M400 163.6 V206 H859 V156" fill="none" stroke="#8e8c85" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 3"/>
+<polygon points="859.00,150.00 855.25,157.50 862.75,157.50" fill="#8e8c85"/>
+<text x="606.32" y="201.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="italic" fill="#8e8c85">labels</text>
+<text x="638.57" y="201.00" xml:space="preserve" font-family="STIXGeneral" font-size="11.50" font-weight="normal" font-style="italic" fill="#8e8c85">b</text>
+<text x="644.32" y="203.99" xml:space="preserve" font-family="STIXGeneral" font-size="7.82" font-weight="normal" font-style="italic" fill="#8e8c85">t</text>
+<text x="652.15" y="201.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="italic" fill="#8e8c85">(privileged, training only)</text>
+<path d="M859 90 V48 Q859 40 851 40 H587 Q579 40 579 48 V82" fill="none" stroke="#2a78d6" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4 3"/>
+<polygon points="579.00,88.00 582.75,80.50 575.25,80.50" fill="#2a78d6"/>
+<text x="705.35" y="34.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.00" font-weight="normal" font-style="normal" fill="#1c5cab">∇</text>
+<text x="714.85" y="37.38" xml:space="preserve" font-family="STIXGeneral" font-size="8.84" font-weight="normal" font-style="italic" fill="#1c5cab">φ</text>
+<text x="720.35" y="34.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.00" font-weight="normal" font-style="italic" fill="#1c5cab">ℒ</text>
+<rect x="8" y="228" width="984" height="218" rx="10" fill="none" stroke="#b9b7af" stroke-width="1.1" stroke-dasharray="5 4"/>
+<text x="22.00" y="250.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="bold" font-style="normal" fill="#111111">(b)</text>
+<text x="45.82" y="250.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="bold" font-style="normal" fill="#111111">Online: PPO with the frozen encoder</text>
+<rect x="22" y="278" width="238" height="136" rx="7" fill="#f4f4f1" stroke="#4a4a46" stroke-width="1.1"/>
+<text x="34.00" y="298.00" xml:space="preserve" font-family="Roboto" font-size="12.00" font-weight="bold" font-style="normal" fill="#111111">Environment</text>
+<text x="108.21" y="298.00" xml:space="preserve" font-family="Roboto" font-size="12.00" font-weight="normal" font-style="normal" fill="#4a4a46">BatteryPlane</text>
+<circle cx="34" cy="330" r="2.1" fill="#8e8c85"/>
+<text x="42.00" y="334.00" xml:space="preserve" font-family="Roboto" font-size="12.50" font-weight="normal" font-style="normal" fill="#4a4a46">battery</text>
+<text x="83.88" y="334.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="italic" fill="#4a4a46">b</text>
+<text x="90.13" y="337.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="italic" fill="#4a4a46">t</text>
+<text x="95.59" y="334.00" xml:space="preserve" font-family="Roboto" font-size="12.50" font-weight="normal" font-style="normal" fill="#4a4a46">is hidden</text>
+<circle cx="34" cy="358" r="2.1" fill="#8e8c85"/>
+<text x="42.00" y="362.00" xml:space="preserve" font-family="Roboto" font-size="12.50" font-weight="normal" font-style="normal" fill="#4a4a46">every action drains</text>
+<text x="149.75" y="362.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="italic" fill="#4a4a46">b</text>
+<text x="156.00" y="365.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="italic" fill="#4a4a46">t</text>
+<circle cx="34" cy="386" r="2.1" fill="#8e8c85"/>
+<text x="42.00" y="390.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="italic" fill="#4a4a46">b</text>
+<text x="48.25" y="393.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="italic" fill="#4a4a46">t</text>
+<text x="53.71" y="390.00" xml:space="preserve" font-family="Roboto" font-size="12.50" font-weight="normal" font-style="normal" fill="#4a4a46">caps the thrust</text>
+<path d="M260 357 L460.00 357.00" fill="none" stroke="#4a4a46" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="466.00,357.00 458.50,353.25 458.50,360.75" fill="#4a4a46"/>
+<text x="345.55" y="349.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.00" font-weight="normal" font-style="italic" fill="#111111">o</text>
+<text x="352.05" y="352.38" xml:space="preserve" font-family="STIXGeneral" font-size="8.84" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="354.51" y="349.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.00" font-weight="normal" font-style="normal" fill="#111111">,</text>
+<text x="361.01" y="349.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.00" font-weight="normal" font-style="italic" fill="#111111">a</text>
+<text x="367.52" y="352.38" xml:space="preserve" font-family="STIXGeneral" font-size="8.84" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="369.98" y="352.38" xml:space="preserve" font-family="STIXGeneral" font-size="8.84" font-weight="normal" font-style="normal" fill="#111111">−1</text>
+<rect x="468" y="325" width="222" height="64" rx="7" fill="#eaf2fc" stroke="#2a78d6" stroke-width="1.3"/>
+<text x="531.27" y="352.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="bold" font-style="normal" fill="#1c5cab">Encoder</text>
+<text x="584.30" y="352.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.50" font-weight="normal" font-style="italic" fill="#1c5cab">f</text>
+<text x="588.06" y="355.51" xml:space="preserve" font-family="STIXGeneral" font-size="9.18" font-weight="normal" font-style="italic" fill="#1c5cab">φ</text>
+<text x="600.46" y="352.00" xml:space="preserve" font-family="Roboto" font-size="13.50" font-weight="normal" font-style="normal" fill="#4a4a46">GRU</text>
+<g transform="translate(546,371)" stroke="#2a78d6" stroke-width="1.1" stroke-linecap="round"><line x1="0" y1="0" x2="5.00" y2="0.00"/><line x1="0" y1="0" x2="2.50" y2="4.33"/><line x1="0" y1="0" x2="-2.50" y2="4.33"/><line x1="0" y1="0" x2="-5.00" y2="0.00"/><line x1="0" y1="0" x2="-2.50" y2="-4.33"/><line x1="0" y1="0" x2="2.50" y2="-4.33"/></g>
+<text x="555.00" y="375.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">frozen:</text>
+<text x="593.25" y="375.00" xml:space="preserve" font-family="STIXGeneral" font-size="11.50" font-weight="normal" font-style="italic" fill="#4a4a46">φ</text>
+<text x="603.25" y="375.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">from (a)</text>
+<path d="M690 357 L736.00 357.00" fill="none" stroke="#2a78d6" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="742.00,357.00 734.50,353.25 734.50,360.75" fill="#2a78d6"/>
+<text x="711.35" y="350.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.50" font-weight="normal" font-style="italic" fill="#1c5cab">b</text>
+<path d="M712.70 340.41 L715.40 338.39 L718.10 340.41" fill="none" stroke="#1c5cab" stroke-width="0.95" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="718.10" y="353.51" xml:space="preserve" font-family="STIXGeneral" font-size="9.18" font-weight="normal" font-style="italic" fill="#1c5cab">t</text>
+<rect x="744" y="286" width="230" height="128" rx="7" fill="#f1effc" stroke="#6250d6" stroke-width="1.3"/>
+<text x="756.00" y="304.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="bold" font-style="normal" fill="#4a3aa7">PPO</text>
+<text x="784.49" y="304.00" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="normal" font-style="normal" fill="#4a4a46">trained on reward</text>
+<text x="876.88" y="304.00" xml:space="preserve" font-family="STIXGeneral" font-size="11.50" font-weight="normal" font-style="italic" fill="#4a4a46">r</text>
+<text x="881.35" y="306.99" xml:space="preserve" font-family="STIXGeneral" font-size="7.82" font-weight="normal" font-style="italic" fill="#4a4a46">t</text>
+<rect x="756" y="314" width="206" height="40" rx="5" fill="#ffffff" stroke="#6250d6" stroke-width="1.0"/>
+<text x="766.00" y="338.50" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="bold" font-style="normal" fill="#4a3aa7">Actor</text>
+<text x="853.46" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="italic" fill="#111111">π</text>
+<text x="860.77" y="343.27" xml:space="preserve" font-family="STIXGeneral" font-size="9.86" font-weight="normal" font-style="italic" fill="#111111">θ</text>
+<text x="865.50" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="normal" fill="#111111">(</text>
+<text x="870.33" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="italic" fill="#111111">a</text>
+<text x="877.59" y="343.27" xml:space="preserve" font-family="STIXGeneral" font-size="9.86" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="883.96" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="normal" fill="#111111">|</text>
+<text x="890.48" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="italic" fill="#111111">o</text>
+<text x="897.73" y="343.27" xml:space="preserve" font-family="STIXGeneral" font-size="9.86" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="900.47" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="normal" fill="#111111">,</text>
+<text x="907.72" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="italic" fill="#111111">b</text>
+<path d="M909.17 329.20 L912.07 327.03 L914.97 329.20" fill="none" stroke="#111111" stroke-width="1.02" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="914.97" y="343.27" xml:space="preserve" font-family="STIXGeneral" font-size="9.86" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="917.71" y="339.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="normal" fill="#111111">)</text>
+<rect x="756" y="364" width="206" height="40" rx="5" fill="#ffffff" stroke="#6250d6" stroke-width="1.0"/>
+<text x="766.00" y="388.50" xml:space="preserve" font-family="Roboto" font-size="11.50" font-weight="bold" font-style="normal" fill="#4a3aa7">Critic</text>
+<text x="862.25" y="389.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="italic" fill="#111111">V</text>
+<text x="871.11" y="393.27" xml:space="preserve" font-family="STIXGeneral" font-size="9.86" font-weight="normal" font-style="italic" fill="#111111">ψ</text>
+<text x="876.86" y="389.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="normal" fill="#111111">(</text>
+<text x="881.69" y="389.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="italic" fill="#111111">o</text>
+<text x="888.94" y="393.27" xml:space="preserve" font-family="STIXGeneral" font-size="9.86" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="891.68" y="389.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="normal" fill="#111111">,</text>
+<text x="898.93" y="389.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="italic" fill="#111111">b</text>
+<path d="M900.38 379.20 L903.28 377.03 L906.18 379.20" fill="none" stroke="#111111" stroke-width="1.02" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="906.18" y="393.27" xml:space="preserve" font-family="STIXGeneral" font-size="9.86" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<text x="908.92" y="389.50" xml:space="preserve" font-family="STIXGeneral" font-size="14.50" font-weight="normal" font-style="normal" fill="#111111">)</text>
+<path d="M141 278 V270 Q141 262 149 262 H851 Q859 262 859 270 V280" fill="none" stroke="#4a4a46" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="859.00,286.00 862.75,278.50 855.25,278.50" fill="#4a4a46"/>
+<text x="495.52" y="257.00" xml:space="preserve" font-family="STIXGeneral" font-size="13.00" font-weight="normal" font-style="italic" fill="#111111">o</text>
+<text x="502.02" y="260.38" xml:space="preserve" font-family="STIXGeneral" font-size="8.84" font-weight="normal" font-style="italic" fill="#111111">t</text>
+<path d="M962 334.0 H976 Q984 334.0 984 342.0 V422 Q984 430 976 430 H149 Q141 430 141 422 V420" fill="none" stroke="#4a4a46" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="141.00,414.00 137.25,421.50 144.75,421.50" fill="#4a4a46"/>
+<text x="339.89" y="425.00" xml:space="preserve" font-family="Roboto" font-size="12.50" font-weight="normal" font-style="normal" fill="#4a4a46">action</text>
+<text x="377.49" y="425.00" xml:space="preserve" font-family="STIXGeneral" font-size="12.50" font-weight="normal" font-style="italic" fill="#111111">a</text>
+<text x="383.75" y="428.25" xml:space="preserve" font-family="STIXGeneral" font-size="8.50" font-weight="normal" font-style="italic" fill="#111111">t</text>
+</svg>

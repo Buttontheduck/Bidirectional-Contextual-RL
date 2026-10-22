@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Batın Muslu">
+  <title>Reading Your Own Battery: Autogenic Context in RL</title>
+  <meta name="description" content="BatteryPlane, a benchmark where the agent's own actions change and hide its context, and a two-stage recipe that learns to infer it.">
+  <meta property="og:title" content="Reading Your Own Battery: Autogenic Context in Reinforcement Learning">
+  <meta property="og:description" content="A plane whose battery is hidden and drained by its own thrust. End-to-end memory agents fail; a frozen encoder trained on many pilots' flights recovers most of the value of knowing the battery.">
+  <meta property="og:image" content="assets/figures/fig1_method.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="site-nav" aria-label="Pages"><div class="inner"><a class="brand" href="index.html">Reading Your Own Battery</a><div class="links"><a href="index.html" aria-current="page">Overview</a><a href="environment.html">Environment</a><a href="contextual_ppo.html">Contextual PPO</a><a href="results.html">Results</a><a href="ablations.html">Ablations</a><a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Code</a></div></div></nav>
+<main>
+
+  <header class="hero">
+    <h1>Reading Your Own Battery:<br>Autogenic Context in Reinforcement Learning</h1>
+    <p class="subtitle">A plane whose battery is hidden from the pilot and drained by the pilot's own thrust: a small benchmark for a context the agent creates itself, and a two-stage recipe that learns to infer it.</p>
+    <div class="authors"><a href="https://github.com/Buttontheduck">Batın Muslu</a></div>
+    <div class="buttons">
+      <a class="button" href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        Code
+      </a>
+      <a class="button" href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL/blob/main/ENCODER_PLAN.md">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0113.25 16h-9.5A1.75 1.75 0 012 14.25zm1.75-.25a.25.25 0 00-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 00.25-.25V6h-2.75A1.75 1.75 0 019 4.25V1.5zm6.75.062V4.25c0 .138.112.25.25.25h2.688zM5 8.75A.75.75 0 015.75 8h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm0 3a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5a.75.75 0 01-.75-.75z"/></svg>
+        Full experiment log
+      </a>
+    </div>
+
+    <div class="teaser">
+      <div class="video-card">
+        <video src="assets/videos/memoryless_ppo_b03.mp4" muted loop playsinline preload="metadata"></video>
+        <div class="label"><span class="dot" style="background:var(--red)"></span>No battery information</div>
+      </div>
+      <div class="video-card">
+        <video src="assets/videos/gru_labels_ppo_b03.mp4" muted loop playsinline preload="metadata"></video>
+        <div class="label"><span class="dot" style="background:var(--accent)"></span>Frozen GRU encoder (ours)</div>
+      </div>
+    </div>
+    <p class="caption">The same flight, starting with 30% battery, on an unseen test seed (2× speed). The agent that cannot see its battery sprints and runs empty after 14.5 s. Ours never sees the battery either, but infers it from how the plane responds, rations, and completes the mission.</p>
+  </header>
+
+  <div class="tldr">
+    <p><strong>TL;DR.</strong> In BatteryPlane the agent must infer its own hidden battery charge, and the only way to see it is to fly at full throttle, which drains it. Memory agents trained end to end fall into a loop: the policy flies one narrow style, so the battery rarely shows, so the encoder learns a clock instead of the battery, so the policy ignores it. Training the encoder <strong>offline on many pilots' flights</strong> and then freezing it breaks the loop: in our main setting, plain PPO with the frozen encoder recovers about 80% of the value of seeing the true battery.</p>
+  </div>
+
+  <h2 id="glance">At a glance</h2>
+  <p>Mean final-test return over 8 training seeds, on reserved test seeds (2000–2002) never used for training or selection.</p>
+  <div class="numbers">
+    <div class="stat"><div class="value" style="color:var(--red)">49</div><div class="name">PPO, no battery information</div></div>
+    <div class="stat ours"><div class="value">238</div><div class="name">PPO + frozen GRU (ours)</div></div>
+    <div class="stat"><div class="value" style="color:var(--purple)">283</div><div class="name">PPO, true battery</div></div>
+    <div class="stat"><div class="value" style="color:var(--green)">316</div><div class="name">PPO, ideal Bayesian estimate</div></div>
+  </div>
+
+  <h2 id="method">The recipe</h2>
+  <figure>
+    <img src="assets/figures/fig1_method.png" alt="Diagram of the two-stage method: offline supervised encoder training, then PPO with the frozen encoder." loading="lazy">
+    <figcaption><strong>(a)</strong> The pilots' flights train a GRU encoder f<sub>φ</sub> to predict the battery b<sub>t</sub> from the observation o<sub>t</sub> and the previous action a<sub>t−1</sub>; the true battery is used only as the training label. <strong>(b)</strong> The encoder is frozen; at every step it gives PPO its estimate b̂<sub>t</sub>, and the actor and critic learn from the reward alone. The policy never sees the battery.</figcaption>
+  </figure>
+  <p>Why training the encoder together with the policy fails, and why this works: <a href="contextual_ppo.html">Contextual PPO →</a></p>
+
+  <h2 id="explore">Explore</h2>
+  <div class="cards four">
+    <a class="card" href="environment.html"><div class="title">Environment</div><p>BatteryPlane: state, observation and action spaces, and why the plane climbs.</p></a>
+    <a class="card" href="contextual_ppo.html"><div class="title">Contextual PPO</div><p>A memory that infers the battery, why training it end to end fails, and the two-stage recipe with the pilots.</p></a>
+    <a class="card" href="results.html"><div class="title">Results</div><p>Final-test returns, results by starting battery, and every agent flying the same test flight.</p></a>
+    <a class="card" href="ablations.html"><div class="title">Ablations</div><p>The encoder's training target, its architecture, end-to-end variants, lessons, and the full configuration.</p></a>
+  </div>
+
+  <h2 id="ai-use">Use of AI tools</h2>
+  <p>Claude (Anthropic) helped with the code, experiments, figures and this website. The research direction and conclusions are the author's.</p>
+
+  <h2 id="citation">Citation</h2>
+  <div class="bib">
+    <pre id="bibtex">@misc{batteryplane2026,
+  title        = {Reading Your Own Battery: Autogenic Context in Reinforcement Learning},
+  author       = {Muslu, Bat{\i}n},
+  year         = {2026},
+  howpublished = {\url{https://github.com/Buttontheduck/Bidirectional-Contextual-RL}}
+}</pre>
+    <button class="chip copy" id="copy">Copy</button>
+  </div>
+
+  <div class="pager"><a class="next" href="environment.html"><span class="dir">Next →</span><span class="name">Environment</span></a></div>
+</main>
+<footer>
+  Built from the experiment logs in the <a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">repository</a>. Videos are real final-test flights rendered with the environment's own renderer. Developed with the help of large language models (<a href="index.html#ai-use">details</a>).
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Batın Muslu">
+  <title>Contextual PPO · Reading Your Own Battery</title>
+  <meta name="description" content="How an agent that never sees its battery can still act on it: Contextual PPO, why training its encoder end to end fails, and the two-stage recipe that works.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="site-nav" aria-label="Pages"><div class="inner"><a class="brand" href="index.html">Reading Your Own Battery</a><div class="links"><a href="index.html">Overview</a><a href="environment.html">Environment</a><a href="contextual_ppo.html" aria-current="page">Contextual PPO</a><a href="results.html">Results</a><a href="ablations.html">Ablations</a><a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Code</a></div></div></nav>
+<main>
+  <header class="page-head">
+    <h1>Contextual PPO</h1>
+    <p class="lead">How an agent that never sees its battery can still act on it: a memory that infers the battery from the flight so far, why training that memory together with the policy fails, and the recipe that works.</p>
+  </header>
+
+  <h2 id="idea">The idea: a memory that infers the battery</h2>
+  <p>The policy cannot see its battery, but the flight so far carries information about it. At full throttle a fuller battery pushes harder, and every action drains it by a known amount. So we give PPO a memory: a recurrent <strong>encoder</strong> that reads the history and keeps a running estimate of the battery.</p>
+  <div class="spaces">
+    <div class="space">
+      <div class="kind">Encoder</div>
+      <div class="eq">z<sub>t</sub> = f<sub>φ</sub>(o<sub>t</sub>, a<sub>t−1</sub>, h<sub>t−1</sub>)</div>
+      <dl>
+        <dt>reads</dt><dd>each observation and the previous action</dd>
+        <dt>keeps</dt><dd>a memory h<sub>t</sub> of the flight so far</dd>
+        <dt>outputs</dt><dd>z<sub>t</sub> = b̂<sub>t</sub>, its estimate of the battery</dd>
+      </dl>
+    </div>
+    <div class="space">
+      <div class="kind">Actor and critic</div>
+      <div class="eq">a<sub>t</sub> ~ π<sub>θ</sub>(· | o<sub>t</sub>, z<sub>t</sub>), V<sub>ψ</sub>(o<sub>t</sub>, z<sub>t</sub>)</div>
+      <dl>
+        <dt>read</dt><dd>the observation plus the battery estimate</dd>
+        <dt>learn</dt><dd>from the reward alone, with PPO</dd>
+      </dl>
+    </div>
+    <div class="space">
+      <div class="kind">Training signal</div>
+      <div class="eq">min<sub>φ</sub> Σ<sub>t</sub> (z<sub>t</sub> − b<sub>t</sub>)²</div>
+      <dl>
+        <dt>label</dt><dd>the true battery b<sub>t</sub>, used during training only</dd>
+        <dt>at test</dt><dd>nothing privileged: the estimate comes from the flight itself</dd>
+      </dl>
+    </div>
+  </div>
+  <p>This is Contextual PPO. The question is how to train the encoder so that its estimate is right on the flights that matter.</p>
+
+  <h2 id="end-to-end">First attempt: train everything together</h2>
+  <p>The natural way trains the encoder and the policy at the same time, on the agent's own flights: after every PPO update, the encoder takes a few steps towards the true battery on the latest episodes. We tried it with an xLSTM (experiment A) and a GRU (joint training, J0–J5). <strong>It fails:</strong> on the final test the xLSTM version scores 42 and the best GRU version 150, no better than Contextual PPO without any memory (155), while the same learner given the true battery scores 286.</p>
+  <p>The reason is autogenic. The policy decides which flights its own encoder learns from:</p>
+  <ul class="points">
+    <li><strong>The policy settles on one style.</strong> Early on the estimate is useless, so the policy learns to fly the same way at every battery.</li>
+    <li><strong>That style rarely reveals the battery.</strong> The battery only shows while the motor runs at its limit, and a policy that rations never does.</li>
+    <li><strong>So the encoder learns a clock.</strong> On those flights the battery is roughly a function of time, which the encoder can predict without reading the physics.</li>
+    <li><strong>So the policy ignores the estimate,</strong> and the loop closes: neither part gives the other a reason to change.</li>
+  </ul>
+  <p>More encoder training, an entropy bonus, a Gaussian head, a curiosity bonus and a warm-up all leave it at the memoryless level (see <a href="ablations.html#ablations">Ablations</a>).</p>
+
+  <h2 id="recipe">Our recipe: learn the battery from many pilots, then freeze it</h2>
+  <p>We break the loop by taking the encoder's data out of the policy's hands, in two stages.</p>
+  <figure>
+    <img src="assets/figures/fig1_method.png" alt="Diagram of the two-stage method: offline supervised encoder training on pilot flights, then PPO with the frozen encoder." loading="lazy">
+    <figcaption><strong>(a)</strong> The pilots' flights train a GRU encoder f<sub>φ</sub> to predict the battery b<sub>t</sub> from the observation o<sub>t</sub> and the previous action a<sub>t−1</sub>; the true battery is used only as the training label. <strong>(b)</strong> The encoder is frozen; at every step it gives PPO its estimate b̂<sub>t</sub>, and the actor and critic learn from the reward alone. The policy never sees the battery.</figcaption>
+  </figure>
+  <ul class="points">
+    <li><strong>Stage 1, offline:</strong> 11 scripted and learned pilots fly 19,000 flights in different styles. A GRU learns to predict the battery at every step of those flights.</li>
+    <li><strong>Stage 2, frozen:</strong> the encoder no longer changes. Plain PPO reads its estimate as one extra input next to the observation and learns from the reward alone.</li>
+    <li><strong>Why it works:</strong> the pilots' variety includes flights that reveal the battery and flights that hide it, so a clock no longer fits and the encoder has to learn the physics. And because it is frozen, its estimate means the same thing throughout the policy's training.</li>
+    <li><strong>The result:</strong> plain PPO with the frozen GRU scores 238 on the final test, against 49 without battery information and 283 with the true battery. Trained on the ideal Bayesian estimate instead of the true battery, the same GRU brings PPO to 330 (see <a href="results.html">Results</a> and <a href="ablations.html">Ablations</a>).</li>
+  </ul>
+
+  <h2 id="pilots-heading">The pilots</h2>
+  <p>To train the encoder offline we fly the plane with 11 scripted and learned pilots in different styles and record 19,000 flights. Variety matters: some styles reveal the battery, others hide it completely.</p>
+  <div class="pilots" id="pilots"></div>
+  <p>Every setting of the encoders and of both learners is in the <a href="ablations.html#configuration">configuration tables</a>.</p>
+
+  <div class="pager"><a class="prev" href="environment.html"><span class="dir">← Previous</span><span class="name">Environment</span></a><a class="next" href="results.html"><span class="dir">Next →</span><span class="name">Results</span></a></div>
+</main>
+<footer>
+  Built from the experiment logs in the <a href="https://github.com/Buttontheduck/Bidirectional-Contextual-RL">repository</a>. Videos are real final-test flights rendered with the environment's own renderer. Developed with the help of large language models (<a href="index.html#ai-use">details</a>).
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>
