@@ -32,6 +32,7 @@
 - **J5 (the encoder learns for 200k steps before the policy) fails too:** 70. Its policies use the battery input much more than J1's, but still average only 151 given the true battery. The remaining suspect is the encoder changing while the policy learns; J6 (the encoder stops after the warm-up) would test it.
 - **The take-off-only version is a usable test bench after all** (revised 2026-10-21): its memoryless agents' higher returns come mostly from the faster start, plus a partial hint; judged on survival it separates agents with and without the battery as clearly as the transition version (section 11).
 - **E3c, end-to-end on the take-off-only version, is the closest end-to-end result so far** (section 11): J1 scores 169 on validation and 197 on the final test, against 155–158 without memory and 254–275 with the true battery (not a clear gain over no memory: final test p = 0.27). Its policies depend on the battery estimate, and given the true battery they match the true-battery agent (247 against 254); the encoder's remaining error (0.05 at hand-over) is what holds them back. Next: a 7-second take-off or a Gaussian head, chosen on validation.
+- **E3d, training the end-to-end encoder on short windows instead of whole flights, makes things worse** (section 11): plain chunking (16-step windows from a blank memory) 138 and R2D2 (windows from the saved memory, 16 burn-in + 16 trained steps) 31, against 169 with whole flights. The encoder's error at hand-over doubles or triples (0.11–0.16 against 0.05): short windows don't teach it to carry the take-off's information. Whole-flight training stays the best.
 - **E2 skipped for now** (the user's choice, 2026-10-20): E3 went first.
 
 - **On a rented GPU:**
@@ -271,6 +272,8 @@ In all versions the hand-over battery is uniform in 20–70% (the reset's b0), t
 | J0 (A's encoder budget) | 8 | 16 | 200,000 steps | |
 | J1 | 32 | 32 | 2.1 million steps | |
 | J5 | 32 | 32 | 2.1 million steps | no PPO update for the first 200,000 steps, with 128 encoder steps per update during that warm-up |
+| J1_chunk | 32 | 512 windows of 16 steps | 2.1 million steps | plain chunking (`cppo.supervised.sequence=chunk`): every window starts from a blank memory |
+| J1_r2d2 | 32 | 512 windows of 16 + 16 steps | 2.1 million steps | R2D2 (`cppo.supervised.sequence=stored_state`): every window starts from the memory saved at collection; 16 burn-in steps without loss or gradient, then 16 trained |
 
 **Evaluation** (all runs): validation every 50,000 steps on 18 flights (seeds 1000–1002 × starting battery 0.2, 0.3, … 0.7, where the starting battery is the hand-over battery), deterministic actions. Score: the mean validation return over 1.5M–2M steps (11 evaluations). Final test: seeds 2000–2002 on the same grid, only through `evaluate_final_test.py`, which first re-runs each run's validation and refuses if the flights don't reproduce.
 
@@ -283,6 +286,7 @@ In all versions the hand-over battery is uniform in 20–70% (the reset's b0), t
 | E3, with the transition | J0 J1 × 0–4 | `--jobs 10 --threads 3 --warmup-steps 100 --transition-steps 80 --output runs_step0/easy_e3` | J0 68–70 min, J1 227–232 min |
 | E3b (J5), with the transition | J5 × 0–4 | `--jobs 5 --threads 3 --warmup-steps 100 --transition-steps 80 --output runs_step0/easy_e3_j5` | 249–251 min |
 | E3c, take-off only | J0 J1 × 0–4 | `--jobs 10 --threads 3 --warmup-steps 100 --output runs_step0/easy_e3_takeoff` | J0 53–62 min, J1 206–208 min |
+| E3d, take-off only | J1_chunk J1_r2d2 × 0–2 | `--jobs 6 --threads 5 --warmup-steps 100 --output runs_step0/easy_e3_windows` | J1_chunk 58 min, J1_r2d2 69 min |
 
 Each launch line is `nohup python run_step0.py --conditions <conditions> --seeds <seeds> <launch> > run_<name>.log 2>&1 &`.
 
@@ -585,3 +589,61 @@ Failed flights on the final test by starting battery:
 - **A 7-second take-off** (`--warmup-steps 140`): the best possible error after 7 s is 0.037 instead of 0.050 (section 3). If the estimate's error is the limit, J1 should move towards the true-battery agent.
 - **A Gaussian head** (J3's encoder: the estimate plus its variance, both read by the actor and critic): lets the policy fly more cautiously when the estimate is uncertain.
 - Each is about 3.5 hours for J1 with 5 seeds (10 runs at once with 3 threads, as here).
+
+### E3d: the end-to-end encoder trained on short windows (2026-10-22)
+
+**Question.** In E3 and E3c the encoder trains on whole flights with full backpropagation through time. Would training it on short windows help? The hope: many more, cheaper encoder steps, so the encoder becomes useful sooner and the policy doesn't settle before it does. Two standard ways to cut flights into windows:
+- **Plain chunking:** windows of 16 steps, each from a blank memory, with the battery error over those 16 steps.
+- **R2D2** (Kapturowski et al., 2019): store the encoder's memory with every collected step; each window starts from the stored memory, runs 16 burn-in steps without loss or gradient to refresh it, then 16 trained steps.
+
+**Design.** J1 on the take-off-only version (as E3c, whose J1 trains on whole flights), with only the encoder's training samples changed: 32 encoder steps per update, each on 512 windows; 16 trained steps per window (plus 16 burn-in steps for R2D2); the 2.1-million-step episode buffer. The validation error is still measured on whole flights. 3 seeds each (0–2), 6 runs at once with 5 threads. Conditions `J1_chunk` and `J1_r2d2` (`config/joint/J1_gru_budget_chunk.yaml`, `J1_gru_budget_r2d2.yaml`; option `cppo.supervised.sequence`, with `chunk_len`, `burn_in` and `chunk_batch_size`; checks in `checks/sequence_checks.py`). `runs_step0/easy_e3_windows/`; W&B `J1_gru_budget_chunk16_gamma0.99_rs0.1_warm100_s<seed>` and `J1_gru_budget_r2d2_burn16_chunk16_gamma0.99_rs0.1_warm100_s<seed>`. Run times 58 and 69 minutes per run, against 207 for J1 on whole flights.
+
+**Results** (validation, late score, mean ± std across seeds, 95% bootstrap interval):
+
+| Agent (take-off-only version) | Score | Seeds | Flights completed |
+|---|---:|---|---:|
+| True battery (0c) | 254 ± 49 (222–285) | 8 | 85% |
+| J1, whole flights (E3c) | 169 ± 41 (137–201) | 139, 219, 152, 207, 128 | 32% |
+| **J1_chunk** | **138 ± 69** (73–210) | 132, 73, 210 | 39% |
+| **J1_r2d2** | **31 ± 219** (−210–219) | 84, −210, 219 | 28% |
+| No memory (0c_blind) | 158 ± 42 (128–183) | 8 | 24% |
+
+- **Neither beats no memory** (J1_chunk −20, Welch p = 0.68; J1_r2d2 −127, p = 0.42) **or whole flights** (−31, p = 0.53; −138, p = 0.39).
+- **R2D2 is unstable:** seed 1 collapsed to −210 (12 of its 18 validation flights hit the ground); seed 2 completes 15 of 18.
+
+| By starting battery (final validation) | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 |
+|---|---:|---:|---:|---:|---:|---:|
+| Failed flights, true battery | 79% | 12% | 0% | 0% | 0% | 0% |
+| Failed flights, J1 whole flights | 100% | 100% | 87% | 80% | 20% | 20% |
+| Failed flights, J1_chunk | 100% | 100% | 67% | 67% | 33% | 0% |
+| Failed flights, J1_r2d2 | 100% | 67% | 67% | 67% | 67% | 67% |
+| Failed flights, no memory | 100% | 100% | 100% | 100% | 54% | 0% |
+| Mean throttle, true battery | 0.10 | 0.35 | 0.47 | 0.59 | 0.69 | 0.78 |
+| Mean throttle, J1 whole flights | 0.81 | 0.81 | 0.74 | 0.76 | 0.78 | 0.83 |
+| Mean throttle, J1_chunk | 0.86 | 0.77 | 0.67 | 0.67 | 0.65 | 0.66 |
+| Mean throttle, J1_r2d2 | 0.69 | 0.37 | 0.25 | 0.18 | 0.17 | 0.17 |
+| Mean throttle, no memory | 1.00 | 1.00 | 1.00 | 0.96 | 0.89 | 0.87 |
+
+R2D2's validation outcomes per seed: seed 0, 12 battery empty and 6 ground crashes; seed 1, 6 battery empty and 12 ground crashes; seed 2, 15 completed and 3 battery empty.
+
+**Diagnostics** (validation flights only; `runs_step0/easy_e3_windows/diagnostics_validation.json`, `diagnostics_followup.json`; every run reproduces its saved final validation exactly):
+
+| Run | With its estimate | With the true battery | With a fixed 0.45 | Error at hand-over (200 random flights) | Validation flights: at hand-over / after 20 s |
+|---|---:|---:|---:|---:|---|
+| J1_chunk s0 | 133 | 332 | 91 | 0.151 (corr 0.55) | 0.175 / 0.156 |
+| J1_chunk s1 | 134 | 288 | 84 | 0.124 (corr 0.65) | 0.143 / 0.131 |
+| J1_chunk s2 | 224 | 231 | 169 | 0.155 (corr 0.67) | 0.154 / 0.054 |
+| J1_r2d2 s0 | 37 | 43 | 147 | 0.118 (corr 0.85) | 0.118 / 0.048 |
+| J1_r2d2 s1 | −208 | −208 | −208 | 0.111 (corr 0.84) | 0.117 / 0.048 |
+| J1_r2d2 s2 | 182 | 184 | 221 | 0.114 (corr 0.82) | 0.088 / 0.134 |
+| *J1 whole flights (E3c), mean* | *186* | *247* | *79* | *0.052–0.058 (corr 0.93)* | |
+
+- **Plain chunking made the encoder much worse:** 0.12–0.16 off at hand-over against 0.05 with whole flights, and its estimate correlates only 0.55–0.67 with the battery (0.93). From a blank memory every 16 steps it cannot learn to use the 100-step take-off.
+- **But its policies learned to use the battery:** given the true battery they average 284 (332, 288, 231), even above the true-battery agent (254); with their own estimate, 164; with a fixed 0.45, 115. The poor estimate is what sinks them.
+- **R2D2's encoder is better than plain chunking but still twice as far off as with whole flights** (0.11–0.12, correlation 0.82–0.85). The stored memory helps, but backpropagating only 16 steps doesn't teach the encoder to keep the take-off's information for a whole flight.
+- **R2D2's policies don't use the estimate:** the true battery changes nothing (37 → 43, 182 → 184), and a fixed 0.45 scores higher for two seeds (147, 221). Seed 1 collapsed whatever its input, flying with very little throttle (0.17–0.37) and hitting the ground.
+
+**What it means.**
+- **Shorter training windows hurt the one thing that limited end-to-end learning here: the estimate's accuracy.** They make encoder training 3–4 times faster, but the encoder can no longer carry the take-off's information across the flight.
+- **Whole-flight backpropagation stays the right way to train this encoder.** These flights are at most 800 steps, short enough to backpropagate through in full.
+- **The policies can become excellent pilots** (J1_chunk's reach 284 with the true battery): what end-to-end learning still lacks is an accurate estimate. The next tests stay those of E3c: a 7-second take-off (best possible error 0.037 instead of 0.050) or a Gaussian head.
