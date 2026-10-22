@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Contextual PPO (CPPO): SB3 PPO with a recurrent xLSTM context encoder, trained on BatteryPlane in `hidden` observation mode. The agent has to infer its own hidden battery charge `b_t` from the history `[o_t, a_{t-1}]`. The research question is an experiment grid A–F (`GRID_PLAN.md`) comparing point vs. Gaussian context estimates, beta-NLL, variance-as-input, and an auxiliary speed head.
 
+## Branches
+
+`main` holds the hard version, the project page (`docs/`) and the figures (`figures/`). This branch, `easy-env`, also holds the easy version: the take-off and transition options of `battery_plane.py`, the learner's preludes (the encoder reads the take-off before every episode) and its window training (`cppo.supervised.sequence`: whole episodes, plain chunks, R2D2 stored states), their checks and launch options. `EASY_ENV_WARMUP.md` records its plan and results on both branches.
+
 ## Environment and commands
 
 Use the `carlos` conda env (Python 3.11): `conda activate carlos`. The `python` on the default PATH is base anaconda, so it won't work. `carlos` has no pytest. Training runs on CPU.
@@ -23,6 +27,7 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 python evaluate_final
 python evaluate_final_test.py --reports <report_step0 reports> --conditions 0a 0b 2a_ideal 4a_encoder ... --output runs_step0/final_test_all.json --jobs 16   # final test of step 0-4 runs (seeds 2000-2002): validation reproduced first, then each run's grid with the reserved seeds; final_test.json per run, reused
 python -m unittest checks.final_test_checks -v
 python figures/collect_data.py && python figures/make_figures.py   # paper figures: numbers from the saved results into figures/data/ (~3 min), plots into figures/out/
+python figures/make_figures_person.py && python figures/env_snapshots.py   # the project page's figures into figures/out_person/ (env_snapshots copies its PNGs to docs/assets/figures/); Roboto from font-roboto, see requirements.txt
 
 # Config/grid checks (tracked in git)
 python -m unittest checks.grid_checks -v
