@@ -83,7 +83,7 @@ Nothing is running and nothing was changed. I can save this as a plan file if yo
 
 **Question.** Contextual PPO with a learned encoder never beat a memoryless agent: A and J0–J5 on the hard version, J0, J1 and J5 on the easy versions. Is that a property of the problem, or of Contextual PPO's supervised encoder? Standard memory learners, trained end to end by the RL losses alone, answer it.
 
-**Status (2026-10-23):** RecurrentPPO and the windows are done on both versions; see [Results](#results-2026-10-23) at the end. Not run yet: M3 (Contextual PPO with `encoder_objective=rl`), the 10M-step stage and the final test.
+**Status (2026-10-23):** RecurrentPPO and the windows are done on both versions; see [Results](#results-2026-10-23) at the end. Their final test is done too. Not run yet: M3 (Contextual PPO with `encoder_objective=rl`) and the 10M-step stage.
 
 ### The learners
 
@@ -239,7 +239,7 @@ About 4–5 working days in all.
 
 **What was run:** M1a/M1b_lstm (RecurrentPPO) and M2a/M2b_win16/win64 (windows), 8 seeds each, on both versions: 96 runs.
 - **M3 and the 10M-step stage** were not run.
-- **Final test:** not yet; `evaluate_final_test.py` doesn't load these runs yet.
+- **Final test:** done (2026-10-23), see below. `evaluate_final_test.py` now loads RecurrentPPO runs. The take-off version's plain-PPO controls (0a, 0b, 0a_blind, 0b_blind) were final-tested for the first time with them.
 - **Details:** `ENCODER_PLAN.md` ("Standard memory baselines", hard version) and `EASY_ENV_WARMUP.md` ("Memory baselines on the take-off-only version").
 
 **Changes from the plan:**
@@ -265,6 +265,23 @@ About 4–5 working days in all.
 | Take-off only | Window 64 | 46 ± 22 | −81 (p < 0.01) | 56 ± 25 | −122 (p < 0.01) | 13% / 19% | 87% / 81% |
 | Take-off only | True battery | 288 ± 25 | | 245 ± 33 | | 83% / 81% | 10% / 12% |
 
+**Final test** (seeds 2000–2002, flown once; every run first reproduced its validation exactly; mean ± std across 8 seeds; Welch's t-test against no memory):
+
+| Version | Agent | Batch 256 | vs no memory | Batch 1,024 | vs no memory | Completed |
+|---|---|---:|---:|---:|---:|---:|
+| Hard | No memory | 49 ± 45 | — | 118 ± 65 | — | 25% / 17% |
+| Hard | **RecurrentPPO** | **66 ± 81** | +17 (p = 0.61) | **14 ± 1** | −104 (p < 0.01) | 9% / 17% |
+| Hard | Window 16 | 61 ± 58 | +12 (p = 0.65) | 38 ± 43 | −80 (p = 0.01) | 17% / 15% |
+| Hard | Window 64 | 5 ± 51 | −44 (p = 0.09) | −37 ± 108 | −155 (p < 0.01) | 12% / 11% |
+| Hard | True battery | 283 ± 66 | | 280 ± 36 | | 90% / 92% |
+| Take-off only | No memory | 139 ± 53 | — | 203 ± 39 | — | 26% / 31% |
+| Take-off only | **RecurrentPPO** | **23 ± 31** | −116 (p < 0.01) | **67 ± 45** | −137 (p < 0.01) | 8% / 17% |
+| Take-off only | Window 16 | 94 ± 53 | −45 (p = 0.11) | 72 ± 59 | −131 (p < 0.01) | 16% / 10% |
+| Take-off only | Window 64 | 64 ± 57 | −76 (p = 0.02) | 78 ± 45 | −125 (p < 0.01) | 13% / 20% |
+| Take-off only | True battery | 279 ± 28 | | 242 ± 41 | | 83% / 83% |
+
+**The final test confirms validation.** No memory learner beats no memory, and 8 of the 12 comparisons are significantly worse. RecurrentPPO's +17 on the hard version at batch 256 is not significant, and it completes 9% of flights against 25%.
+
 **By the decision rules: the headline generalizes.**
 - **No memory learner beats its no-memory control** on either version. 9 of the 12 comparisons are significantly worse: all at batch 1,024 on the hard version and all on the take-off version. The three at batch 256 on the hard version are level.
 - **RecurrentPPO flies at full throttle at every starting battery** (mean throttle 1.00 in 30 of its 32 runs, 0.97–0.98 in the other two), even when its LSTM reads the take-off that reveals the battery. Its memory changes nothing it does.
@@ -274,6 +291,5 @@ About 4–5 working days in all.
 **Next, if wanted:**
 - the small RecurrentPPO sweep;
 - M3 (Contextual PPO with `encoder_objective=rl`);
-- the 10M-step stage;
-- final-test support for the new runs.
+- the 10M-step stage.
 

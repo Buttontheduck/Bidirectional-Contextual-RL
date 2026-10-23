@@ -94,6 +94,36 @@ class FinalTestChecks(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 E.main(["--grid", str(folder), "--output", str(folder / "other.json")])
 
+    def test_memory_baselines_are_reproduced_then_tested(self):
+        """A RecurrentPPO run and a window run (memory_baselines.py) load with their inputs and reproduce their validation."""
+        from stable_baselines3 import PPO
+
+        from checks.step0_checks import plain_ppo_script
+        from memory_baselines import FusedLstmPolicy, MaskedRecurrentPPO
+
+        torch.set_num_threads(1)
+        script = plain_ppo_script()
+        small = ["training.n_envs=2", "ppo.n_steps=8", "ppo.batch_size=8", "+env.kwargs.T=6", "memory.lstm_hidden_size=8",
+                 "evaluation.reset_grid.eval_initial_battery=[0.3]"]
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            for condition, experiment, algorithm, policy in (("M1a_lstm", "M1a_lstm_bs256", MaskedRecurrentPPO, FusedLstmPolicy),
+                                                             ("M2b_win16", "M2b_win16_bs1024", PPO, "MlpPolicy")):
+                cfg = plain_ppo_config(f"+experiment={experiment}", *small)
+                model = algorithm(policy, script.make_train_env(cfg), n_steps=8, batch_size=8, device="cpu",
+                                  policy_kwargs={"net_arch": [16], **({"lstm_hidden_size": 8} if algorithm is MaskedRecurrentPPO else {})},
+                                  seed=0)
+                model.learn(total_timesteps=32)
+                run_dir = folder / condition
+                run_dir.mkdir()
+                model.save(run_dir / "final_model.zip")
+                OmegaConf.save(cfg, run_dir / "config.yaml", resolve=True)
+                run = {"condition": condition, "seed": 0, "config": str(run_dir / "config.yaml"), "run_directory": str(run_dir),
+                       "late_mean_reward": 1.0, "final_validation": training.evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)}
+                row = E.score_run(run)
+                self.assertTrue(row["final_test"]["validation_reproduced"])
+                self.assertEqual(sorted({r["seed"] for r in row["final_test"]["reset_schedule"]}), [2000, 2001, 2002])
+
 
 if __name__ == "__main__":
     unittest.main()

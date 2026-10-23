@@ -7,7 +7,8 @@ Only this script reads the final-test grid (seeds 2000-2002, config/cppo.yaml fi
     python evaluate_final_test.py --reports <report_step0.py reports> --conditions 0a_blind 0b_blind 4a_encoder 4b_encoder \\
         --output runs_step0/final_test.json
         Step 0-4 runs from their report_step0.py reports: plain PPO with or without a frozen context (a frozen encoder
-        reloads its encoder file) and the Contextual PPO controls, each with its own saved config. Every run is first
+        reloads its encoder file), the memory baselines (RecurrentPPO and history windows, memory_baselines.py) and the
+        Contextual PPO controls, each with its own saved config. Every run is first
         scored again on the validation flights, which must reproduce the report's final validation, so it is exactly
         the model that was reported. Then it is scored on the final-test flights: its validation grid with only the
         seeds replaced by the reserved ones (for a Contextual PPO config that is its final_test grid). Each run keeps
@@ -35,6 +36,7 @@ from omegaconf import OmegaConf
 from main_battery_plane_contextual_ppo import (
     ContextualPPO, configure_cpu_threads, evaluate_schedule, validate_config,
 )
+from memory_baselines import MaskedRecurrentPPO, memory_kind_from
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -71,7 +73,8 @@ def score_run(run: dict) -> dict:
         test = json.loads(report.read_text())
         reused = True
     else:
-        algorithm = ContextualPPO if "cppo" in cfg else PPO
+        # Plain PPO, a RecurrentPPO memory baseline (its window and LSTM inputs come back with the config), or Contextual PPO
+        algorithm = ContextualPPO if "cppo" in cfg else MaskedRecurrentPPO if memory_kind_from(cfg) == "recurrent" else PPO
         model = algorithm.load(directory / "final_model.zip", device="cpu")
         saved = run["final_validation"]
         validation = evaluate_schedule(model, cfg, cfg.evaluation.reset_grid)

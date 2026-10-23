@@ -1731,6 +1731,24 @@ python step2_swap_battery.py --runs runs_step0/frozen_gru_a/runs.json runs_step0
 | Mean throttle, RecurrentPPO (batch 256) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 | Mean throttle, window 16 (batch 256) | 0.93 | 0.94 | 0.94 | 0.94 | 0.94 | 0.93 |
 
+**Final test** (2026-10-23; seeds 2000–2002, flown once with `evaluate_final_test.py`, which now loads RecurrentPPO runs; every run first reproduced its validation exactly; mean ± std across 8 seeds, Welch's t-test against no memory; `runs_step0/memory_hard_fused/final_test_memory_hard.json`):
+
+| Agent (hard version) | Final test | vs no memory | Validation | Completed | Battery empty | Ground crash |
+|---|---:|---:|---:|---:|---:|---:|
+| No memory, batch 256 (0a_blind) | 49 ± 45 | — | 23 | 25% | 75% | 0% |
+| **RecurrentPPO, batch 256** | **66 ± 81** | +17 (p = 0.61) | 21 | 9% | 91% | 0% |
+| Window 16, batch 256 | 61 ± 58 | +12 (p = 0.65) | 30 | 17% | 83% | 0% |
+| Window 64, batch 256 | 5 ± 51 | −44 (p = 0.09) | −7 | 12% | 81% | 8% |
+| No memory, batch 1,024 (0b_blind) | 118 ± 65 | — | 77 | 17% | 83% | 0% |
+| **RecurrentPPO, batch 1,024** | **14 ± 1** | −104 (p < 0.01) | −7 | 17% | 83% | 0% |
+| Window 16, batch 1,024 | 38 ± 43 | −80 (p = 0.01) | 21 | 15% | 85% | 0% |
+| Window 64, batch 1,024 | −37 ± 108 | −155 (p < 0.01) | −56 | 11% | 83% | 6% |
+| True battery, batch 256 / 1,024 (0a / 0b) | 283 / 280 | — | 246 / 258 | 90% / 92% | 4% / 1% | 6% / 7% |
+
+- **The validation picture holds.** No memory learner beats no memory. RecurrentPPO's +17 at batch 256 is not significant, and it completes 9% of flights against 25%: it collects reward by flying flat out until the battery dies.
+- **RecurrentPPO at batch 1,024 scores 14 ± 1:** all 8 seeds learned the same full-throttle flight.
+- **The take-off version's final test** is in `EASY_ENV_WARMUP.md`: every memory learner is below no memory there, five of six significantly.
+
 **What it means.**
 - **Neither standard memory learner uses its memory.**
   - RecurrentPPO flies at full throttle until the battery runs out: the "always sprint" rule of the design report. Its mean throttle is 1.00 in 14 of the 16 runs and 0.97–0.98 in the other two, at every starting battery.
@@ -1741,8 +1759,7 @@ python step2_swap_battery.py --runs runs_step0/frozen_gru_a/runs.json runs_step0
 - **Open:**
   - a small RecurrentPPO sweep (it was not tuned beyond sb3-contrib's defaults and step 0's PPO settings);
   - Contextual PPO with `encoder_objective=rl`;
-  - the 10M-step stage;
-  - the final test (`evaluate_final_test.py` doesn't load these runs yet).
+  - the 10M-step stage.
 
 ## Next steps
 
