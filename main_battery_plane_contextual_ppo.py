@@ -59,6 +59,8 @@ from flight_logging import (  # noqa: E402
     FlightLoggingEvalCallback, GradNormLogger, RolloutFlightLogger, evaluate_flights, log_final_flights, terminal_outcome,
 )
 from context_wrapper import context_source_from as frozen_context_source, wrap_context  # noqa: E402
+# A plain-PPO memory baseline's input, for its final validation in report_step0.py (none for every CPPO config)
+from memory_baselines import memory_wrapper_from  # noqa: E402
 from step0_oracle import NoContextPolicy, TrueBatteryPolicy  # noqa: E402
 from step1_controls import (  # noqa: E402
     FLIGHT_PROFILES, BatteryNoiseSwitch, battery_noise_at, make_noisy_battery, switch_source_mismatches,
@@ -267,6 +269,10 @@ def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]], 
     noise = battery_noise_from(cfg) if battery_noise is None else battery_noise
     # The noisy oracle's noise sits inside the scheduler, which reseeds it with every validation flight's seed
     observed = make_noisy_battery(raw_env, cfg, noise) if noise > 0 else raw_env
+    # A plain-PPO memory baseline (memory_baselines.py, for report_step0.py) reads its window or LSTM input, as in training
+    memory = memory_wrapper_from(cfg)
+    if memory is not None:
+        observed = memory(observed)
     scheduler = ScheduledEvalResets(observed, reset_schedule)
     env = Monitor(scheduler)
     env.action_space.seed(int(cfg.training.seed) + 1)

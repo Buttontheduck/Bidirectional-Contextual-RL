@@ -117,6 +117,24 @@ context:
   # encoder: the encoder's name in the W&B names of the step 4 frozen-encoder runs (S4a/S4b_encoder; run_step0.py sets it)
   encoder_tag: null
 
+memory:
+  # The memory baselines (PAPER_ASSESSMENT.md, Tier 1 item 1; memory_baselines.py), from scratch on the plain observation:
+  #   none       plain PPO on the observation (p01-p04, steps 0-4)
+  #   window     plain PPO on the last `window` steps of [o_t, a_{t-1}, valid] as one flat input (HistoryWindow); on the
+  #              easy version the window starts filled with the take-off
+  #   recurrent  sb3-contrib's RecurrentPPO (ppo.policy=MlpLstmPolicy), its LSTM reading [o_t, a_{t-1}] (RecurrentInput);
+  #              on the easy version the take-off is replayed as the first steps of every episode, masked out of the losses
+  kind: none
+  window: 16
+  # recurrent: sb3-contrib's defaults, an LSTM of 256 for the actor and another for the critic, then ppo.net_arch
+  lstm_hidden_size: 256
+  n_lstm_layers: 1
+  enable_critic_lstm: true
+  shared_lstm: false
+  # recurrent: run the LSTM over each training sequence in one call (memory_baselines.FusedLstmPolicy): the same
+  # computation as sb3-contrib's step-by-step loop, 10-30 times faster; false = sb3-contrib's own MlpLstmPolicy
+  fused_lstm: true
+
 evaluation:
   # In ENVIRONMENT steps, exactly like the SAC config (the script converts it to SB3's
   # per-call frequency internally). Each evaluation is 18 episodes x 700 steps = 12,600 steps
