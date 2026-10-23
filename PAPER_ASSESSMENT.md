@@ -293,3 +293,22 @@ About 4–5 working days in all.
 - M3 (Contextual PPO with `encoder_objective=rl`);
 - the 10M-step stage.
 
+## Out-of-distribution evaluation (Tier 2, item 10; 2026-10-23)
+
+**Done on the hard version.** 120 frozen agents: the README's table plus the memory baselines. Nothing trains.
+- **Settings:**
+  - shifted speed noise (0, 10);
+  - battery capacity (85, 120 hover-seconds);
+  - motor thrust cap (±1 m/s²);
+  - a starting-battery sweep 0.10–0.19 and 0.71–1.00.
+- **Seeds:** 3000–3004, never the validation or final-test seeds.
+- **Fixed estimates keep the training physics.** Every run first reproduced its validation exactly.
+- **Details and full tables:** `ENCODER_PLAN.md` ("Out-of-distribution evaluation").
+
+**Main results:**
+- **The true battery generalizes:** Contextual PPO and plain PPO with it lose 46–61 points on a battery that drains 18% faster and still complete 83–86% of flights.
+- **The end-to-end learners don't adapt.** That is Contextual PPO's A and J1, RecurrentPPO and no memory: a faster-draining battery collapses them to 0–6% of flights completed, and below a starting battery of 0.2 they save no flight.
+- **The decoupled method's weakness:** T1 (305 in distribution) falls to 101–130 with a 1 m/s² stronger motor, completing 5–15% of flights. Its encoder learned the training physics. The ideal-estimate agents lose 38–40% of their flights there too, and 116–138 points with a weaker motor.
+- **Starting battery is a weak axis, as expected:** no cliff at the range's edges, nearly nobody saved below 0.15, nearly everyone completes above 0.7.
+
+**For the paper:** an honest limitation of the decoupled method (frozen encoders trained under one physics), and a natural next experiment: train the encoder on varied physics (capacity and motor drawn per flight) and repeat this evaluation.

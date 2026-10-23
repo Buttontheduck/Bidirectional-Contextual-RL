@@ -311,6 +311,11 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. 
   - RecurrentPPO flies at full throttle at every starting battery, and the windows also fly the same at every battery.
 
   Details are in `ENCODER_PLAN.md` and `EASY_ENV_WARMUP.md`, the plan in `PAPER_ASSESSMENT.md`.
+- **Out of distribution (2026-10-23).** 120 frozen agents flown under shifted physics, speed noise and starting batteries (`ood_evaluation.py`; `ENCODER_PLAN.md`, "Out-of-distribution evaluation"):
+  - the agents with the true battery generalize best;
+  - agents without battery information, Contextual PPO's learned encoders included, don't adapt: the physics carries them;
+  - the frozen teacher-trained GRU (T1), the best agent in distribution, collapses with a 1 m/s² stronger motor (5–15% of flights completed);
+  - starting batteries just outside 0.2–0.7 show no cliff, and only agents with battery information save any flight below 0.2.
 - **A likely reason A failed, not tested directly:** inside Contextual PPO the encoder got about 1,950 supervised steps of 16 episodes (A–F, 1M steps), or 3,900 (the A rerun, 2M). It trained on its own clock-like flights. That is less training, on narrower data, than the offline encoders needed before their click (about 4,300–5,200 steps of 32 varied flights).
 
 **Why, from the step 1 controls**, which replace the encoder with the true battery plus controlled noise:
