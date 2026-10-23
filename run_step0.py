@@ -26,6 +26,8 @@ up to one run per physical core (--jobs) and 2 threads per run (--threads).
     python run_step0.py --conditions J0 J1 J2 J3 --seeds 0 1 2 3 4 --jobs 20 --threads 1   # joint training with a GRU encoder (also J4, J5)
     python run_step0.py --conditions 4a_encoder 4b_encoder --encoder-models runs_encoder/step4_grid/E1_gru_point_main_s1/encoder.pt \
         --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1      # step 4: plain PPO with a frozen learned encoder, once per model
+    python run_step0.py --conditions M2a_win16 M2b_win16 M2a_win64 M2b_win64 M1a_lstm M1b_lstm --seeds 0 1 2 3 4 5 6 7 \
+        --jobs 16 --threads 1                               # memory baselines: windows of 16 / 64 steps, RecurrentPPO (LSTM)
 
 Each launch gets its own folder runs_step0/<time>/ with one log per run (0a_s0.log, ...) and runs.json, which maps
 every run to its run directory (runs_ppo/<id>/ or runs_cppo/<id>/). At the end the launcher prints the
@@ -94,6 +96,14 @@ CONDITIONS = {
     "J5": ("main_battery_plane_contextual_ppo.py", "+joint=J5_gru_budget_warmup", "cppo"),
     "4a_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4a_encoder_bs256", "ppo"),
     "4b_encoder": ("ppo/main_battery_plane_ppo.py", "+experiment=S4b_encoder_bs1024", "ppo"),
+    # Memory baselines (PAPER_ASSESSMENT.md, Tier 1 item 1): 0a_blind / 0b_blind with sb3-contrib's RecurrentPPO (an LSTM)
+    # or with a window of the last 16 or 64 steps (memory_baselines.py)
+    "M1a_lstm": ("ppo/main_battery_plane_ppo.py", "+experiment=M1a_lstm_bs256", "ppo"),
+    "M1b_lstm": ("ppo/main_battery_plane_ppo.py", "+experiment=M1b_lstm_bs1024", "ppo"),
+    "M2a_win16": ("ppo/main_battery_plane_ppo.py", "+experiment=M2a_win16_bs256", "ppo"),
+    "M2b_win16": ("ppo/main_battery_plane_ppo.py", "+experiment=M2b_win16_bs1024", "ppo"),
+    "M2a_win64": ("ppo/main_battery_plane_ppo.py", "+experiment=M2a_win64_bs256", "ppo"),
+    "M2b_win64": ("ppo/main_battery_plane_ppo.py", "+experiment=M2b_win64_bs1024", "ppo"),
 }
 # Extra overrides of a condition (the in-flight configs default to the sharp profile)
 CONDITION_OVERRIDES = {name: ["env.battery_noise_flight=linear"] for name in ("1a_linear", "1b_linear", "1c_linear")}
@@ -110,6 +120,8 @@ IDEAL_CONDITIONS = {"2a_ideal": "ideal", "2b_ideal": "ideal", "2a_ideal_std": "i
 ENCODER_CONDITIONS = ["4a_encoder", "4b_encoder"]
 # Joint training with a GRU encoder (config/joint/): each rung in a report of its own (their settings differ)
 JOINT_CONDITIONS = [name for name in CONDITIONS if name.startswith("J")]
+# Memory baselines: each condition in a report of its own (their inputs differ)
+MEMORY_CONDITIONS = [name for name in CONDITIONS if name.startswith("M")]
 # Installation check: two rollouts and two evaluations per run (keys shared by both training scripts)
 SMOKE_OVERRIDES = ["training.total_timesteps=8192", "evaluation.frequency=4096", "evaluation.plots.frequency=8192",
                    "checkpoint.frequency=8192"]
@@ -426,9 +438,12 @@ def report_commands(done: list[dict], scales: list, noises: list, output: Path) 
             return f"encoder_{result['encoder_tag']}"
         if condition in JOINT_CONDITIONS:
             return f"joint_{condition}"
+        if condition in MEMORY_CONDITIONS:
+            return f"memory_{condition}"
         return IDEAL_CONDITIONS.get(condition)
 
-    encoder_variants = sorted({variant(r) for r in done if r["condition"] in ENCODER_CONDITIONS + JOINT_CONDITIONS})
+    encoder_variants = sorted({variant(r) for r in done
+                               if r["condition"] in ENCODER_CONDITIONS + JOINT_CONDITIONS + MEMORY_CONDITIONS})
     lines = []
     for scale in scales:
         for noise in noises:
@@ -451,7 +466,8 @@ def report_command(group: list[dict], scale, noise, flight, output: Path) -> str
     if flight is not None:
         labels.append({"ideal": "ideal context", "ideal_std": "ideal context with its std"}.get(
             flight, f"frozen encoder {flight[len('encoder_'):]}" if flight.startswith("encoder_")
-            else f"joint training {flight[len('joint_'):]}" if flight.startswith("joint_") else f"{flight} in-flight noise"))
+            else f"joint training {flight[len('joint_'):]}" if flight.startswith("joint_")
+            else f"memory baseline {flight[len('memory_'):]}" if flight.startswith("memory_") else f"{flight} in-flight noise"))
         suffix += f"_{flight}"
     label = f" ({', '.join(labels)})" if labels else ""
     report = " ".join(f"--run {r['condition']} {r['run_dir']}/config.yaml {r['run_dir']}" for r in group)

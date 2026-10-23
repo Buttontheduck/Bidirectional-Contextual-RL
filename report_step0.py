@@ -13,6 +13,10 @@ env.battery_noise_until (500k), then the true battery; scored like step 0, the f
 estimate (and its std) appended to the observation; each variant in a report of its own.
 J0-J5 are the joint-training rungs (config/joint/): Contextual_PPO with a GRU encoder (cppo.encoder_arch=gru) trained
 together with the policy at the A rerun's settings, each in a report of its own.
+M1a_lstm, M1b_lstm, M2a_win16, M2b_win16, M2a_win64, M2b_win64 are the memory baselines (PAPER_ASSESSMENT.md, Tier 1
+item 1; memory_baselines.py): 0a_blind / 0b_blind with sb3-contrib's RecurrentPPO (an LSTM reading [o_t, a_{t-1}]) or
+with a window of the last 16 or 64 steps; each in a report of its own. On the easy version RecurrentPPO replays the
+take-off as the first steps of every episode, so its steps and validations scale by (take-off + T) / T ("replay").
 4a_encoder, 4b_encoder are step 4's frozen encoders: plain PPO in hidden mode (0a / 0b's learner) with a learned
 encoder's battery estimate appended to the observation (context.encoder_model); each encoder in a report of its own.
 0a_blind, 0b_blind, 0c_blind are the memoryless controls: 0a, 0b, 0c in hidden mode, without the battery and without
@@ -41,12 +45,14 @@ import torch
 
 from context_wrapper import context_protocol
 import main_battery_plane_contextual_ppo as training
+from memory_baselines import MaskedRecurrentPPO, memory_kind_from
 from contextual_ppo.torch_layers import GRURolloutEncoder, XLSTMRolloutEncoder
 
 
 CONDITIONS = ("0a", "0b", "0c", "A", "1a", "1b", "1c", "1a_switch", "1b_switch", "1c_switch", "1a_early", "1b_early", "1c_early",
               "1a_sharp", "1b_sharp", "1c_sharp", "1a_linear", "1b_linear", "1c_linear", "0a_blind", "0b_blind", "0c_blind",
-              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std", "4a_encoder", "4b_encoder", "J0", "J1", "J2", "J3", "J4", "J5")
+              "2a_ideal", "2b_ideal", "2a_ideal_std", "2b_ideal_std", "4a_encoder", "4b_encoder", "J0", "J1", "J2", "J3", "J4", "J5",
+              "M1a_lstm", "M1b_lstm", "M2a_win16", "M2b_win16", "M2a_win64", "M2b_win64")
 # Joint training with a GRU encoder: hidden mode, Contextual_PPO's learned encoder, like A but with the GRU
 JOINT = ("J0", "J1", "J2", "J3", "J4", "J5")
 # Memoryless controls: the step 0 run each condition repeats in hidden mode, without the battery and without memory
@@ -56,6 +62,10 @@ BLIND = {"0a_blind": "0a", "0b_blind": "0b", "0c_blind": "0c"}
 IDEAL_CONTEXT = {"2a_ideal": ("0a", False), "2b_ideal": ("0b", False), "2a_ideal_std": ("0a", True), "2b_ideal_std": ("0b", True)}
 # Step 4's frozen encoders: the step 0 learner each condition uses in hidden mode, with a learned encoder's estimate appended
 ENCODER_CONTEXT = {"4a_encoder": "0a", "4b_encoder": "0b"}
+# Memory baselines: the step 0 learner each condition uses in hidden mode, its memory (memory.kind) and window
+MEMORY = {"M1a_lstm": ("0a", "recurrent", None), "M1b_lstm": ("0b", "recurrent", None),
+          "M2a_win16": ("0a", "window", 16), "M2b_win16": ("0b", "window", 16),
+          "M2a_win64": ("0a", "window", 64), "M2b_win64": ("0b", "window", 64)}
 # Step 1's noisy oracle: the step 0 run each condition repeats with noise on the battery
 NOISY_REPEATS = {"1a": "0a", "1b": "0b", "1c": "0c"}
 # Step 1's late switch: the step 0 run whose final model each condition keeps training
@@ -71,6 +81,22 @@ SCHEDULES = {
     "step0": {"total": 2_000_000, "late": (1_500_000, 2_000_000), "final": 2_002_944},
     "switch": {"total": 1_000_000, "late": (500_000, 1_000_000), "final": 1_003_520},
 }
+MISSION_STEPS = 700   # battery_plane.py's T
+
+
+def schedule_from(name: str, prelude_steps: int = 0) -> dict:
+    """
+    A schedule with its evaluation frequency. "replay": a RecurrentPPO run on the easy version, whose replayed take-off
+    counts as steps (run_step0.replay_schedule): every count scales by (prelude + T) / T, still 40 evaluations, the late
+    window the last 11 of them.
+    """
+    if name != "replay":
+        return {**SCHEDULES[name], "frequency": EVAL_FREQUENCY}
+    frequency = round(EVAL_FREQUENCY * (prelude_steps + MISSION_STEPS) / MISSION_STEPS / 8) * 8
+    total = 40 * frequency
+    return {"total": total, "late": (30 * frequency, total), "final": -(-total // 4096) * 4096, "frequency": frequency}
+
+
 LATE_START, LATE_END = SCHEDULES["step0"]["late"]
 EXPECTED_LATE_STEPS = np.arange(LATE_START, LATE_END + 1, EVAL_FREQUENCY)
 FINAL_TIMESTEPS = SCHEDULES["step0"]["final"]
@@ -98,6 +124,8 @@ def run_kind(condition: str) -> str:
         return ENCODER_CONTEXT[condition]
     if condition in JOINT:
         return "J"
+    if condition in MEMORY:
+        return MEMORY[condition][0]
     return (NOISY_REPEATS.get(condition) or SWITCH_SOURCES.get(condition) or EARLY_NOISE.get(condition)
             or BLIND.get(condition) or condition)
 
@@ -133,24 +161,38 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     if (until is not None) != (condition in EARLY_NOISE):
         raise ValueError(f"{condition} " + ("requires env.battery_noise_until (noise first, then the true battery)"
                                             if condition in EARLY_NOISE else "must not switch the battery noise off"))
-    # A late switch continues a saved step 0 model (noise 0 is its control); every other run starts from scratch
-    schedule = "switch" if condition in SWITCH_SOURCES else "step0"
+    # A memory baseline reads a window of past steps or has an LSTM (memory_baselines.py); every other run neither
+    memory = memory_kind_from(cfg)
+    if condition in MEMORY:
+        _, expected_memory, window = MEMORY[condition]
+        if memory != expected_memory or (window is not None and int(cfg.memory.window) != window):
+            raise ValueError(f"{condition} requires memory.kind={expected_memory}" + (f" with memory.window={window}" if window else ""))
+    elif memory != "none":
+        raise ValueError(f"{condition} requires no memory (memory.kind=none)")
+    probe = training.bp.BatteryPlaneEnv(observation_mode=cfg.env.observation_mode, **training.env_kwargs_from(cfg))
+    prelude_steps = int(getattr(probe.core, "prelude_steps", 0))
+    probe.close()
+    # A late switch continues a saved step 0 model (noise 0 is its control); every other run starts from scratch. A
+    # RecurrentPPO run on the easy version counts its replayed take-off as steps
+    schedule = ("switch" if condition in SWITCH_SOURCES
+                else "replay" if memory == "recurrent" and prelude_steps > 0 else "step0")
+    timing = schedule_from(schedule, prelude_steps)
     continues = cfg.training.get("init_model") not in (None, "REQUIRED")
     if continues != (schedule == "switch"):
         raise ValueError(f"{condition} " + ("must continue a saved step 0 model (training.init_model)" if schedule == "switch"
                                             else "must start from scratch (no training.init_model)"))
     # A, the memoryless controls and the ideal context see no battery
     mode = ("hidden" if kind in ("A", "J") or condition in BLIND or condition in IDEAL_CONTEXT or condition in ENCODER_CONTEXT
-            else "observed")
+            or condition in MEMORY else "observed")
     if cfg.env.observation_mode != mode:
         raise ValueError(f"Step 0 requires env.observation_mode={mode} for {condition}")
-    if not cfg.evaluation.deterministic or int(cfg.evaluation.frequency) != EVAL_FREQUENCY:
-        raise ValueError("Step 0 requires deterministic evaluation every 50,000 transitions")
+    if not cfg.evaluation.deterministic or int(cfg.evaluation.frequency) != timing["frequency"]:
+        raise ValueError(f"Step 0 requires deterministic evaluation every {timing['frequency']:,} transitions")
     grid = OmegaConf.to_container(cfg.evaluation.reset_grid, resolve=True)
     if {key: grid.get(key) for key in VALIDATION_GRID} != VALIDATION_GRID:
         raise ValueError("Step 0 requires the fixed validation grid (1000–1002, battery 0.2–0.7, noise 5)")
-    if int(cfg.training.total_timesteps) != SCHEDULES[schedule]["total"]:
-        raise ValueError(f"{condition} requires {SCHEDULES[schedule]['total']:,} requested training transitions")
+    if int(cfg.training.total_timesteps) != timing["total"]:
+        raise ValueError(f"{condition} requires {timing['total']:,} requested training transitions")
     if int(cfg.training.n_envs) != 8:
         raise ValueError("Step 0 requires eight training environments")
     if kind == "0c":
@@ -192,18 +234,26 @@ def evaluation_protocol(cfg, condition: str) -> dict:
     settings = OmegaConf.to_container(learner, resolve=True)
     # Configs from before reward_scale trained on unscaled rewards
     settings.setdefault("reward_scale", 1.0)
+    memory_settings = None if memory == "none" else (
+        {"kind": memory, "window": int(cfg.memory.window)} if memory == "window" else
+        {"kind": memory, **{key: OmegaConf.to_container(cfg.memory, resolve=True)[key]
+                            for key in ("lstm_hidden_size", "n_lstm_layers", "enable_critic_lstm", "shared_lstm")},
+         # Runs from before the fused LSTM used sb3-contrib's loop
+         "fused_lstm": bool(cfg.memory.get("fused_lstm", False))})
     return {"environment": effective_env, "context": context, "battery_noise": noise, "battery_noise_until": until,
             "battery_noise_flight": flight,
             "battery_noise_flight_step": cfg.env.get("battery_noise_flight_step") if flight else None, "schedule": schedule,
-            "reset_grid": VALIDATION_GRID,
-            "deterministic": True, "frequency": EVAL_FREQUENCY,
+            "prelude_steps": prelude_steps, "reset_grid": VALIDATION_GRID,
+            "deterministic": True, "frequency": timing["frequency"],
+            **({} if memory_settings is None else {"memory": memory_settings}),
             "shared_ppo_settings": {key: settings[key] for key in SHARED_PPO_SETTINGS}}
 
 
-def summarize_curve(path: Path, n_episodes: int = 18, schedule: str = "step0") -> dict:
+def summarize_curve(path: Path, n_episodes: int = 18, schedule: str = "step0", prelude_steps: int = 0) -> dict:
     """Average the 11 scheduled late validation means of the schedule's window, including both endpoints."""
-    late_start, late_end = SCHEDULES[schedule]["late"]
-    expected = np.arange(late_start, late_end + 1, EVAL_FREQUENCY)
+    timing = schedule_from(schedule, prelude_steps)
+    late_start, late_end = timing["late"]
+    expected = np.arange(late_start, late_end + 1, timing["frequency"])
     with np.load(path, allow_pickle=False) as saved:
         timesteps = np.asarray(saved["timesteps"])
         rewards = np.asarray(saved["results"])
@@ -220,7 +270,8 @@ def summarize_curve(path: Path, n_episodes: int = 18, schedule: str = "step0") -
         raise ValueError(f"Non-finite returns or invalid episode lengths: {path}")
     late = (timesteps >= late_start) & (timesteps <= late_end)
     if not np.array_equal(timesteps[late], expected):
-        raise ValueError(f"Need every 50k evaluation from {late_start:,} through {late_end:,} ({len(expected)} points): {path}")
+        raise ValueError(f"Need every {timing['frequency']:,}-step evaluation from {late_start:,} through {late_end:,} "
+                         f"({len(expected)} points): {path}")
     means = rewards.mean(axis=1)
     return {
         "late_mean_reward": float(means[late].mean()),
@@ -277,15 +328,18 @@ def main() -> None:
         checkpoint = directory / "final_model.zip"
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
-        curve = summarize_curve(directory / "eval" / "evaluations.npz", schedule=candidate["schedule"])
+        curve = summarize_curve(directory / "eval" / "evaluations.npz", schedule=candidate["schedule"],
+                                prelude_steps=candidate["prelude_steps"])
         prepared.append((condition, config_path, directory, cfg, curve))
 
     torch.set_num_threads(1)
     runs = []
     for condition, config_path, directory, cfg, curve in prepared:
-        algorithm = training.ContextualPPO if "cppo" in cfg else PPO
+        algorithm = (training.ContextualPPO if "cppo" in cfg
+                     else MaskedRecurrentPPO if memory_kind_from(cfg) == "recurrent" else PPO)
         model = algorithm.load(directory / "final_model.zip", device="cpu")
-        if model.num_timesteps != SCHEDULES[protocol["schedule"]]["final"] or model.seed != int(cfg.training.seed):
+        timing = schedule_from(protocol["schedule"], protocol["prelude_steps"])
+        if model.num_timesteps != timing["final"] or model.seed != int(cfg.training.seed):
             raise ValueError(f"Checkpoint training duration or seed does not match the supplied config: {directory}")
         if (model.n_envs, model.n_steps, model.n_epochs) != (8, 512, 10):
             raise ValueError(f"Checkpoint rollout/epoch settings do not match Step 0: {directory}")
@@ -309,10 +363,10 @@ def main() -> None:
                      **curve, "final_validation": validation})
         print(f"{condition} seed {cfg.training.seed}: late={curve['late_mean_reward']:.3f}, "
               f"final={validation['mean_reward']:.3f}")
-    late_start, late_end = SCHEDULES[protocol["schedule"]]["late"]
+    late_start, late_end = timing["late"]
     report = {
         "scoring": {"start": late_start, "end": late_end, "endpoints_inclusive": True,
-                    "evaluations_per_seed": len(range(late_start, late_end + 1, EVAL_FREQUENCY)),
+                    "evaluations_per_seed": len(range(late_start, late_end + 1, timing["frequency"])),
                     "criterion": "Mean of scheduled validation episode-return means; equal weight per training seed",
                     "spread": "Population standard deviation across supplied training seeds",
                     "outcomes": "Final-checkpoint validation only; battery-empty takes precedence over simultaneous ground contact"},

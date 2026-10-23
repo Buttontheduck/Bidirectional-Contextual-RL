@@ -1,0 +1,15 @@
+# @package _global_
+# Memory baseline M2a (PAPER_ASSESSMENT.md, Tier 1 item 1): plain PPO reading the last 64 steps of [o_t, a_{t-1}, valid] as
+# one flat input (no memory beyond the window), at 0a_blind's settings (hidden mode, minibatches of 256).
+#
+#   python run_step0.py --conditions M2a_win16 M2b_win16 M2a_win64 M2b_win64 --seeds 0 1 2 3 4 5 6 7 --jobs 32 --threads 1
+defaults:
+  - /experiment/S0a_blind_bs256
+  - _self_
+memory:
+  kind: window
+  window: 64
+wandb:
+  run_name: M2a_win${memory.window}_bs256_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}_s${training.seed}
+  group: M2a_win${memory.window}_bs256_gamma${ppo.gamma}_rs${ppo.reward_scale}${wandb.study}
+  tags: [ppo, memory_baseline, window]

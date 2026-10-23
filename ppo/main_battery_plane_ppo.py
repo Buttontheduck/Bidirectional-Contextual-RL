@@ -60,6 +60,8 @@ from context_wrapper import context_source_from, validate_context, wrap_context 
 from step1_controls import (  # noqa: E402
     FLIGHT_PROFILES, BatteryNoiseSwitch, battery_noise_at, make_noisy_battery, switch_source_mismatches,
 )
+# The memory baselines (PAPER_ASSESSMENT.md, Tier 1 item 1): a window of past steps, or sb3-contrib's RecurrentPPO
+from memory_baselines import FusedLstmPolicy, MaskedRecurrentPPO, memory_kind_from, memory_wrapper_from, prelude_steps  # noqa: E402
 
 ACTIVATIONS = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
 
@@ -147,6 +149,7 @@ def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | 
     base_seed = int(cfg.training.seed)
     reward_scale = float(cfg.ppo.get("reward_scale", 1.0))
     battery_noise = float(cfg.env.get("battery_noise", 0.0))
+    memory = memory_wrapper_from(cfg)
 
     def factory(index: int):
         def _init() -> gym.Env:
@@ -155,6 +158,9 @@ def make_train_env(cfg: DictConfig, env_wrapper: Callable[[gym.Env], gym.Env] | 
                 env = make_noisy_battery(env, cfg, battery_noise)
             if env_wrapper is not None:
                 env = env_wrapper(env)
+            # cfg.memory: a window of past steps or RecurrentPPO's input [o_t, a_{t-1}] (memory_baselines.py)
+            if memory is not None:
+                env = memory(env)
             env = Monitor(env)
             if reward_scale != 1.0:
                 env = TransformReward(env, lambda reward: reward_scale * reward)
@@ -182,6 +188,10 @@ def make_eval_env(cfg: DictConfig, reset_schedule: Sequence[Mapping[str, Any]], 
     # The noisy oracle's noise sits inside the scheduler, which reseeds it with every validation flight's seed
     battery_noise = float(cfg.env.get("battery_noise", 0.0)) if battery_noise is None else battery_noise
     observed = make_noisy_battery(raw_env, cfg, battery_noise) if battery_noise > 0 else raw_env
+    # The same memory input as in training, inside the scheduler, whose seeds and options reach the plane
+    memory = memory_wrapper_from(cfg)
+    if memory is not None:
+        observed = memory(observed)
     scheduler = ScheduledEvalResets(observed, reset_schedule)
     env = Monitor(scheduler)
     env.action_space.seed(int(cfg.training.seed) + 1)
@@ -284,6 +294,28 @@ def validate_ppo(cfg: DictConfig) -> None:
         raise ValueError("Training and evaluation seeds must be disjoint")
     initial_model_from(cfg)   # a late switch must name the model it continues
     validate_context(cfg, env_kwargs_from(cfg))
+    validate_memory(cfg)
+
+
+def validate_memory(cfg: DictConfig) -> None:
+    """cfg.memory (memory_baselines.py): the memory baselines start from scratch on the plain observation."""
+    kind = memory_kind_from(cfg)
+    recurrent = str(cfg.ppo.policy) == "MlpLstmPolicy"
+    if recurrent != (kind == "recurrent"):
+        raise ValueError("memory.kind=recurrent goes with ppo.policy=MlpLstmPolicy (sb3-contrib's RecurrentPPO), and only with it")
+    if kind == "none":
+        return
+    if context_source_from(cfg) != "none" or float(cfg.env.get("battery_noise", 0.0)) > 0:
+        raise ValueError(f"memory.kind={kind} reads the plain observation: it needs context.source=none and no battery noise")
+    if initial_model_from(cfg) is not None:
+        raise ValueError(f"memory.kind={kind} starts from scratch (no training.init_model)")
+    keys = ("memory.window",) if kind == "window" else ("memory.lstm_hidden_size", "memory.n_lstm_layers")
+    for key in keys:
+        value = OmegaConf.select(cfg, key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} must be a positive integer, got {value!r}")
+    if kind == "recurrent" and not isinstance(cfg.memory.get("fused_lstm"), bool):
+        raise ValueError("memory.fused_lstm must be true (FusedLstmPolicy) or false (sb3-contrib's step-by-step loop)")
 
 
 def initial_model_from(cfg: DictConfig) -> Path | None:
@@ -375,9 +407,12 @@ def main(cfg: DictConfig) -> None:
         f" | eval episodes: {len(eval_reset_schedule)}"
         f" | gamma={cfg.ppo.gamma} reward_scale={cfg.ppo.get('reward_scale', 1.0)} battery_noise={cfg.env.get('battery_noise', 0.0)}"
         f" until={cfg.env.get('battery_noise_until')} flight={cfg.env.get('battery_noise_flight')}"
-        f" | context={context_source_from(cfg)} (observation width {train_env.observation_space.shape[0]})"
+        f" | context={context_source_from(cfg)} memory={memory_kind_from(cfg)}"
+        f" (observation width {train_env.observation_space.shape[0]})"
     )
-    run.config.update({"effective_env": core._kw, "algorithm": "PPO", "torch_threads": torch.get_num_threads(),
+    recurrent = memory_kind_from(cfg) == "recurrent"
+    run.config.update({"effective_env": core._kw, "algorithm": "RecurrentPPO" if recurrent else "PPO",
+                       "torch_threads": torch.get_num_threads(),
                        "init_model": None if initial_model_from(cfg) is None else str(initial_model_from(cfg)),
                        "torch_interop_threads": torch.get_num_interop_threads()}, allow_val_change=True)
 
@@ -390,9 +425,21 @@ def main(cfg: DictConfig) -> None:
     }
 
     initial_model = initial_model_from(cfg)
+    algorithm_kwargs = {}
+    if recurrent:
+        # sb3-contrib's RecurrentPPO: an LSTM for the actor and one for the critic (memory.*), then net_arch. On the easy
+        # version the replayed take-off's steps are masked out of the losses through the last input (autopilot)
+        policy_kwargs.update(lstm_hidden_size=int(cfg.memory.lstm_hidden_size), n_lstm_layers=int(cfg.memory.n_lstm_layers),
+                             enable_critic_lstm=bool(cfg.memory.enable_critic_lstm), shared_lstm=bool(cfg.memory.shared_lstm))
+        width = train_env.observation_space.shape[0]
+        algorithm_kwargs["autopilot_index"] = width - 1 if prelude_steps(raw_eval_env) else None
+        print(f"  RecurrentPPO | LSTM {cfg.memory.lstm_hidden_size} x {cfg.memory.n_lstm_layers}"
+              f" | take-off replayed and masked: {algorithm_kwargs['autopilot_index'] is not None}"
+              f" | fused LSTM: {bool(cfg.memory.fused_lstm)}")
     if initial_model is None:
-        model = PPO(
-            policy=cfg.ppo.policy,
+        model = (MaskedRecurrentPPO if recurrent else PPO)(
+            # MlpLstmPolicy, or the same policy with each sequence run in one LSTM call (memory.fused_lstm)
+            policy=FusedLstmPolicy if recurrent and cfg.memory.fused_lstm else cfg.ppo.policy,
             env=train_env,
             learning_rate=cfg.ppo.learning_rate,
             n_steps=int(cfg.ppo.n_steps),
@@ -412,6 +459,7 @@ def main(cfg: DictConfig) -> None:
             seed=int(cfg.training.seed),
             device=cfg.training.device,
             verbose=int(cfg.ppo.verbose),
+            **algorithm_kwargs,
         )
     else:
         model = load_initial_model(cfg, train_env, initial_model, str(run_dir / "tensorboard"))

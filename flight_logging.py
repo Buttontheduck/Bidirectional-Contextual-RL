@@ -82,6 +82,8 @@ class Flight:
         self.b0 = self.b = math.nan
 
     def add(self, info: Mapping[str, Any], reward: float, action: Sequence[float]) -> None:
+        if info.get("autopilot"):
+            return   # a replayed take-off step (memory_baselines.RecurrentInput): not part of the mission
         vx, y = float(info["vx"]), float(info["y"])
         throttle, lift = float(action[0]), float(action[1])
         self.steps += 1
