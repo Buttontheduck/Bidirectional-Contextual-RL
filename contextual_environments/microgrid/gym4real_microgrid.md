@@ -8,9 +8,14 @@ Gym4ReaL is a suite of environments for testing reinforcement learning under rea
 
 This document describes the environment as installed here, read from its source code and checked by running it.
 
-**Results so far (22 October 2026)** (see [Experiments](#experiments)):
+**Verdict (23 October 2026): not a useful test of autogenic context, also with random starting health** (see [Experiments](#experiments)):
 - **The project's pretrained PPO reproduces in the unchanged environment and beats every rule-based baseline:** +€21–27 per household per year over the best rule.
 - **Retrained with the same recipe,** PPO gains nothing measurable from seeing the battery's state of health: +€7.3 per household per year (+2.3%), with a 95% CI of −€7.6 to +€21.3.
+- **With random starting health** (0.6–1 at every reset), seeing it is worth at most a small, fragile benefit:
+  - +€6.4 per household per year (+2.2%, Welch p = 0.14) with deterministic actions;
+  - −€0.7 with sampled actions.
+
+  Knowing the battery in BatteryPlane is worth 170–220 points.
 
 - **Source:** https://github.com/Daveonwave/gym4ReaL, commit `774d5ce` (3 July 2025), cloned to `/root/venvs/src/gym4ReaL`. It is not a pip package (its `pyproject.toml` is an unfilled template), so both Python environments reach it through a `.pth` file.
 - **Installed twice:**
@@ -224,7 +229,7 @@ As learned from MyoSuite and CityLearn, any design here should first pass a valu
 1. check that a learner beats the rule-based baselines;
 2. then compare that learner with health shown vs hidden;
 
-before any Contextual PPO budget. Both steps were run in the unchanged environment ([Experiments](#experiments)). The learner beats the rules, but showing health gives no measurable benefit.
+before any Contextual PPO budget. Both steps were run ([Experiments](#experiments)), in the unchanged environment and with random starting health. In both, the learner beats the rules, but showing health gives at most a small, fragile benefit (about 2%). So the microgrid is set aside as an autogenic-context test.
 
 ## Experiments
 
@@ -338,15 +343,84 @@ The two additions for reproducibility are a seeded random baseline and seeded PP
 - **Its effects are small.** It shrinks the capacity by about 4% within a year, and the wear price per unit of health is constant.
 - **The upper end of the CI,** about +7%, leaves room for a modest benefit, but there is no evidence of one.
 
-**Possible next steps** (not run):
-- **Random starting health** (`random_battery_init`), so health differs a lot between episodes, where knowing it should matter most. This changes the environment, and also randomizes the starting charge and temperature.
-- **More seeds,** to narrow the CI. The spread between seeds is large.
+**Next:** random starting health, so that health differs a lot between episodes (experiment 3).
 
 ```bash
 /root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/evaluate_checkpoint.py --output contextual_environments/microgrid/runs/checkpoint_evaluation.json
 /root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/train_ppo.py --seed 0 --show-soh    # health shown
 /root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/train_ppo.py --seed 0               # health hidden
 OMP_NUM_THREADS=1 /root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/evaluate_checkpoint.py --runs <run dirs> --output contextual_environments/microgrid/runs/gate_recipe.json
+```
+
+### 3. Random starting health: the final check (22–23 October 2026)
+
+**Question:** in experiment 2, health started at 1.0 in every episode, so it was nearly a function of elapsed time. If it differs a lot between episodes, does seeing it help?
+
+**Design:**
+- **Experiment 2 unchanged** (same recipe, same training data, health shown vs hidden), except for Gym4ReaL's own option **`random_battery_init`**. Every reset draws a random starting battery: health 0.6–1, charge 0.2–1, temperature 0–50 °C, and the electrical state from the configured bounds.
+- **5 seeds per setting,** 14,025,600 steps each, 10 runs side by side. W&B groups `PPO_MG_recipe_randinit_seeSoH` and `PPO_MG_recipe_randinit_hidden`.
+- **Evaluation:** 84 scenarios, 3 random starts for each of the 28 test households. The starts are drawn from a seeded generator, so every policy meets exactly the same starting battery (checked).
+  - Starting health ranges 0.60–0.99 (median 0.80), and 42 scenarios start below 0.8.
+  - In about 6% of episodes a battery starting near 0.6 reaches its end of life before the year ends, equally often under every PPO policy.
+- **Fixed before the results:**
+  - **Primary:** shown minus hidden in mean score with deterministic actions, the training seed as the unit (bootstrap 95% CI and Welch's t-test).
+  - **Also reported:** the score per hour (which corrects for episodes ending early), the scenarios starting below 0.8 health (where knowing health should matter most), and sampled actions.
+
+**Seed 3 collapsed in both settings and was stopped.**
+- An interim evaluation of the latest checkpoints (4.2M and 5.6M steps) gave both seed-3 runs **exactly −€399.0, the "only market" rule's score**: their policies had collapsed to never using the battery. That is likely a known PPO failure: the action's mean drifts below 0, every action is clipped to 0, and no learning signal remains.
+- Both runs were also the slowest (about 1,000–1,150 steps per second, against 1,200–2,200 for the others). They were stopped at about 6M steps, so the comparison is **4 seeds against 4** (seeds 0, 1, 2, 4).
+- This decision was taken after seeing the interim results. It removes the same seed from both settings.
+
+The other runs took 2.2–2.6 hours each.
+
+**Results** (final models, deterministic actions, 84 scenarios, score per household per year):
+
+| | Seed 0 | Seed 1 | Seed 2 | Seed 4 | Mean |
+|---|---:|---:|---:|---:|---:|
+| **Health shown** | −€293 | −€289 | −€298 | −€291 | **−€292.5** |
+| **Health hidden** | −€300 | −€292 | −€298 | −€306 | **−€299.0** |
+
+| Shown − hidden | Gap | Bootstrap 95% CI | Welch 95% CI, p | Scenarios where shown is better |
+|---|---:|---|---|---:|
+| Deterministic actions (primary) | **+€6.4 (+2.2%)** | +€0.4 to +€12.3 | −€2.9 to +€15.7, p = 0.14 | 82% of 84 |
+| Deterministic, score per hour | +€0.0008/h (+2.3%) | +€0.0001 to +€0.0015 | p = 0.13 | 82% of 84 |
+| Deterministic, starting health below 0.8 | +€7.4 (+2.8%) | +€0.2 to +€14.2 | −€3.3 to +€18.0, p = 0.14 | 83% of 42 |
+| Sampled actions (as in the notebook) | −€0.7 (−0.2%) | −€11.2 to +€7.6 | −€16.1 to +€14.6, p = 0.90 | 57% of 84 |
+
+**For reference** (same 84 scenarios, deterministic actions):
+
+| Policy | Score |
+|---|---:|
+| PPO, health shown | −€292.5 |
+| **PPO_trained,** the project's checkpoint: never trained with random starts, never sees health | **−€296.5** |
+| PPO, health hidden | −€299.0 |
+| Battery first: the best rule here | −€339.9 |
+| Only market | −€399.0 |
+
+Both trained settings beat the best rule (hidden +€40.9 per household, CI +€29.9 to +€52.5; shown +€47.4, CI +€34.7 to +€60.3). With random starts the battery begins at a random charge, so leaving it unused stops being the best rule: calendar aging at a high charge costs more.
+
+**What it says:**
+- **At most a small, fragile benefit.**
+  - With deterministic actions, seeing health is worth +€6.4 per household per year (2.2%), in the same direction in 82% of scenarios.
+  - But the more conservative test is not significant (Welch p = 0.14). With 4 seeds per side, the bootstrap interval, which just excludes zero, is coarse.
+  - With sampled actions, the notebook's own way of acting, the benefit disappears (−€0.7).
+- **It is no larger where it should matter most.** For batteries starting below 0.8 health, the gap is +€7.4, the same as overall.
+- **A policy that never saw random starts or health does about as well.** The project's `PPO_trained` scores −€296.5 on these scenarios, between the two trained settings.
+- **The size is what matters for this project.** Even at the top of its confidence interval (about 5%), knowing health is worth a small fraction of what knowing the battery is worth in BatteryPlane (170–220 points, the difference between failing and completing most flights).
+
+**Why health still barely matters:**
+- **The battery protects itself.** The action is a share of the household's own surplus or deficit. The environment clips anything the battery cannot take, and the agent sees the charge, measured against the worn capacity. A worn battery simply fills sooner, and the observed charge shows it.
+- **The cost of wear does not depend on health.** The wear price is a constant €75 per point. The damage model restarts at every reset, so a battery starting at 0.65 does not wear faster than one starting at 1.0.
+- **What health changes, capacity, the agent effectively sees.** Capacity shows in how fast the observed charge moves.
+
+**Conclusion for the microgrid.** Gym4ReaL's MicroGridEnv is a good battery-management benchmark: the learner beats the rules, and the pretrained model reproduces. But it is not a test of autogenic context:
+- the battery's health is created by the agent's own use and hidden, but knowing it changes almost nothing, with fixed or random starting health;
+- like the MyoSuite elbow and CityLearn, it is set aside.
+
+```bash
+/root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/train_ppo.py --seed 0 --show-soh --random-battery-init    # health shown
+/root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/train_ppo.py --seed 0 --random-battery-init               # health hidden
+OMP_NUM_THREADS=1 /root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/evaluate_checkpoint.py --random-battery-init --starts 3 --eval-seeds 2 --runs <run dirs> --output contextual_environments/microgrid/runs/gate_randinit.json
 ```
 
 ## References

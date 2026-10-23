@@ -6,6 +6,7 @@ configuration paths are relative):
 
     /root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/train_ppo.py --seed 0 --show-soh   # health shown
     /root/venvs/carlos-gym4real/bin/python contextual_environments/microgrid/train_ppo.py --seed 0              # hidden
+    ... --random-battery-init      # Gym4ReaL's random starting battery state (health 0.6-1) at every reset
     ... --episodes 1 --wandb-mode disabled                                                                     # smoke test
 
 The environment is unchanged: world_train.yaml through parameter_generator's defaults (2015-2018 data, the 370
@@ -39,6 +40,9 @@ GYM4REAL = os.environ.get("GYM4REAL_DIR", "/root/venvs/src/gym4ReaL")
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--show-soh", action="store_true")
+    parser.add_argument("--random-battery-init", action="store_true",
+                        help="Gym4ReaL's random_battery_init: a random starting battery state (health 0.6-1, charge "
+                             "0.2-1, temperature 0-50 C) at every reset")
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--episodes", type=int, default=100, help="episodes per environment (PPO_trained: 100)")
     parser.add_argument("--n-envs", type=int, default=4)
@@ -57,7 +61,8 @@ def main(argv=None) -> None:
     from stable_baselines3.common.env_util import make_vec_env
 
     torch.set_num_threads(args.threads)
-    group = f"PPO_MG_recipe_{'seeSoH' if args.show_soh else 'hidden'}{args.suffix}"
+    suffix = ("_randinit" if args.random_battery_init else "") + args.suffix
+    group = f"PPO_MG_recipe{suffix}_{'seeSoH' if args.show_soh else 'hidden'}"
     name = f"{group}_s{args.seed}"
     run_dir = HERE / "runs" / f"{name}_{datetime.now():%Y%m%d-%H%M%S}"
     run_dir.mkdir(parents=True)
@@ -66,7 +71,8 @@ def main(argv=None) -> None:
     import gym4real  # noqa: F401  (registers gym4real/microgrid-v0)
     from gym4real.envs.microgrid.utils import parameter_generator
 
-    params = parameter_generator(world_options="gym4real/envs/microgrid/world_train.yaml")
+    params = parameter_generator(world_options="gym4real/envs/microgrid/world_train.yaml",
+                                 random_battery_init=True if args.random_battery_init else None)
     params["soh"] = args.show_soh
     envs = make_vec_env("gym4real/microgrid-v0", n_envs=args.n_envs, env_kwargs={"settings": params})
     episode_steps = len(envs.get_attr("generation")[0])
