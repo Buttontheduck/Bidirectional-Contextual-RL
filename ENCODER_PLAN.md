@@ -1672,6 +1672,206 @@ python step2_swap_battery.py --runs runs_step0/frozen_gru_a/runs.json runs_step0
   - The figures (`figures/`, figure 5 and figure 6 e–f) show the encoder next to the ideal estimator on the same flights.
 - **For the T1 policies, their encoder's estimate and the true battery are interchangeable inputs.** That is the practical sense in which T1 "learned the battery".
 
+### Standard memory baselines: RecurrentPPO and history windows (2026-10-23)
+
+**Question.** Contextual PPO with an encoder learned inside the loop never beat its memoryless control (A, J0–J5). Is that Contextual PPO's design (a supervised encoder, frozen during the PPO epochs), or does standard end-to-end memory RL fail too? The plan is in `PAPER_ASSESSMENT.md` ("Plan: Tier 1, item 1"). The take-off-only version of the same runs is in `EASY_ENV_WARMUP.md` ("Memory baselines on the take-off-only version").
+
+**Design.**
+- **Settings:** step 0's (8 environments × 512 steps, 10 epochs, γ 0.99, reward scale 0.1, 2M steps, hidden mode), seeds 0–7, minibatches of 256 ("a", like 0a_blind) and 1,024 ("b", like 0b_blind).
+- **Code:** `memory_baselines.py`; conditions in `ppo/configs/experiment/M*.yaml`; checks in `checks/memory_baseline_checks.py`.
+- **RecurrentPPO** (M1a_lstm, M1b_lstm; sb3-contrib 2.9.0):
+  - an LSTM of 256 for the actor and another for the critic (sb3-contrib's defaults), then 2 × 256 tanh;
+  - its input is `[o_t, a_{t−1}]`, the previous executed action appended, as Contextual PPO's encoder reads it;
+  - trained by the PPO losses alone;
+  - its minibatches are runs of consecutive steps (256) or two whole streams (1,024), each starting from the memory saved at collection.
+- **History windows** (M2a_win16, M2b_win16, M2a_win64, M2b_win64): plain PPO reading the last 16 or 64 steps (0.8 or 3.2 s) of `[o_t, a_{t−1}, valid]` as one flat input.
+- **Runs:**
+  - folders: `runs_step0/memory_hard/` (the windows, and the stopped RecurrentPPO runs below) and `runs_step0/memory_hard_fused/` (RecurrentPPO);
+  - W&B project `cppo`, groups `M2a_win16_bs256_gamma0.99_rs0.1` (and the other windows), `M1a_lstm256_bs256_gamma0.99_rs0.1_fused` and `M1b_lstm256_bs1024_gamma0.99_rs0.1_fused`;
+  - run times with 32 runs side by side, one thread each: windows 49–100 min, RecurrentPPO 209–217 min.
+
+**The fused LSTM.** The first RecurrentPPO runs (launched 2026-10-23, 04:14) ran at about 15 steps per second: after 9–10 hours they were at 0.4–0.55M of 2M steps.
+- **The cause:** sb3-contrib runs its LSTM one step at a time in Python whenever a training sequence holds an episode start, which here is nearly always. With 32 runs on the CPU, that loop became about 15 times slower than with the machine free.
+- **The fix:** sb3-contrib's rollout buffer starts a new sequence at every episode start, so a reset can only fall on a sequence's first step. `FusedLstmPolicy` resets the memory there and runs the whole sequence in one `nn.LSTM` call.
+  - It is on by default (`memory.fused_lstm`); `false` runs sb3-contrib's own loop.
+  - Checks: identical outputs; gradients equal up to rounding (about 1e-6 relative); after a whole update, the same weights within 1e-5.
+  - All 32 RecurrentPPO runs (both versions) were stopped at 14:07 and restarted with it.
+- **Comparison with the stopped runs:**
+  - **A rerun with sb3-contrib's loop** is identical to the stopped runs in every logged number (seed 0, first three updates): the runs are deterministic.
+  - **The fused rerun of seed 0** is identical for the first 2–4 updates, then takes its own path, as any rounding change does. The same fused code with 2 threads instead of 1 moved seed 0's first validation by 123 points (batch 1,024), more than the fused path did (46).
+  - **Over all seeds, no difference** between the stopped and the fused runs at the same steps: hard 38 vs 23 (p = 0.30) and −25 vs 0 (p = 0.55) over the first 400–450k steps; take-off 89 vs 89 and 64 vs 64.
+- **Speed:** with the CPU nearly free, about 13 s per update with sb3-contrib's loop against 4.5 s fused. Under full load, 200+ s against 18–25 s.
+
+**Results** (validation late score over 1.5M–2M steps, mean ± std across 8 seeds):
+- outcome rates come from the final validation;
+- "vs no memory" is Welch's t-test against the no-memory run with the same minibatches;
+- throttle spread is the range of the mean throttle over the six starting batteries.
+
+| Agent (hard version) | Score | vs no memory | Completed | Battery empty | Ground crash | Throttle spread |
+|---|---:|---:|---:|---:|---:|---:|
+| No memory, batch 256 (0a_blind) | 23 ± 41 | — | 26% | 74% | 0% | 0.11 |
+| **RecurrentPPO, batch 256** | **21 ± 65** | −2 (p = 0.94) | 8% | 92% | 0% | 0.00 |
+| Window 16, batch 256 | 30 ± 43 | +7 (p = 0.77) | 15% | 81% | 4% | 0.01 |
+| Window 64, batch 256 | −7 ± 27 | −30 (p = 0.13) | 15% | 81% | 5% | 0.13 |
+| No memory, batch 1,024 (0b_blind) | 77 ± 32 | — | 15% | 85% | 0% | 0.20 |
+| **RecurrentPPO, batch 1,024** | **−7 ± 18** | −84 (p < 0.01) | 17% | 83% | 0% | 0.02 |
+| Window 16, batch 1,024 | 21 ± 24 | −56 (p < 0.01) | 13% | 87% | 0% | 0.01 |
+| Window 64, batch 1,024 | −56 ± 93 | −134 (p = 0.01) | 10% | 85% | 5% | 0.00 |
+| True battery, batch 256 / 1,024 (0a / 0b) | 246 / 258 | — | 88% / 86% | 6% / 5% | 6% / 9% | 0.78 / 0.64 |
+
+| By starting battery (final validation) | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 |
+|---|---:|---:|---:|---:|---:|---:|
+| Failed flights, true battery (batch 256) | 71% | 0% | 0% | 0% | 0% | 0% |
+| Failed flights, no memory (batch 256) | 100% | 100% | 100% | 88% | 58% | 0% |
+| Failed flights, RecurrentPPO (batch 256) | 100% | 100% | 100% | 100% | 100% | 54% |
+| Failed flights, RecurrentPPO (batch 1,024) | 100% | 100% | 100% | 100% | 100% | 0% |
+| Failed flights, window 16 (batch 256) | 100% | 100% | 96% | 92% | 92% | 29% |
+| Mean throttle, true battery (batch 256) | −0.12 | 0.32 | 0.40 | 0.48 | 0.57 | 0.65 |
+| Mean throttle, no memory (batch 256) | 1.00 | 1.00 | 0.99 | 0.95 | 0.90 | 0.89 |
+| Mean throttle, RecurrentPPO (batch 256) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| Mean throttle, window 16 (batch 256) | 0.93 | 0.94 | 0.94 | 0.94 | 0.94 | 0.93 |
+
+**Final test** (2026-10-23; seeds 2000–2002, flown once with `evaluate_final_test.py`, which now loads RecurrentPPO runs; every run first reproduced its validation exactly; mean ± std across 8 seeds, Welch's t-test against no memory; `runs_step0/memory_hard_fused/final_test_memory_hard.json`):
+
+| Agent (hard version) | Final test | vs no memory | Validation | Completed | Battery empty | Ground crash |
+|---|---:|---:|---:|---:|---:|---:|
+| No memory, batch 256 (0a_blind) | 49 ± 45 | — | 23 | 25% | 75% | 0% |
+| **RecurrentPPO, batch 256** | **66 ± 81** | +17 (p = 0.61) | 21 | 9% | 91% | 0% |
+| Window 16, batch 256 | 61 ± 58 | +12 (p = 0.65) | 30 | 17% | 83% | 0% |
+| Window 64, batch 256 | 5 ± 51 | −44 (p = 0.09) | −7 | 12% | 81% | 8% |
+| No memory, batch 1,024 (0b_blind) | 118 ± 65 | — | 77 | 17% | 83% | 0% |
+| **RecurrentPPO, batch 1,024** | **14 ± 1** | −104 (p < 0.01) | −7 | 17% | 83% | 0% |
+| Window 16, batch 1,024 | 38 ± 43 | −80 (p = 0.01) | 21 | 15% | 85% | 0% |
+| Window 64, batch 1,024 | −37 ± 108 | −155 (p < 0.01) | −56 | 11% | 83% | 6% |
+| True battery, batch 256 / 1,024 (0a / 0b) | 283 / 280 | — | 246 / 258 | 90% / 92% | 4% / 1% | 6% / 7% |
+
+- **The validation picture holds.** No memory learner beats no memory. RecurrentPPO's +17 at batch 256 is not significant, and it completes 9% of flights against 25%: it collects reward by flying flat out until the battery dies.
+- **RecurrentPPO at batch 1,024 scores 14 ± 1:** all 8 seeds learned the same full-throttle flight.
+- **The take-off version's final test** is in `EASY_ENV_WARMUP.md`: every memory learner is below no memory there, five of six significantly.
+
+**What it means.**
+- **Neither standard memory learner uses its memory.**
+  - RecurrentPPO flies at full throttle until the battery runs out: the "always sprint" rule of the design report. Its mean throttle is 1.00 in 14 of the 16 runs and 0.97–0.98 in the other two, at every starting battery.
+  - The windows also fly at the same throttle at every starting battery.
+- **A window does worse than no memory.** Its 112–448 inputs, mostly noisy speed readings, slow learning down. Any evidence of the battery leaves the window after 0.8–3.2 s.
+- **The take-off version gives the same answer, more clearly:** RecurrentPPO 23 / 44 against 127 / 177 without memory (`EASY_ENV_WARMUP.md`).
+- **The headline is no longer specific to Contextual PPO.** Every end-to-end memory learner tried stays at or below the no-memory level: Contextual PPO's supervised encoder (A, J0–J5), RecurrentPPO and the history windows. Meanwhile an encoder trained offline and frozen reaches the ideal estimate's level (T1: 291 / 262).
+- **Open:**
+  - a small RecurrentPPO sweep (it was not tuned beyond sb3-contrib's defaults and step 0's PPO settings);
+  - Contextual PPO with `encoder_objective=rl`;
+  - the 10M-step stage.
+
+### Out-of-distribution evaluation (2026-10-23)
+
+**Question.** How do the trained agents behave under conditions they never trained on? Listed as Tier 2, item 10 in `PAPER_ASSESSMENT.md`.
+
+**Design.** `ood_evaluation.py`, checks in `checks/ood_checks.py`. Nothing trains.
+- **Which models:** every run behind the README's table on the hard version, plus the memory baselines: 120 runs.
+  - true battery: 0a, 0b, 0c;
+  - no memory: 0a_blind, 0b_blind, 0c_blind;
+  - Contextual PPO's learned encoders: A, J1;
+  - frozen estimates: the ideal estimate (2a, 2b), the GRU trained on the true battery (`E1_gru_point_main_s1`), T1 (`E1_gru_teacher_point_main_s3`);
+  - RecurrentPPO (M1a, M1b).
+- **Seeds:** 3000–3002 (3000–3004 for the battery sweep), never the validation seeds 1000–1002 or the final-test seeds 2000–2002.
+- **Only the plane changes.** A frozen estimate (the ideal estimator, a frozen encoder) keeps the training physics, prior (0.2–0.7) and noise model, as a fixed estimator would.
+- **Every run first flies its own validation grid again** and must reproduce its report's final validation exactly. All 120 did, in both evaluations.
+
+| Setting | What changes (training: batteries 0.2–0.7, speed noise 5, 100 hover-seconds, thrust cap 11.5–18) | Flights per run |
+|---|---|---:|
+| nominal | nothing (new seeds): the reference | 18 |
+| noise_0 / noise_10 | speed-reading noise 0 or 10 m/s | 18 each |
+| capacity_85 / capacity_120 | the battery holds 85 or 120 hover-seconds: it drains ~18% faster or ~17% slower | 18 each |
+| motor_weaker / motor_stronger | the cruise motor's thrust cap 1 m/s² lower or higher at every charge | 18 each |
+| battery_sweep | starting batteries 0.10, 0.12, 0.15, 0.17, 0.18, 0.19 and 0.71, 0.72, 0.73, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, with 0.20 and 0.70 as anchors (5 seeds) | 85 |
+
+The design report (`BatteryPlaneVec.value_of_context`) keeps every physics shift a fair task: knowing the battery is worth 22–52% of the oracle's return (defaults: 36%).
+
+**Results: physics and noise** (`runs_step0/ood/hard/summary.json`). Cells:
+- nominal: the mean return over seeds (completed flights);
+- other settings: the change from nominal, with a * for a paired t-test on the same seeds with p < 0.05 (completed flights where it matters).
+
+| Agent | Nominal | Noise 0 | Noise 10 | Capacity 85 | Capacity 120 | Motor weaker | Motor stronger |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Plain PPO, true battery (0a) | 271 (89%) | −4 | −1 | −61* (83%) | +61* | −12 | +6 |
+| **Contextual PPO, true battery (0c)** | 272 (88%) | 0 | −1 | −46* (86%) | +61* | −8 | +6 |
+| Contextual PPO, no context (0c_blind) | 148 (28%) | −2 | −1 | −142* (5%) | +127* (47%) | +22* | −34* |
+| **Contextual PPO, learned xLSTM (A, 3 seeds)** | 40 (17%) | −1 | +8 | −94* (6%) | +112* (33%) | +43* | −29 |
+| **Contextual PPO, joint GRU (J1, 5 seeds)** | 138 (27%) | −7 | −2 | −130* (6%) | +135* (50%) | 0 | −48 (4%) |
+| RecurrentPPO, batch 256 | 57 (9%) | 0 | 0 | −95* (0%) | +129* | +34* | −19 |
+| No memory, batch 256 (0a_blind) | 37 (24%) | +2 | +3 | −93* (6%) | +111* | +46* | −59* |
+| Ideal estimate, batch 256 (2a) | 282 (92%) | +39* | −49* | −28* | +33* | −138* (81%) | +3 (62%) |
+| Ideal estimate, batch 1,024 (2b) | 319 (94%) | +31* | −47* | −40* | +33* | −116* | −17 (60%) |
+| GRU on the true battery, batch 256 | 218 (90%) | +23* | −23 | −28* | +27* | −10 | +3 |
+| **T1, batch 256** | 305 (83%) | +16 | −59* | −76* | +58* | −69* | −175* (15%) |
+| **T1, batch 1,024** | 306 (75%) | +10 | −50* | −125* (50%) | +69* | −88* | −205* (5%) |
+
+- **The true battery generalizes.** Plain PPO and Contextual PPO with the true battery lose little under any shift. On a battery that drains 18% faster they still complete 83–86% of their flights.
+- **Agents without battery information don't adapt; the physics carries them.** That is no memory, Contextual PPO without context, A, J1 and RecurrentPPO.
+  - Speed-reading noise changes nothing for them.
+  - A faster-draining battery collapses them (0–6% of flights completed).
+  - A bigger battery or a weaker motor, which drains less at full throttle, helps them a lot.
+- **Speed-reading noise matters only for the estimate-based agents,** because the battery is read from how the speed responds to the thrust: exact readings +10 to +43, noise 10 −23 to −59.
+- **A different motor fools the fixed estimators.**
+  - **Stronger motor:** T1 collapses (5–15% of flights completed, 84–95% end with an empty battery), and the ideal-estimate agents lose 38–40% of their flights to an empty battery.
+  - **Weaker motor:** the ideal-estimate agents lose 116–138 points, with more ground crashes.
+  - This fits the estimates reading a stronger motor as a fuller battery (the plane flies too hard) and a weaker one as an emptier battery (too gently). The estimates weren't measured directly, so that is not shown.
+- **The best agent in distribution, T1, is the most fragile under a motor shift.** The GRU trained on the true battery is weaker in distribution but barely moves (−10 / +3 at batch 256).
+
+**Results: starting battery** (`runs_step0/ood/hard_battery/battery_sweep_table.json`, all 16 agents; batch-256 agents below). Return: the mean over the agent's runs of each run's mean over 5 flights, ± the std across runs.
+
+| Starting battery | PPO, true battery | CPPO, true battery | No memory | CPPO, no context | CPPO A | CPPO J1 | RecurrentPPO | Ideal estimate | GRU, true battery | T1 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.10 | −293 ± 11 | −272 ± 67 | −250 ± 10 | −274 ± 4 | −271 ± 9 | −263 ± 3 | −265 ± 11 | −249 ± 10 | −245 ± 25 | −258 ± 16 |
+| 0.12 | −282 ± 30 | −265 ± 74 | −238 ± 12 | −265 ± 5 | −261 ± 13 | −251 ± 4 | −254 ± 13 | −226 ± 18 | −219 ± 29 | −235 ± 24 |
+| 0.15 | −256 ± 84 | −211 ± 156 | −219 ± 14 | −248 ± 8 | −244 ± 19 | −230 ± 6 | −236 ± 16 | −147 ± 78 | −143 ± 78 | −174 ± 51 |
+| 0.17 | −221 ± 110 | −202 ± 163 | −206 ± 15 | −234 ± 10 | −232 ± 23 | −216 ± 8 | −222 ± 18 | −77 ± 105 | −67 ± 102 | −124 ± 78 |
+| 0.18 | −196 ± 109 | −187 ± 161 | −200 ± 15 | −226 ± 11 | −225 ± 25 | −208 ± 9 | −215 ± 19 | −43 ± 97 | −16 ± 116 | −111 ± 79 |
+| 0.19 | −168 ± 118 | −170 ± 164 | −193 ± 15 | −218 ± 12 | −219 ± 27 | −199 ± 9 | −208 ± 20 | −24 ± 99 | 25 ± 98 | −42 ± 107 |
+| *0.20 (in range)* | −86 ± 148 | −135 ± 167 | −186 ± 14 | −209 ± 13 | −212 ± 29 | −190 ± 9 | −200 ± 21 | 10 ± 92 | 57 ± 83 | −29 ± 104 |
+| *0.70 (in range)* | 541 ± 62 | 557 ± 56 | 381 ± 127 | 641 ± 38 | 417 ± 169 | 590 ± 49 | 458 ± 221 | 548 ± 53 | 318 ± 73 | 586 ± 92 |
+| 0.71 | 551 ± 62 | 568 ± 55 | 383 ± 129 | 649 ± 38 | 423 ± 168 | 623 ± 74 | 474 ± 224 | 556 ± 54 | 320 ± 76 | 595 ± 94 |
+| 0.72 | 561 ± 63 | 579 ± 55 | 385 ± 131 | 656 ± 39 | 430 ± 167 | 631 ± 75 | 512 ± 232 | 563 ± 54 | 323 ± 78 | 604 ± 97 |
+| 0.73 | 571 ± 63 | 590 ± 55 | 387 ± 133 | 663 ± 39 | 436 ± 165 | 639 ± 76 | 535 ± 236 | 570 ± 54 | 325 ± 81 | 613 ± 99 |
+| 0.75 | 592 ± 63 | 613 ± 55 | 391 ± 137 | 678 ± 40 | 448 ± 163 | 656 ± 77 | 559 ± 240 | 583 ± 56 | 331 ± 86 | 632 ± 104 |
+| 0.80 | 643 ± 64 | 670 ± 54 | 402 ± 148 | 717 ± 43 | 482 ± 157 | 699 ± 80 | 599 ± 238 | 613 ± 60 | 345 ± 102 | 678 ± 118 |
+| 0.85 | 696 ± 65 | 727 ± 54 | 428 ± 147 | 758 ± 46 | 617 ± 27 | 743 ± 84 | 642 ± 238 | 641 ± 65 | 360 ± 118 | 726 ± 132 |
+| 0.90 | 751 ± 66 | 785 ± 55 | 440 ± 160 | 801 ± 49 | 654 ± 30 | 789 ± 88 | 686 ± 239 | 671 ± 71 | 376 ± 138 | 775 ± 148 |
+| 0.95 | 806 ± 65 | 843 ± 55 | 451 ± 173 | 843 ± 53 | 692 ± 34 | 836 ± 91 | 733 ± 239 | 699 ± 77 | 392 ± 157 | 823 ± 163 |
+| 1.00 | 858 ± 63 | 896 ± 53 | 463 ± 185 | 883 ± 57 | 730 ± 38 | 881 ± 94 | 810 ± 218 | 724 ± 83 | 406 ± 173 | 869 ± 177 |
+
+Outcomes, completed / battery empty / ground crash in % (40 flights per cell; A 15, J1 25):
+
+| Starting battery | PPO, true battery | CPPO, true battery | No memory | CPPO, no context | CPPO A | CPPO J1 | RecurrentPPO | Ideal estimate | GRU, true battery | T1 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.10 | 0/52/48 | 5/52/42 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 |
+| 0.12 | 0/50/50 | 5/45/50 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 |
+| 0.15 | 5/52/42 | 18/30/52 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 18/78/5 | 10/90/0 | 5/95/0 |
+| 0.17 | 12/38/50 | 18/30/52 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 38/57/5 | 25/75/0 | 12/82/5 |
+| 0.18 | 18/35/48 | 20/22/57 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 48/50/2 | 38/62/0 | 12/82/5 |
+| 0.19 | 22/38/40 | 22/20/57 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 52/42/5 | 48/52/0 | 30/65/5 |
+| *0.20* | 42/28/30 | 30/20/50 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 0/100/0 | 62/32/5 | 55/45/0 | 30/65/5 |
+| *0.70* | 100/0/0 | 100/0/0 | 95/5/0 | 100/0/0 | 67/33/0 | 92/8/0 | 55/45/0 | 100/0/0 | 100/0/0 | 100/0/0 |
+| 0.71–0.80 | 100/0/0 | 100/0/0 | 95/5/0 | 100/0/0 | 67/33/0 | 100/0/0 | 57–75/25–42/0 | 100/0/0 | 100/0/0 | 100/0/0 |
+| 0.85–1.00 | 100/0/0 | 100/0/0 | 100/0/0 | 100/0/0 | 100/0/0 | 100/0/0 | 75–85/15–25/0 | 100/0/0 | 100/0/0 | 100/0/0 |
+
+- **No cliff at the edges of the training range.** Every agent changes smoothly from 0.20 to 0.19 and from 0.70 to 0.71: outside the range it continues its in-range trend.
+- **Just below the range (0.17–0.19), only agents with battery information save flights:**
+  - the ideal estimate 38–52%, the GRU trained on the true battery 25–48%, the true-battery agents 12–22%, T1 12–30%;
+  - no memory, Contextual PPO without context, A, J1 and RecurrentPPO save none: every flight ends with an empty battery;
+  - at 0.10–0.12 nobody gets through (5% at most).
+- **The true-battery agents fail differently at low batteries.** About half their failures are ground crashes (they seem to cut thrust to save the battery and sink); every other agent empties the battery.
+- **Above the range almost everyone completes.** The exceptions: A completes 67% up to 0.80 (one of its 3 seeds empties the battery), RecurrentPPO 55–85%, no memory 95%.
+- **Above 0.7, the return shows who believes a fuller battery:**
+  - Contextual PPO with the true battery climbs from 557 to 896, and T1 from 586 to 869.
+  - The ideal estimate climbs more slowly (548 to 724): its prior stops at 0.7, so it never estimates a fuller battery.
+  - The GRU trained on the true battery stays at 320–406: it flies as if the battery were medium even when it is full.
+  - Contextual PPO without context reaches 883 at a full battery, as much as with the true battery: with a full battery, flying flat out is the right strategy anyway.
+
+**What it means.**
+- **Contextual PPO with the true battery generalizes best:** it extrapolates smoothly and adapts to a faster-draining battery.
+- **Its learned encoders (A, J1) behave exactly like no context out of distribution,** as in distribution: they never save a flight below 0.2, and their scores follow what the physics does to full-throttle flying.
+- **The decoupled method's frozen encoder (T1) matches the ideal estimate in distribution but is the most fragile under a motor shift.** It learned the training physics' map from thrust response to battery. Training the encoder on varied physics is the obvious next test.
+
 ## Next steps
 
 **Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).

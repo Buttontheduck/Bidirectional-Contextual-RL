@@ -1,6 +1,6 @@
 # Easy alternative environment: a forced take-off before the agent takes control
 
-**On branch `main`** this document records the plan, every training setting and every result. The code it describes (the take-off and transition options of `battery_plane.py`, the learner's preludes and its window training, their checks in `checks/`, and the `run_step0.py` options and conditions) lives on branch `easy-env`: check that branch out to rerun these experiments.
+**On every branch** this document records the plan, every training setting and every result. The code it describes (the take-off and transition options of `battery_plane.py`, the learner's preludes and its window training, their checks in `checks/`, and the `run_step0.py` options and conditions) lives on branch `easy-env`, and on `memory-baselines-easy`, which adds the memory baselines: check one of them out to rerun these experiments.
 
 **Status:** idea with first measurements (2026-10-14). Nothing is implemented in the environment or the learner yet. The current environment stays the main (hard) version.
 
@@ -649,3 +649,72 @@ R2D2's validation outcomes per seed: seed 0, 12 battery empty and 6 ground crash
 - **Shorter training windows hurt the one thing that limited end-to-end learning here: the estimate's accuracy.** They make encoder training 3–4 times faster, but the encoder can no longer carry the take-off's information across the flight.
 - **Whole-flight backpropagation stays the right way to train this encoder.** These flights are at most 800 steps, short enough to backpropagate through in full.
 - **The policies can become excellent pilots** (J1_chunk's reach 284 with the true battery): what end-to-end learning still lacks is an accurate estimate. The next tests stay those of E3c: a 7-second take-off (best possible error 0.037 instead of 0.050) or a Gaussian head.
+
+### Memory baselines on the take-off-only version (2026-10-23)
+
+**Question.** E3c's J1 reads the take-off and still doesn't beat no memory. Do standard end-to-end memory learners do better when the take-off shows them the battery? The plan is in `PAPER_ASSESSMENT.md` ("Plan: Tier 1, item 1"); the hard version and the fused LSTM are in `ENCODER_PLAN.md` ("Standard memory baselines").
+
+**Design.** Step 0's settings, take-off only (`warmup_steps=100`), seeds 0–7, minibatches of 256 and 1,024 (`memory_baselines.py`).
+- **RecurrentPPO** (M1a_lstm, M1b_lstm; sb3-contrib 2.9.0, an LSTM of 256 for the actor and another for the critic, reading `[o_t, a_{t−1}]`, with the fused LSTM):
+  - sb3-contrib has no prelude, so the take-off is replayed as the first 100 steps of every episode: the autopilot's observations and executed actions, the agent's actions ignored, reward 0, plus an extra autopilot input.
+  - Those steps are masked out of every PPO loss (`RecurrentInput`, `MaskedRecurrentPPO`). So the LSTM reads what Contextual PPO's encoder reads, with gradients through the take-off.
+  - Episodes are then 800 steps, so `run_step0.py` scales the budget by 800/700: 2,285,760 steps (2M mission steps), with validation every 57,144 steps (40 evaluations, the late score over the last 11).
+  - The checks show that the mission after the replay is step-for-step the plane's own episode, and that the flight metrics leave the replayed steps out.
+- **History windows** (M2a/M2b_win16, M2a/M2b_win64): plain PPO on the last 16 or 64 steps of `[o_t, a_{t−1}, valid]`. The window starts filled with the take-off from the reset info (`warmup_observations`, `warmup_actions`; never `warmup_batteries`).
+- **Runs:**
+  - launched from a worktree of branch `memory-baselines-easy`;
+  - folders `runs_step0/memory_takeoff/` (the windows) and `runs_step0/memory_takeoff_fused/` (RecurrentPPO);
+  - W&B groups end in `_warm100` (windows) and `_warm100_fused` (RecurrentPPO);
+  - run times: windows 40–120 min, RecurrentPPO 228–230 min.
+
+**Results** (validation late score, mean ± std across 8 seeds):
+- outcome rates come from the final validation;
+- "vs no memory" is Welch's t-test against this version's E1 run without memory, with the same minibatches;
+- throttle spread is the range of the mean throttle over the six starting batteries.
+
+| Agent (take-off-only version) | Score | vs no memory | Completed | Battery empty | Ground crash | Throttle spread |
+|---|---:|---:|---:|---:|---:|---:|
+| No memory, batch 256 (0a_blind) | 127 ± 48 | — | 25% | 75% | 0% | 0.22 |
+| **RecurrentPPO, batch 256** | **23 ± 37** | −104 (p < 0.01) | 8% | 92% | 0% | 0.00 |
+| Window 16, batch 256 | 73 ± 39 | −55 (p = 0.03) | 16% | 84% | 0% | 0.07 |
+| Window 64, batch 256 | 46 ± 22 | −81 (p < 0.01) | 13% | 87% | 0% | 0.11 |
+| No memory, batch 1,024 (0b_blind) | 177 ± 24 | — | 30% | 70% | 0% | 0.21 |
+| **RecurrentPPO, batch 1,024** | **44 ± 12** | −133 (p < 0.01) | 17% | 83% | 0% | 0.00 |
+| Window 16, batch 1,024 | 70 ± 37 | −107 (p < 0.01) | 9% | 91% | 0% | 0.01 |
+| Window 64, batch 1,024 | 56 ± 25 | −122 (p < 0.01) | 19% | 81% | 0% | 0.05 |
+| True battery, batch 256 / 1,024 (0a / 0b) | 288 / 245 | — | 83% / 81% | 10% / 12% | 6% / 6% | 1.39 / 1.23 |
+
+| By starting battery (final validation) | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 |
+|---|---:|---:|---:|---:|---:|---:|
+| Failed flights, true battery (batch 256) | 100% | 0% | 0% | 0% | 0% | 0% |
+| Failed flights, no memory (batch 256) | 100% | 100% | 100% | 88% | 62% | 0% |
+| Failed flights, RecurrentPPO (batch 256) | 100% | 100% | 100% | 100% | 100% | 50% |
+| Failed flights, RecurrentPPO (batch 1,024) | 100% | 100% | 100% | 100% | 100% | 0% |
+| Failed flights, window 64 (batch 1,024) | 100% | 100% | 100% | 88% | 88% | 12% |
+| Mean throttle, true battery (batch 256) | −0.68 | 0.31 | 0.42 | 0.52 | 0.62 | 0.71 |
+| Mean throttle, no memory (batch 256) | 1.00 | 1.00 | 0.99 | 0.92 | 0.82 | 0.78 |
+| Mean throttle, RecurrentPPO (batch 256) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| Mean throttle, window 64 (batch 1,024) | 1.00 | 1.00 | 1.00 | 0.96 | 0.95 | 0.95 |
+
+**Final test** (2026-10-23; seeds 2000–2002, flown once; every run first reproduced its validation exactly; mean ± std across 8 seeds, Welch's t-test against no memory). The plain-PPO controls of E1 (0a, 0b, 0a_blind, 0b_blind) had not been final-tested before: this was their first and only use of these flights. Files: `runs_step0/memory_takeoff_fused/final_test_memory_takeoff.json` and `final_test_takeoff_controls.json` (worktree of `memory-baselines-easy`).
+
+| Agent (take-off-only version) | Final test | vs no memory | Validation | Completed | Battery empty | Ground crash |
+|---|---:|---:|---:|---:|---:|---:|
+| No memory, batch 256 (0a_blind) | 139 ± 53 | — | 127 | 26% | 74% | 0% |
+| **RecurrentPPO, batch 256** | **23 ± 31** | −116 (p < 0.01) | 23 | 8% | 92% | 0% |
+| Window 16, batch 256 | 94 ± 53 | −45 (p = 0.11) | 73 | 16% | 84% | 0% |
+| Window 64, batch 256 | 64 ± 57 | −76 (p = 0.02) | 46 | 13% | 87% | 0% |
+| No memory, batch 1,024 (0b_blind) | 203 ± 39 | — | 177 | 31% | 69% | 0% |
+| **RecurrentPPO, batch 1,024** | **67 ± 45** | −137 (p < 0.01) | 44 | 17% | 83% | 0% |
+| Window 16, batch 1,024 | 72 ± 59 | −131 (p < 0.01) | 70 | 10% | 90% | 0% |
+| Window 64, batch 1,024 | 78 ± 45 | −125 (p < 0.01) | 56 | 20% | 80% | 0% |
+| True battery, batch 256 / 1,024 (0a / 0b) | 279 / 242 | — | 288 / 245 | 83% / 83% | 10% / 12% | 7% / 5% |
+
+The final test confirms validation: every memory learner is below no memory, five of six significantly.
+
+**What it means.**
+- **RecurrentPPO ignores the take-off.** Its LSTM reads the 5-second full-throttle take-off, which reveals the battery (best possible error 0.050 after it, section 3). Yet it flies at full throttle in all 16 runs, at every starting battery, and fails every flight from 0.2 to 0.6. It ends 104–133 points below no memory.
+- **The agents without memory do better than RecurrentPPO here,** although they can't remember the take-off: they ease off the throttle at high batteries (0.78–0.82 at 0.6–0.7), where the hand-over speed hints at the battery, and complete every flight from 0.7.
+- **The windows hold the take-off at hand-over but lose it after 0.8 or 3.2 s;** all four are worse than no memory (p ≤ 0.03).
+- **Next to E3c:** Contextual PPO's supervised encoder (J1, 169 with 5 seeds, against 158 without memory) at least learns the battery (0.05 off at hand-over), and its policies use it. RecurrentPPO and the windows do neither.
+- **Same answer as the hard version:** standard end-to-end memory RL doesn't learn to use the autogenic context, even when the take-off reveals it for free.
