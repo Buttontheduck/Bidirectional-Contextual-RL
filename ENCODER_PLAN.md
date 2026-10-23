@@ -1672,6 +1672,78 @@ python step2_swap_battery.py --runs runs_step0/frozen_gru_a/runs.json runs_step0
   - The figures (`figures/`, figure 5 and figure 6 e–f) show the encoder next to the ideal estimator on the same flights.
 - **For the T1 policies, their encoder's estimate and the true battery are interchangeable inputs.** That is the practical sense in which T1 "learned the battery".
 
+### Standard memory baselines: RecurrentPPO and history windows (2026-10-23)
+
+**Question.** Contextual PPO with an encoder learned inside the loop never beat its memoryless control (A, J0–J5). Is that Contextual PPO's design (a supervised encoder, frozen during the PPO epochs), or does standard end-to-end memory RL fail too? The plan is in `PAPER_ASSESSMENT.md` ("Plan: Tier 1, item 1"). The take-off-only version of the same runs is in `EASY_ENV_WARMUP.md` ("Memory baselines on the take-off-only version").
+
+**Design.**
+- **Settings:** step 0's (8 environments × 512 steps, 10 epochs, γ 0.99, reward scale 0.1, 2M steps, hidden mode), seeds 0–7, minibatches of 256 ("a", like 0a_blind) and 1,024 ("b", like 0b_blind).
+- **Code:** `memory_baselines.py`; conditions in `ppo/configs/experiment/M*.yaml`; checks in `checks/memory_baseline_checks.py`.
+- **RecurrentPPO** (M1a_lstm, M1b_lstm; sb3-contrib 2.9.0):
+  - an LSTM of 256 for the actor and another for the critic (sb3-contrib's defaults), then 2 × 256 tanh;
+  - its input is `[o_t, a_{t−1}]`, the previous executed action appended, as Contextual PPO's encoder reads it;
+  - trained by the PPO losses alone;
+  - its minibatches are runs of consecutive steps (256) or two whole streams (1,024), each starting from the memory saved at collection.
+- **History windows** (M2a_win16, M2b_win16, M2a_win64, M2b_win64): plain PPO reading the last 16 or 64 steps (0.8 or 3.2 s) of `[o_t, a_{t−1}, valid]` as one flat input.
+- **Runs:**
+  - folders: `runs_step0/memory_hard/` (the windows, and the stopped RecurrentPPO runs below) and `runs_step0/memory_hard_fused/` (RecurrentPPO);
+  - W&B project `cppo`, groups `M2a_win16_bs256_gamma0.99_rs0.1` (and the other windows), `M1a_lstm256_bs256_gamma0.99_rs0.1_fused` and `M1b_lstm256_bs1024_gamma0.99_rs0.1_fused`;
+  - run times with 32 runs side by side, one thread each: windows 49–100 min, RecurrentPPO 209–217 min.
+
+**The fused LSTM.** The first RecurrentPPO runs (launched 2026-10-23, 04:14) ran at about 15 steps per second: after 9–10 hours they were at 0.4–0.55M of 2M steps.
+- **The cause:** sb3-contrib runs its LSTM one step at a time in Python whenever a training sequence holds an episode start, which here is nearly always. With 32 runs on the CPU, that loop became about 15 times slower than with the machine free.
+- **The fix:** sb3-contrib's rollout buffer starts a new sequence at every episode start, so a reset can only fall on a sequence's first step. `FusedLstmPolicy` resets the memory there and runs the whole sequence in one `nn.LSTM` call.
+  - It is on by default (`memory.fused_lstm`); `false` runs sb3-contrib's own loop.
+  - Checks: identical outputs; gradients equal up to rounding (about 1e-6 relative); after a whole update, the same weights within 1e-5.
+  - All 32 RecurrentPPO runs (both versions) were stopped at 14:07 and restarted with it.
+- **Comparison with the stopped runs:**
+  - **A rerun with sb3-contrib's loop** is identical to the stopped runs in every logged number (seed 0, first three updates): the runs are deterministic.
+  - **The fused rerun of seed 0** is identical for the first 2–4 updates, then takes its own path, as any rounding change does. The same fused code with 2 threads instead of 1 moved seed 0's first validation by 123 points (batch 1,024), more than the fused path did (46).
+  - **Over all seeds, no difference** between the stopped and the fused runs at the same steps: hard 38 vs 23 (p = 0.30) and −25 vs 0 (p = 0.55) over the first 400–450k steps; take-off 89 vs 89 and 64 vs 64.
+- **Speed:** with the CPU nearly free, about 13 s per update with sb3-contrib's loop against 4.5 s fused. Under full load, 200+ s against 18–25 s.
+
+**Results** (validation late score over 1.5M–2M steps, mean ± std across 8 seeds):
+- outcome rates come from the final validation;
+- "vs no memory" is Welch's t-test against the no-memory run with the same minibatches;
+- throttle spread is the range of the mean throttle over the six starting batteries.
+
+| Agent (hard version) | Score | vs no memory | Completed | Battery empty | Ground crash | Throttle spread |
+|---|---:|---:|---:|---:|---:|---:|
+| No memory, batch 256 (0a_blind) | 23 ± 41 | — | 26% | 74% | 0% | 0.11 |
+| **RecurrentPPO, batch 256** | **21 ± 65** | −2 (p = 0.94) | 8% | 92% | 0% | 0.00 |
+| Window 16, batch 256 | 30 ± 43 | +7 (p = 0.77) | 15% | 81% | 4% | 0.01 |
+| Window 64, batch 256 | −7 ± 27 | −30 (p = 0.13) | 15% | 81% | 5% | 0.13 |
+| No memory, batch 1,024 (0b_blind) | 77 ± 32 | — | 15% | 85% | 0% | 0.20 |
+| **RecurrentPPO, batch 1,024** | **−7 ± 18** | −84 (p < 0.01) | 17% | 83% | 0% | 0.02 |
+| Window 16, batch 1,024 | 21 ± 24 | −56 (p < 0.01) | 13% | 87% | 0% | 0.01 |
+| Window 64, batch 1,024 | −56 ± 93 | −134 (p = 0.01) | 10% | 85% | 5% | 0.00 |
+| True battery, batch 256 / 1,024 (0a / 0b) | 246 / 258 | — | 88% / 86% | 6% / 5% | 6% / 9% | 0.78 / 0.64 |
+
+| By starting battery (final validation) | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 |
+|---|---:|---:|---:|---:|---:|---:|
+| Failed flights, true battery (batch 256) | 71% | 0% | 0% | 0% | 0% | 0% |
+| Failed flights, no memory (batch 256) | 100% | 100% | 100% | 88% | 58% | 0% |
+| Failed flights, RecurrentPPO (batch 256) | 100% | 100% | 100% | 100% | 100% | 54% |
+| Failed flights, RecurrentPPO (batch 1,024) | 100% | 100% | 100% | 100% | 100% | 0% |
+| Failed flights, window 16 (batch 256) | 100% | 100% | 96% | 92% | 92% | 29% |
+| Mean throttle, true battery (batch 256) | −0.12 | 0.32 | 0.40 | 0.48 | 0.57 | 0.65 |
+| Mean throttle, no memory (batch 256) | 1.00 | 1.00 | 0.99 | 0.95 | 0.90 | 0.89 |
+| Mean throttle, RecurrentPPO (batch 256) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| Mean throttle, window 16 (batch 256) | 0.93 | 0.94 | 0.94 | 0.94 | 0.94 | 0.93 |
+
+**What it means.**
+- **Neither standard memory learner uses its memory.**
+  - RecurrentPPO flies at full throttle until the battery runs out: the "always sprint" rule of the design report. Its mean throttle is 1.00 in 14 of the 16 runs and 0.97–0.98 in the other two, at every starting battery.
+  - The windows also fly at the same throttle at every starting battery.
+- **A window does worse than no memory.** Its 112–448 inputs, mostly noisy speed readings, slow learning down. Any evidence of the battery leaves the window after 0.8–3.2 s.
+- **The take-off version gives the same answer, more clearly:** RecurrentPPO 23 / 44 against 127 / 177 without memory (`EASY_ENV_WARMUP.md`).
+- **The headline is no longer specific to Contextual PPO.** Every end-to-end memory learner tried stays at or below the no-memory level: Contextual PPO's supervised encoder (A, J0–J5), RecurrentPPO and the history windows. Meanwhile an encoder trained offline and frozen reaches the ideal estimate's level (T1: 291 / 262).
+- **Open:**
+  - a small RecurrentPPO sweep (it was not tuned beyond sb3-contrib's defaults and step 0's PPO settings);
+  - Contextual PPO with `encoder_objective=rl`;
+  - the 10M-step stage;
+  - the final test (`evaluate_final_test.py` doesn't load these runs yet).
+
 ## Next steps
 
 **Done:** the CPPO oracle bypass and step 0; step 1 (noisy oracle, fly-with-noise, late switch, early and in-flight noise, the A encoder's error over a flight, the ideal estimator); the memoryless controls; the context wrapper and plain PPO with the ideal estimate (step 2: the encoder is the bottleneck); the pilot generator and dataset v2 (step 3).

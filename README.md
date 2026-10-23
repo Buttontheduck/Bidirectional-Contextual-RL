@@ -304,6 +304,11 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. 
   - **The catch:** the teacher knows the exact physics, the prior and the speed noise, so this encoder isn't purely learned from experience.
   - **Learning the uncertainty as well (T2)** costs no accuracy, and its uncertainty is calibrated (squared error over its variance about 1).
 - **Joint training still fails.** Contextual PPO with a GRU encoder trained alongside the policy reaches 114 at best (J1, 16 times more encoder training), about the memoryless level (115). An entropy bonus, a Gaussian head, a curiosity bonus and a warm-up on random flights didn't help. The policy flies narrowly, so its encoder learns a clock again (R² about 0.8 on its own flights).
+- **Standard memory learners fail too (2026-10-23).** sb3-contrib's RecurrentPPO (an LSTM trained by the PPO losses alone) and plain PPO on a window of the last 16 or 64 steps, at step 0's settings with 8 seeds:
+  - none beats the no-memory control on either version (hard: RecurrentPPO 21 / −7 against 23 / 77; take-off only: 23 / 44 against 127 / 177);
+  - RecurrentPPO flies at full throttle at every starting battery, and the windows also fly the same at every battery.
+
+  Details are in `ENCODER_PLAN.md` and `EASY_ENV_WARMUP.md`, the plan in `PAPER_ASSESSMENT.md`.
 - **A likely reason A failed, not tested directly:** inside Contextual PPO the encoder got about 1,950 supervised steps of 16 episodes (A–F, 1M steps), or 3,900 (the A rerun, 2M). It trained on its own clock-like flights. That is less training, on narrower data, than the offline encoders needed before their click (about 4,300–5,200 steps of 32 varied flights).
 
 **Why, from the step 1 controls**, which replace the encoder with the true battery plus controlled noise:
