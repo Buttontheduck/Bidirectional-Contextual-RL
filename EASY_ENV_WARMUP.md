@@ -696,6 +696,22 @@ R2D2's validation outcomes per seed: seed 0, 12 battery empty and 6 ground crash
 | Mean throttle, RecurrentPPO (batch 256) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 | Mean throttle, window 64 (batch 1,024) | 1.00 | 1.00 | 1.00 | 0.96 | 0.95 | 0.95 |
 
+**Final test** (2026-10-23; seeds 2000–2002, flown once; every run first reproduced its validation exactly; mean ± std across 8 seeds, Welch's t-test against no memory). The plain-PPO controls of E1 (0a, 0b, 0a_blind, 0b_blind) had not been final-tested before: this was their first and only use of these flights. Files: `runs_step0/memory_takeoff_fused/final_test_memory_takeoff.json` and `final_test_takeoff_controls.json` (worktree of `memory-baselines-easy`).
+
+| Agent (take-off-only version) | Final test | vs no memory | Validation | Completed | Battery empty | Ground crash |
+|---|---:|---:|---:|---:|---:|---:|
+| No memory, batch 256 (0a_blind) | 139 ± 53 | — | 127 | 26% | 74% | 0% |
+| **RecurrentPPO, batch 256** | **23 ± 31** | −116 (p < 0.01) | 23 | 8% | 92% | 0% |
+| Window 16, batch 256 | 94 ± 53 | −45 (p = 0.11) | 73 | 16% | 84% | 0% |
+| Window 64, batch 256 | 64 ± 57 | −76 (p = 0.02) | 46 | 13% | 87% | 0% |
+| No memory, batch 1,024 (0b_blind) | 203 ± 39 | — | 177 | 31% | 69% | 0% |
+| **RecurrentPPO, batch 1,024** | **67 ± 45** | −137 (p < 0.01) | 44 | 17% | 83% | 0% |
+| Window 16, batch 1,024 | 72 ± 59 | −131 (p < 0.01) | 70 | 10% | 90% | 0% |
+| Window 64, batch 1,024 | 78 ± 45 | −125 (p < 0.01) | 56 | 20% | 80% | 0% |
+| True battery, batch 256 / 1,024 (0a / 0b) | 279 / 242 | — | 288 / 245 | 83% / 83% | 10% / 12% | 7% / 5% |
+
+The final test confirms validation: every memory learner is below no memory, five of six significantly.
+
 **What it means.**
 - **RecurrentPPO ignores the take-off.** Its LSTM reads the 5-second full-throttle take-off, which reveals the battery (best possible error 0.050 after it, section 3). Yet it flies at full throttle in all 16 runs, at every starting battery, and fails every flight from 0.2 to 0.6. It ends 104–133 points below no memory.
 - **The agents without memory do better than RecurrentPPO here,** although they can't remember the take-off: they ease off the throttle at high batteries (0.78–0.82 at 0.6–0.7), where the hand-over speed hints at the battery, and complete every flight from 0.7.

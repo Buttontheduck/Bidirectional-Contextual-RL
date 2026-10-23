@@ -244,6 +244,8 @@ Details, tables and W&B groups are in `ENCODER_PLAN.md`.
 | Contextual PPO with a GRU encoder trained jointly (best rung, J1, 5 seeds) | No, inferred | GRU | 114 | 150 | 30% |
 | Plain PPO with a frozen GRU trained offline on the true battery (batch 256 / 1024) | No, inferred | Frozen GRU | 209 / 164 | 238 / 184 | 92% / 76% |
 | **Plain PPO with a frozen GRU trained offline on the ideal estimate** (batch 256 / 1024) | No, inferred | Frozen GRU (teacher T1) | **291 / 262** | **330 / 319** | 86% / 76% |
+| RecurrentPPO (sb3-contrib), its LSTM trained end to end by the PPO losses (batch 256 / 1024) | No, inferred | LSTM | 21 / −7 | 66 / 14 | 9% / 17% |
+| Plain PPO on a window of the last 16 steps (batch 256 / 1024) | No | 0.8 s window | 30 / 21 | 61 / 38 | 17% / 15% |
 
 All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. Seeds 0–7, except the A rerun (0–2) and joint training (0–4). Every run on the final test first reproduced its validation result exactly.
 
@@ -305,7 +307,7 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. 
   - **Learning the uncertainty as well (T2)** costs no accuracy, and its uncertainty is calibrated (squared error over its variance about 1).
 - **Joint training still fails.** Contextual PPO with a GRU encoder trained alongside the policy reaches 114 at best (J1, 16 times more encoder training), about the memoryless level (115). An entropy bonus, a Gaussian head, a curiosity bonus and a warm-up on random flights didn't help. The policy flies narrowly, so its encoder learns a clock again (R² about 0.8 on its own flights).
 - **Standard memory learners fail too (2026-10-23).** sb3-contrib's RecurrentPPO (an LSTM trained by the PPO losses alone) and plain PPO on a window of the last 16 or 64 steps, at step 0's settings with 8 seeds:
-  - none beats the no-memory control on either version (hard: RecurrentPPO 21 / −7 against 23 / 77; take-off only: 23 / 44 against 127 / 177);
+  - none beats the no-memory control on either version. Validation, hard: RecurrentPPO 21 / −7 against 23 / 77; take-off only: 23 / 44 against 127 / 177. Final test, hard: 66 / 14 against 49 / 119 (+17 n.s., −104); take-off only: 23 / 67 against 139 / 203;
   - RecurrentPPO flies at full throttle at every starting battery, and the windows also fly the same at every battery.
 
   Details are in `ENCODER_PLAN.md` and `EASY_ENV_WARMUP.md`, the plan in `PAPER_ASSESSMENT.md`.
