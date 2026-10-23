@@ -1,6 +1,6 @@
 # Easy alternative environment: a forced take-off before the agent takes control
 
-**On branch `main`** this document records the plan, every training setting and every result. The code it describes (the take-off and transition options of `battery_plane.py`, the learner's preludes and its window training, their checks in `checks/`, and the `run_step0.py` options and conditions) lives on branch `easy-env`: check that branch out to rerun these experiments.
+**On every branch** this document records the plan, every training setting and every result. The code it describes (the take-off and transition options of `battery_plane.py`, the learner's preludes and its window training, their checks in `checks/`, and the `run_step0.py` options and conditions) lives on branch `easy-env`, and on `memory-baselines-easy`, which adds the memory baselines: check one of them out to rerun these experiments.
 
 **Status:** idea with first measurements (2026-10-14). Nothing is implemented in the environment or the learner yet. The current environment stays the main (hard) version.
 
