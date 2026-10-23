@@ -1,5 +1,7 @@
 # Easy alternative environment: a forced take-off before the agent takes control
 
+**On every branch** this document records the plan, every training setting and every result. The code it describes (the take-off and transition options of `battery_plane.py`, the learner's preludes and its window training, their checks in `checks/`, and the `run_step0.py` options and conditions) lives on branch `easy-env`, and on `memory-baselines-easy`, which adds the memory baselines: check one of them out to rerun these experiments.
+
 **Status:** idea with first measurements (2026-10-14). Nothing is implemented in the environment or the learner yet. The current environment stays the main (hard) version.
 
 **Update (2026-10-17): kept as plan B.** In the hard version, a GRU encoder trained offline on varied pilot flights now makes plain PPO score 209 at batch 256: 23 without memory, 246 with the true battery and 283 with the ideal estimate (ENCODER_PLAN.md, step 4).
