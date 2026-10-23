@@ -7,7 +7,7 @@ The project has two sides:
 1. **BatteryPlane** (`battery_plane.py`), an environment built so that the battery matters. An agent that can't see the battery and has no memory should do poorly, and the same agent should do much better when it sees the battery.
 2. **Contextual PPO** (`contextual_ppo/`), an agent with memory. A recurrent encoder infers the battery from the history of observations and actions, and the actor and critic both use that estimate. If this agent recovers most of the gap between "can't see the battery" and "sees the battery", the environment is a valid test of autogenic context, and the agent is a working baseline for it.
 
-**Project page:** `docs/`, five pages (overview, environment, Contextual PPO, results, ablations) for GitHub Pages, served from this branch's `/docs` folder. **Trained models:** the release [`models-v1`](https://github.com/Buttontheduck/Bidirectional-Contextual-RL/releases/tag/models-v1), with the two frozen GRU encoders, 48 PPO policies, their final-test scores and a script to fly them. **Branches:** `main` holds the hard version, the project page and the figures; this branch, `easy-env`, also holds the easy version (a forced take-off before the agent takes control) with its code and experiments, summarized in section 6 and recorded in `EASY_ENV_WARMUP.md`.
+**Project page:** `docs/`, five pages (overview, environment, Contextual PPO, results, ablations) for GitHub Pages, served from branch `main`'s `/docs` folder. **Trained models:** the release [`models-v1`](https://github.com/Buttontheduck/Bidirectional-Contextual-RL/releases/tag/models-v1), with the two frozen GRU encoders, 48 PPO policies, their final-test scores and a script to fly them. **Branches:** `main` holds the hard version, the project page and the figures; `easy-env` adds the easy version (a forced take-off before the agent takes control) with its code and experiments, summarized in section 6 and recorded in `EASY_ENV_WARMUP.md`; `memory-baselines` (from `main`) and `memory-baselines-easy` (from `easy-env`) add the memory baselines (RecurrentPPO, history windows) and the out-of-distribution evaluation, summarized in section 6 and `PAPER_ASSESSMENT.md`. The md files are the same on every branch; files marked with a branch exist only there.
 
 ## 1. Allogenic and autogenic context
 
@@ -244,6 +244,8 @@ Details, tables and W&B groups are in `ENCODER_PLAN.md`.
 | Contextual PPO with a GRU encoder trained jointly (best rung, J1, 5 seeds) | No, inferred | GRU | 114 | 150 | 30% |
 | Plain PPO with a frozen GRU trained offline on the true battery (batch 256 / 1024) | No, inferred | Frozen GRU | 209 / 164 | 238 / 184 | 92% / 76% |
 | **Plain PPO with a frozen GRU trained offline on the ideal estimate** (batch 256 / 1024) | No, inferred | Frozen GRU (teacher T1) | **291 / 262** | **330 / 319** | 86% / 76% |
+| RecurrentPPO (sb3-contrib), its LSTM trained end to end by the PPO losses (batch 256 / 1024) | No, inferred | LSTM | 21 / −7 | 66 / 14 | 9% / 17% |
+| Plain PPO on a window of the last 16 steps (batch 256 / 1024) | No | 0.8 s window | 30 / 21 | 61 / 38 | 17% / 15% |
 
 All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. Seeds 0–7, except the A rerun (0–2) and joint training (0–4). Every run on the final test first reproduced its validation result exactly.
 
@@ -304,6 +306,16 @@ All rows: discount 0.99, reward scale 0.1, 2M steps, 18 flights per evaluation. 
   - **The catch:** the teacher knows the exact physics, the prior and the speed noise, so this encoder isn't purely learned from experience.
   - **Learning the uncertainty as well (T2)** costs no accuracy, and its uncertainty is calibrated (squared error over its variance about 1).
 - **Joint training still fails.** Contextual PPO with a GRU encoder trained alongside the policy reaches 114 at best (J1, 16 times more encoder training), about the memoryless level (115). An entropy bonus, a Gaussian head, a curiosity bonus and a warm-up on random flights didn't help. The policy flies narrowly, so its encoder learns a clock again (R² about 0.8 on its own flights).
+- **Standard memory learners fail too (2026-10-23).** sb3-contrib's RecurrentPPO (an LSTM trained by the PPO losses alone) and plain PPO on a window of the last 16 or 64 steps, at step 0's settings with 8 seeds:
+  - none beats the no-memory control on either version. Validation, hard: RecurrentPPO 21 / −7 against 23 / 77; take-off only: 23 / 44 against 127 / 177. Final test, hard: 66 / 14 against 49 / 119 (+17 n.s., −104); take-off only: 23 / 67 against 139 / 203;
+  - RecurrentPPO flies at full throttle at every starting battery, and the windows also fly the same at every battery.
+
+  Details are in `ENCODER_PLAN.md` and `EASY_ENV_WARMUP.md`, the plan in `PAPER_ASSESSMENT.md`.
+- **Out of distribution (2026-10-23).** 120 frozen agents flown under shifted physics, speed noise and starting batteries (`ood_evaluation.py`; `ENCODER_PLAN.md`, "Out-of-distribution evaluation"):
+  - the agents with the true battery generalize best;
+  - agents without battery information, Contextual PPO's learned encoders included, don't adapt: the physics carries them;
+  - the frozen teacher-trained GRU (T1), the best agent in distribution, collapses with a 1 m/s² stronger motor (5–15% of flights completed);
+  - starting batteries just outside 0.2–0.7 show no cliff, and only agents with battery information save any flight below 0.2.
 - **A likely reason A failed, not tested directly:** inside Contextual PPO the encoder got about 1,950 supervised steps of 16 episodes (A–F, 1M steps), or 3,900 (the A rerun, 2M). It trained on its own clock-like flights. That is less training, on narrower data, than the offline encoders needed before their click (about 4,300–5,200 steps of 32 varied flights).
 
 **Why, from the step 1 controls**, which replace the encoder with the true battery plus controlled noise:
@@ -329,14 +341,14 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 - the teacher-trained GRU's encoder-seed check, and the swap test of all frozen-encoder policies
 - GIFs of every pilot style and of the four plain-PPO agents on the final-test flights (`pilot_gifs.py`, `policy_gifs.py`)
 - the paper figures and the project page (`figures/`, `docs/`), and the trained models as the release `models-v1`
-- the easy version and its experiments E0–E3d (this branch, below)
+- the easy version and its experiments E0–E3d (branch `easy-env`, below)
 
 **Next steps** (`ENCODER_PLAN.md`):
 
 1. Let the policy also read T2's uncertainty, as the ideal estimate's uncertainty was tested in step 2.
 2. Return to Contextual PPO with the teacher-trained encoder as a starting point, or with the ideal estimate as the joint encoder's target.
 
-**The easy version** (this branch, 2026-10-20 to 2026-10-22; `EASY_ENV_WARMUP.md` has every setting and result). The code: `battery_plane.py`'s `warmup_steps` and `transition_steps`, the learner's preludes (the encoder reads the take-off before every episode) and window training (`cppo.supervised.sequence`), and `run_step0.py --warmup-steps / --transition-steps`. Before every flight an autopilot flies a 5-second take-off at full throttle, which reveals the battery to an agent with memory, and hands over with the battery still uniform on 0.2–0.7. It removes the hardest autogenic step (deciding to spend battery to learn the battery); the hard version stays the main one.
+**The easy version** (branch `easy-env`, 2026-10-20 to 2026-10-22; `EASY_ENV_WARMUP.md` has every setting and result). The code: `battery_plane.py`'s `warmup_steps` and `transition_steps`, the learner's preludes (the encoder reads the take-off before every episode) and window training (`cppo.supervised.sequence`), and `run_step0.py --warmup-steps / --transition-steps`. Before every flight an autopilot flies a 5-second take-off at full throttle, which reveals the battery to an agent with memory, and hands over with the battery still uniform on 0.2–0.7. It removes the hardest autogenic step (deciding to spend battery to learn the battery); the hard version stays the main one.
 - **It is a fair test.** Knowing the battery is still worth a lot (Contextual PPO on validation: 254 with the true battery, 158 without memory). Two variants: the take-off alone, where memoryless agents get a faster start and a partial hint but still fail every low-battery flight, and a 4-second transition back to the starting speed, which makes the hand-over identical to the hard version's start.
 - **End-to-end Contextual PPO still doesn't beat no memory**, although its GRU encoder reads the take-off first (a new prelude option of the learner) and reaches the best possible error at hand-over, about 0.05. With the transition: J1 95, J0 67 and J5 (an encoder warm-up) 70, against 58 without memory and 256 with the true battery. The policies settle on a no-memory flying style before the encoder becomes useful.
 - **The take-off alone comes closest.** J1 scores 169 on validation and 197 on the final test, against 155–158 without memory and 254–275 with the true battery (not a clear gain: final test p = 0.27). Its policies depend on the estimate, and given the true battery they fly as well as the true-battery agent (247 against 254): the encoder's remaining error holds them back.
@@ -363,9 +375,11 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 | `flight_logging.py` | Flight diagnostics shared by both learners (validation, rollouts, gradient norms, final validation) |
 | `run_grid.py`, `run_step0.py`, `report_step0.py`, `evaluate_final_test.py` | Launchers, reports and the one-time final test |
 | `step1_fly_with_noise.py`, `step1_encoder_error.py`, `step2_swap_battery.py` | Step 1 and step 2 analyses |
-| `checks/` | `unittest` checks: configs, seeds, logging, controls, the context wrapper, the pilots, encoder training, joint training and the final test (`step0`–`step4_checks`, `joint_checks`, `final_test_checks`), and on this branch the easy version, the learner's preludes and window training (`easy_env_checks`, `prelude_checks`, `sequence_checks`) |
+| `checks/` | `unittest` checks: configs, seeds, logging, controls, the context wrapper, the pilots, encoder training, joint training and the final test (`step0`–`step4_checks`, `joint_checks`, `final_test_checks`); on branch `easy-env` also the easy version, the learner's preludes and window training (`easy_env_checks`, `prelude_checks`, `sequence_checks`); on the `memory-baselines` branches also the memory baselines and the out-of-distribution evaluation (`memory_baseline_checks`, `ood_checks`) |
 | `GRID_PLAN.md`, `ENCODER_PLAN.md` | The A–F grid; the encoder-versus-policy plan with all results so far |
-| `EASY_ENV_WARMUP.md`, `warmup_information.py` | The easy version (forced take-off): plan, settings and every result, and the first measurement of what a take-off reveals |
+| `EASY_ENV_WARMUP.md`, `warmup_information.py` | The easy version (forced take-off): plan, settings and every result (its code is on branch `easy-env`), and the first measurement of what a take-off reveals |
+| `memory_baselines.py`, `ood_evaluation.py` | Branches `memory-baselines` and `memory-baselines-easy`: the memory baselines (RecurrentPPO with a fused LSTM and the take-off replay, history windows) and the out-of-distribution evaluation of frozen agents |
+| `PAPER_ASSESSMENT.md` | The paper/workshop assessment, the plan of the memory baselines, and their results and the out-of-distribution results |
 | `CLAUDE.md` | Working notes: commands, architecture, protocol rules |
 | `papers/` | The taxonomy paper and the three allogenic-context papers |
 
