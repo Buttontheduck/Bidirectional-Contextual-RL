@@ -83,7 +83,7 @@ Nothing is running and nothing was changed. I can save this as a plan file if yo
 
 **Question.** Contextual PPO with a learned encoder never beat a memoryless agent: A and J0–J5 on the hard version, J0, J1 and J5 on the easy versions. Is that a property of the problem, or of Contextual PPO's supervised encoder? Standard memory learners, trained end to end by the RL losses alone, answer it.
 
-**Status:** planned; nothing is written or running. Edits to existing files wait for your OK (see [Code to write](#code-to-write)).
+**Status (2026-10-23):** RecurrentPPO and the windows are done on both versions; see [Results](#results-2026-10-23) at the end. Not run yet: M3 (Contextual PPO with `encoder_objective=rl`), the 10M-step stage and the final test.
 
 ### The learners
 
@@ -234,3 +234,46 @@ About 4–5 working days in all.
 
 - **A small RecurrentPPO sweep,** so that "it wasn't tuned" can't be said (Ni et al. 2022's point): LSTM 64 or 256, learning rate 1e-4 or 3e-4, rollouts of 1,024 steps; 4 seeds each on the hard version, chosen on validation.
 - **Other memory families:** recurrent off-policy (SAC with a recurrent critic), transformers, DreamerV3.
+
+### Results (2026-10-23)
+
+**What was run:** M1a/M1b_lstm (RecurrentPPO) and M2a/M2b_win16/win64 (windows), 8 seeds each, on both versions: 96 runs.
+- **M3 and the 10M-step stage** were not run.
+- **Final test:** not yet; `evaluate_final_test.py` doesn't load these runs yet.
+- **Details:** `ENCODER_PLAN.md` ("Standard memory baselines", hard version) and `EASY_ENV_WARMUP.md` ("Memory baselines on the take-off-only version").
+
+**Changes from the plan:**
+- **The fused LSTM.** sb3-contrib's RecurrentPPO runs its LSTM one step at a time in Python whenever a training sequence holds an episode start. With 32 runs side by side, that made the first RecurrentPPO runs about 15 times slower than timed: after 9–10 hours they were at 0.1–0.57M of 2M steps.
+  - They were stopped and rerun with `memory_baselines.FusedLstmPolicy`, which resets the memory at each sequence's first step and runs the sequence in one call.
+  - It gives identical outputs and gradients equal up to rounding. A rerun with sb3-contrib's loop reproduces the stopped runs exactly; the fused runs take their own path after 2–4 updates, as any rounding change does.
+  - Over all seeds the fused and stopped runs don't differ at the same steps (p = 0.30–1.00).
+  - `memory.fused_lstm=false` restores sb3-contrib's loop.
+- **Run times** with 32 runs side by side: windows 40–120 min (planned 15–25), RecurrentPPO 3.5–4 h with the fused LSTM.
+
+**Results** (validation late score, mean ± std across 8 seeds; "vs no memory" is Welch's t-test against the no-memory run with the same minibatches; completed and battery empty are from the final validation):
+
+| Version | Agent | Batch 256 | vs no memory | Batch 1,024 | vs no memory | Completed | Battery empty |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Hard | No memory | 23 ± 41 | — | 77 ± 32 | — | 26% / 15% | 74% / 85% |
+| Hard | **RecurrentPPO** | **21 ± 65** | −2 (p = 0.94) | **−7 ± 18** | −84 (p < 0.01) | 8% / 17% | 92% / 83% |
+| Hard | Window 16 | 30 ± 43 | +7 (p = 0.77) | 21 ± 24 | −56 (p < 0.01) | 15% / 13% | 81% / 87% |
+| Hard | Window 64 | −7 ± 27 | −30 (p = 0.13) | −56 ± 93 | −134 (p = 0.01) | 15% / 10% | 81% / 85% |
+| Hard | True battery | 246 ± 52 | | 258 ± 30 | | 88% / 86% | 6% / 5% |
+| Take-off only | No memory | 127 ± 48 | — | 177 ± 24 | — | 25% / 30% | 75% / 70% |
+| Take-off only | **RecurrentPPO** | **23 ± 37** | −104 (p < 0.01) | **44 ± 12** | −133 (p < 0.01) | 8% / 17% | 92% / 83% |
+| Take-off only | Window 16 | 73 ± 39 | −55 (p = 0.03) | 70 ± 37 | −107 (p < 0.01) | 16% / 9% | 84% / 91% |
+| Take-off only | Window 64 | 46 ± 22 | −81 (p < 0.01) | 56 ± 25 | −122 (p < 0.01) | 13% / 19% | 87% / 81% |
+| Take-off only | True battery | 288 ± 25 | | 245 ± 33 | | 83% / 81% | 10% / 12% |
+
+**By the decision rules: the headline generalizes.**
+- **No memory learner beats its no-memory control** on either version. 9 of the 12 comparisons are significantly worse: all at batch 1,024 on the hard version and all on the take-off version. The three at batch 256 on the hard version are level.
+- **RecurrentPPO flies at full throttle at every starting battery** (mean throttle 1.00 in 30 of its 32 runs, 0.97–0.98 in the other two), even when its LSTM reads the take-off that reveals the battery. Its memory changes nothing it does.
+- **The windows fly the same at every starting battery too.** Their extra inputs make them worse than no memory.
+- **Together with Contextual PPO's own results** (A, J0–J5, E3–E3d): every end-to-end memory learner tried stays at or below the no-memory level, while an encoder trained offline and frozen reaches the ideal estimate's level. Weakness 1 above is answered for RecurrentPPO and windows. A reviewer can still ask for tuning: the follow-up sweep is below.
+
+**Next, if wanted:**
+- the small RecurrentPPO sweep;
+- M3 (Contextual PPO with `encoder_objective=rl`);
+- the 10M-step stage;
+- final-test support for the new runs.
+
