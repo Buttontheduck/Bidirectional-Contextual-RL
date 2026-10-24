@@ -380,6 +380,7 @@ This is the autogenic difficulty from section 1 showing up in practice. The agen
 | `EASY_ENV_WARMUP.md`, `warmup_information.py` | The easy version (forced take-off): plan, settings and every result (its code is on branch `easy-env`), and the first measurement of what a take-off reveals |
 | `memory_baselines.py`, `ood_evaluation.py` | Branches `memory-baselines` and `memory-baselines-easy`: the memory baselines (RecurrentPPO with a fused LSTM and the take-off replay, history windows) and the out-of-distribution evaluation of frozen agents |
 | `PAPER_ASSESSMENT.md` | The paper/workshop assessment, the plan of the memory baselines, and their results and the out-of-distribution results |
+| `environments/` | The exact package versions of every Python environment the experiments ran in (`carlos` and the side environments' venvs), with how to rebuild them |
 | `CLAUDE.md` | Working notes: commands, architecture, protocol rules |
 | `papers/` | The taxonomy paper and the three allogenic-context papers |
 
