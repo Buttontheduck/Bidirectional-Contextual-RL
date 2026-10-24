@@ -12,7 +12,7 @@ Contextual PPO (CPPO): SB3 PPO with a recurrent xLSTM context encoder, trained o
 
 ## Environment and commands
 
-Use the `carlos` conda env (Python 3.11): `conda activate carlos`. The `python` on the default PATH is base anaconda, so it won't work. `carlos` has no pytest. Training runs on CPU.
+Use the `carlos` conda env (Python 3.11): `conda activate carlos`. The `python` on the default PATH is base anaconda, so it won't work. `carlos` has no pytest. Training runs on CPU. `environments/` holds the exact package versions of `carlos` and of the side environments' venvs (exported 2026-10-24 from the training server), with how to rebuild them.
 
 ```bash
 # Single training run (base config = experiment A); Hydra overrides on the command line
